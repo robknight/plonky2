@@ -170,6 +170,22 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         "MulExtensionGenerator".to_string()
     }
 
+    fn witness_operation(&self) -> Option<crate::iop::generator::WitnessOperation> {
+        use crate::iop::generator::WitnessOperation;
+        if D != 2 || !WitnessOperation::field_supported::<F>() {
+            return None;
+        }
+        Some(WitnessOperation::ExtensionMultiply {
+            inputs: self.dependencies().try_into().ok()?,
+            outputs: MulExtensionGate::<D>::wires_ith_output(self.i)
+                .map(|col| Target::wire(self.row, col))
+                .collect::<Vec<_>>()
+                .try_into()
+                .ok()?,
+            coefficient: self.const_0.to_canonical_u64(),
+        })
+    }
+
     fn dependencies(&self) -> Vec<Target> {
         MulExtensionGate::<D>::wires_ith_multiplicand_0(self.i)
             .chain(MulExtensionGate::<D>::wires_ith_multiplicand_1(self.i))

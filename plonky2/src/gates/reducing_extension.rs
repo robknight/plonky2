@@ -55,7 +55,7 @@ impl<const D: usize> ReducingExtensionGate<D> {
     const fn start_accs(&self) -> usize {
         Self::START_COEFFS + self.num_coeffs * D
     }
-    const fn wires_accs(&self, i: usize) -> Range<usize> {
+    pub(crate) const fn wires_accs(&self, i: usize) -> Range<usize> {
         debug_assert!(i < self.num_coeffs);
         if i == self.num_coeffs - 1 {
             // The last accumulator is the output.
@@ -201,6 +201,19 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D> for Red
             .chain((0..self.gate.num_coeffs).flat_map(ReducingExtensionGate::<D>::wires_coeff))
             .map(|i| Target::wire(self.row, i))
             .collect()
+    }
+
+    fn witness_operation(&self) -> Option<crate::iop::generator::WitnessOperation> {
+        use crate::iop::generator::WitnessOperation;
+        (D == 2
+            && WitnessOperation::field_supported::<F>()
+            && self.gate.num_coeffs > 0
+            && u32::try_from(self.gate.num_coeffs).is_ok())
+        .then_some(WitnessOperation::Reducing {
+            row: self.row,
+            num_coeffs: self.gate.num_coeffs,
+            extension_coeffs: true,
+        })
     }
 
     fn run_once(

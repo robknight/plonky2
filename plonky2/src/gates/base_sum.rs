@@ -187,6 +187,16 @@ impl<F: RichField + Extendable<D>, const B: usize, const D: usize> SimpleGenerat
         vec![Target::wire(self.row, BaseSumGate::<B>::WIRE_SUM)]
     }
 
+    fn witness_operation(&self) -> Option<crate::iop::generator::WitnessOperation> {
+        use crate::iop::generator::WitnessOperation;
+        (B.is_power_of_two() && B > 1 && B <= (1usize << 31) && self.num_limbs <= 0x00ff_ffff)
+            .then_some(WitnessOperation::BaseSplit {
+                row: self.row,
+                num_limbs: self.num_limbs,
+                limb_bits: B.trailing_zeros(),
+            })
+    }
+
     fn run_once(
         &self,
         witness: &PartitionWitness<F>,

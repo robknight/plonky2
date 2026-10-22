@@ -1,5 +1,5 @@
 #[cfg(not(feature = "std"))]
-use alloc::{format, vec::Vec};
+use alloc::{format, vec, vec::Vec};
 
 use itertools::Itertools;
 use plonky2_field::types::Field;
@@ -15,16 +15,35 @@ use crate::fri::prover::fri_proof;
 use crate::fri::structure::{FriBatchInfo, FriInstanceInfo};
 use crate::fri::FriParams;
 use crate::hash::hash_types::RichField;
-use crate::hash::merkle_tree::MerkleTree;
+use crate::hash::merkle_tree::{MerkleLeaves, MerkleTree};
 use crate::iop::challenger::Challenger;
 use crate::plonk::config::GenericConfig;
 use crate::timed;
 use crate::util::reducing::ReducingFactor;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_strict, reverse_bits, reverse_index_bits_in_place, transpose};
+use crate::util::{log2_strict, reverse_bits};
 
 /// Four (~64 bit) field elements gives ~128 bit security.
 pub const SALT_SIZE: usize = 4;
+
+/// The rows of the column-major `columns`, as Merkle leaves in bit-reversed
+/// row order: leaf `i` is row `reverse_bits(i)`.
+pub(crate) fn transpose_to_leaves<F: Field>(columns: &[Vec<F>]) -> MerkleLeaves<F> {
+    let num_columns = columns.len();
+    let num_rows = columns[0].len();
+    let log_rows = log2_strict(num_rows);
+    let mut values = vec![F::ZERO; num_columns * num_rows];
+    values
+        .par_chunks_exact_mut(num_columns)
+        .enumerate()
+        .for_each(|(i, leaf)| {
+            let row = reverse_bits(i, log_rows);
+            for (value, column) in leaf.iter_mut().zip(columns) {
+                *value = column[row];
+            }
+        });
+    MerkleLeaves::new(values, num_columns, num_rows)
+}
 
 /// Represents a FRI oracle, i.e. a batch of polynomials which have been Merklized.
 #[derive(Eq, PartialEq, Debug, Serialize, Deserialize, Clone)]
@@ -36,6 +55,20 @@ pub struct PolynomialBatch<F: RichField + Extendable<D>, C: GenericConfig<D, F =
     pub degree_log: usize,
     pub rate_bits: usize,
     pub blinding: bool,
+    /// The device copy of the extended evaluations, when committed on the GPU.
+    #[cfg(feature = "gpu")]
+    #[serde(skip)]
+    pub(crate) device: crate::gpu::DeviceCache,
+    /// The device copy of the coefficients (column-major), when committed on
+    /// the GPU or uploaded by the opening phase.
+    #[cfg(feature = "gpu")]
+    #[serde(skip)]
+    pub(crate) device_coeffs: crate::gpu::DeviceCache,
+    /// The device copy of the values on the subgroup (column-major), when
+    /// committed from values on the GPU.
+    #[cfg(feature = "gpu")]
+    #[serde(skip)]
+    pub(crate) device_values: crate::gpu::DeviceCache,
 }
 
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> Default
@@ -48,6 +81,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> D
             degree_log: 0,
             rate_bits: 0,
             blinding: false,
+            #[cfg(feature = "gpu")]
+            device: Default::default(),
+            #[cfg(feature = "gpu")]
+            device_coeffs: Default::default(),
+            #[cfg(feature = "gpu")]
+            device_values: Default::default(),
         }
     }
 }
@@ -56,7 +95,70 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     PolynomialBatch<F, C, D>
 {
     /// Creates a list polynomial commitment for the polynomials interpolating the values in `values`.
+    ///
+    /// With the `gpu` feature and a suitable adapter, the IFFT, LDE, transpose and Merkle tree are
+    /// computed on the device; the result is identical to [`Self::from_values_cpu`].
     pub fn from_values(
+        values: Vec<PolynomialValues<F>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> Self {
+        Self::from_values_with_plan(
+            values,
+            rate_bits,
+            blinding,
+            cap_height,
+            timing,
+            fft_root_table,
+            #[cfg(feature = "gpu")]
+            None,
+        )
+    }
+
+    pub(crate) fn from_values_with_plan(
+        values: Vec<PolynomialValues<F>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+        #[cfg(feature = "gpu")] plan: Option<&crate::gpu::policy::ExecutionPlan>,
+    ) -> Self {
+        #[cfg(feature = "gpu")]
+        if let Some(ctx) = crate::gpu::lde::applicable::<F, C, D>(
+            values.len(),
+            values.first().map_or(0, |v| v.len()),
+            rate_bits,
+            blinding,
+        ) {
+            return crate::gpu::lde::from_values_with_residency(
+                &ctx,
+                values,
+                rate_bits,
+                blinding,
+                cap_height,
+                timing,
+                plan.map_or_else(
+                    || ctx.options.retain_leaves(ctx.mappable),
+                    |p| p.retain_leaves(),
+                ),
+            );
+        }
+        Self::from_values_cpu(
+            values,
+            rate_bits,
+            blinding,
+            cap_height,
+            timing,
+            fft_root_table,
+        )
+    }
+
+    /// `from_values` on the CPU.
+    pub(crate) fn from_values_cpu(
         values: Vec<PolynomialValues<F>>,
         rate_bits: usize,
         blinding: bool,
@@ -70,7 +172,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             values.into_par_iter().map(|v| v.ifft()).collect::<Vec<_>>()
         );
 
-        Self::from_coeffs(
+        Self::from_coeffs_cpu(
             coeffs,
             rate_bits,
             blinding,
@@ -81,7 +183,70 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     }
 
     /// Creates a list polynomial commitment for the polynomials `polynomials`.
+    ///
+    /// With the `gpu` feature and a suitable adapter, the LDE, transpose and Merkle tree are
+    /// computed on the device; the result is identical to [`Self::from_coeffs_cpu`].
     pub fn from_coeffs(
+        polynomials: Vec<PolynomialCoeffs<F>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> Self {
+        Self::from_coeffs_with_plan(
+            polynomials,
+            rate_bits,
+            blinding,
+            cap_height,
+            timing,
+            fft_root_table,
+            #[cfg(feature = "gpu")]
+            None,
+        )
+    }
+
+    pub(crate) fn from_coeffs_with_plan(
+        polynomials: Vec<PolynomialCoeffs<F>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+        #[cfg(feature = "gpu")] plan: Option<&crate::gpu::policy::ExecutionPlan>,
+    ) -> Self {
+        #[cfg(feature = "gpu")]
+        if let Some(ctx) = crate::gpu::lde::applicable::<F, C, D>(
+            polynomials.len(),
+            polynomials.first().map_or(0, |p| p.len()),
+            rate_bits,
+            blinding,
+        ) {
+            return crate::gpu::lde::from_coeffs_with_residency(
+                &ctx,
+                polynomials,
+                rate_bits,
+                blinding,
+                cap_height,
+                timing,
+                plan.map_or_else(
+                    || ctx.options.retain_leaves(ctx.mappable),
+                    |p| p.retain_leaves(),
+                ),
+            );
+        }
+        Self::from_coeffs_cpu(
+            polynomials,
+            rate_bits,
+            blinding,
+            cap_height,
+            timing,
+            fft_root_table,
+        )
+    }
+
+    /// `from_coeffs` on the CPU.
+    pub(crate) fn from_coeffs_cpu(
         polynomials: Vec<PolynomialCoeffs<F>>,
         rate_bits: usize,
         blinding: bool,
@@ -96,12 +261,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             Self::lde_values(&polynomials, rate_bits, blinding, fft_root_table)
         );
 
-        let mut leaves = timed!(timing, "transpose LDEs", transpose(&lde_values));
-        reverse_index_bits_in_place(&mut leaves);
+        let leaves = timed!(timing, "transpose LDEs", transpose_to_leaves(&lde_values));
         let merkle_tree = timed!(
             timing,
             "build Merkle tree",
-            MerkleTree::new(leaves, cap_height)
+            MerkleTree::from_leaves(leaves, cap_height)
         );
 
         Self {
@@ -110,6 +274,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             degree_log: log2_strict(degree),
             rate_bits,
             blinding,
+            #[cfg(feature = "gpu")]
+            device: Default::default(),
+            #[cfg(feature = "gpu")]
+            device_coeffs: Default::default(),
+            #[cfg(feature = "gpu")]
+            device_values: Default::default(),
         }
     }
 
@@ -144,8 +314,20 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     pub fn get_lde_values(&self, index: usize, step: usize) -> &[F] {
         let index = index * step;
         let index = reverse_bits(index, self.degree_log + self.rate_bits);
-        let slice = &self.merkle_tree.leaves[index];
+        let slice = self.merkle_tree.leaves.row(index);
         &slice[..slice.len() - if self.blinding { SALT_SIZE } else { 0 }]
+    }
+
+    /// Prepares the rows that `get_lde_values(index, step)` will read for
+    /// these indices, from the device buffer where the host maps it directly.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn prepare_lde_values(&self, indices: impl IntoIterator<Item = usize>, step: usize) {
+        let bits = self.degree_log + self.rate_bits;
+        let rows = indices
+            .into_iter()
+            .map(|index| reverse_bits(index * step, bits))
+            .collect::<Vec<_>>();
+        self.merkle_tree.leaves.prepare_rows(&rows);
     }
 
     /// Like `get_lde_values`, but fetches LDE values from a batch of `P::WIDTH` points, and returns
@@ -175,7 +357,45 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     }
 
     /// Produces a batch opening proof.
+    ///
+    /// With the `gpu` feature and a suitable adapter, the initial FRI
+    /// polynomial is combined from the device copies of the oracles'
+    /// coefficients and folded on the device; the proof is identical to
+    /// [`Self::prove_openings_cpu`].
     pub fn prove_openings(
+        instance: &FriInstanceInfo<F, D>,
+        oracles: &[&Self],
+        challenger: &mut Challenger<F, C::Hasher>,
+        fri_params: &FriParams,
+        final_poly_coeff_len: Option<usize>,
+        max_num_query_steps: Option<usize>,
+        timing: &mut TimingTree,
+    ) -> FriProof<F, C::Hasher, D> {
+        #[cfg(feature = "gpu")]
+        if let Some(proof) = crate::gpu::opening::try_prove_openings::<F, C, D>(
+            instance,
+            oracles,
+            challenger,
+            fri_params,
+            final_poly_coeff_len,
+            max_num_query_steps,
+            timing,
+        ) {
+            return proof;
+        }
+        Self::prove_openings_cpu(
+            instance,
+            oracles,
+            challenger,
+            fri_params,
+            final_poly_coeff_len,
+            max_num_query_steps,
+            timing,
+        )
+    }
+
+    /// `prove_openings` on the CPU (the final FFT may still run on the GPU).
+    pub(crate) fn prove_openings_cpu(
         instance: &FriInstanceInfo<F, D>,
         oracles: &[&Self],
         challenger: &mut Challenger<F, C::Hasher>,
@@ -218,7 +438,13 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let lde_final_values = timed!(
             timing,
             &format!("perform final FFT {}", lde_final_poly.len()),
-            lde_final_poly.coset_fft(F::coset_shift().into())
+            {
+                #[cfg(feature = "gpu")]
+                let gpu_values = crate::gpu::fri::try_opening_fft::<F, D>(&lde_final_poly);
+                #[cfg(not(feature = "gpu"))]
+                let gpu_values: Option<PolynomialValues<F::Extension>> = None;
+                gpu_values.unwrap_or_else(|| lde_final_poly.coset_fft(F::coset_shift().into()))
+            }
         );
 
         let fri_proof = fri_proof::<F, C, D>(

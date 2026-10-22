@@ -126,6 +126,17 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D> for Wir
         vec![self.integer]
     }
 
+    fn witness_operation(&self) -> Option<crate::iop::generator::WitnessOperation> {
+        use crate::iop::generator::WitnessOperation;
+        (!self.gates.is_empty() && self.gates.len() <= 0x00ff_ffff).then(|| {
+            WitnessOperation::WireSplit {
+                integer: self.integer,
+                gates: self.gates.clone(),
+                num_limbs: self.num_limbs.min(64),
+            }
+        })
+    }
+
     fn run_once(
         &self,
         witness: &PartitionWitness<F>,

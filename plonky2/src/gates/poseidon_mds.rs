@@ -240,6 +240,12 @@ impl<F: RichField + Extendable<D> + Poseidon, const D: usize> SimpleGenerator<F,
             .collect()
     }
 
+    fn witness_operation(&self) -> Option<crate::iop::generator::WitnessOperation> {
+        use crate::iop::generator::WitnessOperation;
+        (D == 2 && WitnessOperation::field_supported::<F>())
+            .then_some(WitnessOperation::PoseidonMds { row: self.row })
+    }
+
     fn run_once(
         &self,
         witness: &PartitionWitness<F>,

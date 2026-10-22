@@ -199,6 +199,82 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         verify::<F, C, D>(proof_with_pis, &self.verifier_only, &self.common)
     }
 
+    /// Checks, without compiling, whether the circuit can have a witness
+    /// program: every generator must describe its operation and the circuit
+    /// must not use lookup tables. See [`crate::plonk::witness_program`].
+    #[cfg(all(feature = "std", feature = "rand_chacha"))]
+    pub fn witness_program_support(
+        &self,
+    ) -> core::result::Result<(), crate::plonk::witness_program::WitnessProgramError> {
+        crate::plonk::witness_program::support(&self.prover_only, &self.common)
+    }
+
+    /// Compiles a witness program for proofs whose inputs set exactly
+    /// `input_targets`; their values do not matter. Takes about 0.3 s per
+    /// million generators on an Apple M4; does not install the program.
+    #[cfg(all(feature = "std", feature = "rand_chacha"))]
+    pub fn compile_witness_program(
+        &self,
+        input_targets: &[crate::iop::target::Target],
+    ) -> core::result::Result<
+        crate::plonk::witness_program::WitnessProgram,
+        crate::plonk::witness_program::WitnessProgramError,
+    > {
+        crate::plonk::witness_program::compile(&self.prover_only, &self.common, input_targets)
+    }
+
+    /// Compiles a witness program for proofs that set the same targets as
+    /// `inputs`; only the targets are read, not their values.
+    #[cfg(all(feature = "std", feature = "rand_chacha"))]
+    pub fn compile_witness_program_like(
+        &self,
+        inputs: &PartialWitness<F>,
+    ) -> core::result::Result<
+        crate::plonk::witness_program::WitnessProgram,
+        crate::plonk::witness_program::WitnessProgramError,
+    > {
+        let targets = inputs.target_values.keys().copied().collect::<Vec<_>>();
+        self.compile_witness_program(&targets)
+    }
+
+    /// Installs `program`, replacing any installed program. Later proofs whose
+    /// inputs match it use the compiled executor; others use the worklist.
+    /// Clones of this circuit data share the installed program.
+    #[cfg(all(feature = "std", feature = "rand_chacha"))]
+    pub fn install_witness_program(
+        &self,
+        program: crate::plonk::witness_program::WitnessProgram,
+    ) -> core::result::Result<(), crate::plonk::witness_program::WitnessProgramError> {
+        crate::plonk::witness_program::install(&self.prover_only, program)
+    }
+
+    /// Removes the installed witness program; later proofs use the worklist.
+    #[cfg(all(feature = "std", feature = "rand_chacha"))]
+    pub fn remove_witness_program(&self) {
+        crate::plonk::witness_program::remove(&self.prover_only)
+    }
+
+    /// The installed witness program, if any.
+    #[cfg(all(feature = "std", feature = "rand_chacha"))]
+    pub fn witness_program(&self) -> Option<crate::plonk::witness_program::WitnessProgram> {
+        crate::plonk::witness_program::installed(&self.prover_only)
+    }
+
+    /// Decodes a witness program stored with
+    /// [`WitnessProgram::to_bytes`](crate::plonk::witness_program::WitnessProgram::to_bytes),
+    /// checking that it belongs to this circuit and to the running build. Does
+    /// not install it.
+    #[cfg(all(feature = "std", feature = "rand_chacha"))]
+    pub fn witness_program_from_bytes(
+        &self,
+        bytes: &[u8],
+    ) -> core::result::Result<
+        crate::plonk::witness_program::WitnessProgram,
+        crate::plonk::witness_program::WitnessProgramError,
+    > {
+        crate::plonk::witness_program::from_bytes(bytes, &self.prover_only)
+    }
+
     pub fn verify_compressed(
         &self,
         compressed_proof_with_pis: CompressedProofWithPublicInputs<F, C, D>,
@@ -292,6 +368,82 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             &mut TimingTree::default(),
         )
     }
+
+    /// Checks, without compiling, whether the circuit can have a witness
+    /// program: every generator must describe its operation and the circuit
+    /// must not use lookup tables. See [`crate::plonk::witness_program`].
+    #[cfg(all(feature = "std", feature = "rand_chacha"))]
+    pub fn witness_program_support(
+        &self,
+    ) -> core::result::Result<(), crate::plonk::witness_program::WitnessProgramError> {
+        crate::plonk::witness_program::support(&self.prover_only, &self.common)
+    }
+
+    /// Compiles a witness program for proofs whose inputs set exactly
+    /// `input_targets`; their values do not matter. Takes about 0.3 s per
+    /// million generators on an Apple M4; does not install the program.
+    #[cfg(all(feature = "std", feature = "rand_chacha"))]
+    pub fn compile_witness_program(
+        &self,
+        input_targets: &[crate::iop::target::Target],
+    ) -> core::result::Result<
+        crate::plonk::witness_program::WitnessProgram,
+        crate::plonk::witness_program::WitnessProgramError,
+    > {
+        crate::plonk::witness_program::compile(&self.prover_only, &self.common, input_targets)
+    }
+
+    /// Compiles a witness program for proofs that set the same targets as
+    /// `inputs`; only the targets are read, not their values.
+    #[cfg(all(feature = "std", feature = "rand_chacha"))]
+    pub fn compile_witness_program_like(
+        &self,
+        inputs: &PartialWitness<F>,
+    ) -> core::result::Result<
+        crate::plonk::witness_program::WitnessProgram,
+        crate::plonk::witness_program::WitnessProgramError,
+    > {
+        let targets = inputs.target_values.keys().copied().collect::<Vec<_>>();
+        self.compile_witness_program(&targets)
+    }
+
+    /// Installs `program`, replacing any installed program. Later proofs whose
+    /// inputs match it use the compiled executor; others use the worklist.
+    /// Clones of this circuit data share the installed program.
+    #[cfg(all(feature = "std", feature = "rand_chacha"))]
+    pub fn install_witness_program(
+        &self,
+        program: crate::plonk::witness_program::WitnessProgram,
+    ) -> core::result::Result<(), crate::plonk::witness_program::WitnessProgramError> {
+        crate::plonk::witness_program::install(&self.prover_only, program)
+    }
+
+    /// Removes the installed witness program; later proofs use the worklist.
+    #[cfg(all(feature = "std", feature = "rand_chacha"))]
+    pub fn remove_witness_program(&self) {
+        crate::plonk::witness_program::remove(&self.prover_only)
+    }
+
+    /// The installed witness program, if any.
+    #[cfg(all(feature = "std", feature = "rand_chacha"))]
+    pub fn witness_program(&self) -> Option<crate::plonk::witness_program::WitnessProgram> {
+        crate::plonk::witness_program::installed(&self.prover_only)
+    }
+
+    /// Decodes a witness program stored with
+    /// [`WitnessProgram::to_bytes`](crate::plonk::witness_program::WitnessProgram::to_bytes),
+    /// checking that it belongs to this circuit and to the running build. Does
+    /// not install it.
+    #[cfg(all(feature = "std", feature = "rand_chacha"))]
+    pub fn witness_program_from_bytes(
+        &self,
+        bytes: &[u8],
+    ) -> core::result::Result<
+        crate::plonk::witness_program::WitnessProgram,
+        crate::plonk::witness_program::WitnessProgramError,
+    > {
+        crate::plonk::witness_program::from_bytes(bytes, &self.prover_only)
+    }
 }
 
 /// Circuit data required by the prover.
@@ -362,6 +514,25 @@ pub struct ProverOnlyCircuitData<
     pub lookup_rows: Vec<LookupWire>,
     /// A vector of (looking_in, looking_out) pairs for each lookup table index.
     pub lut_to_lookups: Vec<Lookup>,
+    /// The generators watching each target, built on the first proof.
+    #[cfg(feature = "std")]
+    pub(crate) watch_table: crate::iop::generator::WatchTableCache,
+    /// The rounds in which the generators finished, recorded on the first
+    /// proof and replayed by later ones.
+    #[cfg(feature = "std")]
+    pub(crate) generator_schedule: crate::iop::generator::GeneratorSchedule,
+    /// Reusable witness allocations, excluded from serialization and equality.
+    #[cfg(feature = "std")]
+    pub(crate) witness_buffers: crate::iop::witness::WitnessBuffers<F>,
+    /// The device copy of the sigma values (column-major), uploaded by the
+    /// first proof that computes the partial products on the GPU.
+    #[cfg(feature = "gpu")]
+    pub(crate) device_sigmas: crate::gpu::DeviceCache,
+    /// The compiled witness program the caller installed, if any (see
+    /// [`crate::plonk::witness_program`]); omitted from serialization and
+    /// equality.
+    #[cfg(all(feature = "std", feature = "rand_chacha"))]
+    pub(crate) witness_program: crate::plonk::witness_program::region::ProgramCache,
 }
 
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
@@ -669,4 +840,44 @@ pub struct VerifierCircuitTarget {
     /// A digest of the "circuit" (i.e. the instance, minus public inputs), which can be used to
     /// seed Fiat-Shamir.
     pub circuit_digest: HashOutTarget,
+}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::*;
+    use crate::field::types::Field;
+    use crate::iop::witness::WitnessWrite;
+    use crate::plonk::circuit_builder::CircuitBuilder;
+    use crate::plonk::config::PoseidonGoldilocksConfig;
+    use crate::util::serialization::{DefaultGateSerializer, DefaultGeneratorSerializer};
+
+    /// Caches filled by proving (the watch table, the recorded generator
+    /// schedule, retained buffers) are not part of a circuit's value, so a
+    /// proved circuit still equals its serialized round trip, as pod2's tests
+    /// expect of upstream plonky2.
+    #[test]
+    fn proved_circuit_equals_its_round_trip() {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let x = builder.add_virtual_target();
+        let mut y = x;
+        for _ in 0..64 {
+            y = builder.mul_add(y, y, x);
+        }
+        let hash = builder.hash_n_to_hash_no_pad::<crate::hash::poseidon::PoseidonHash>(vec![y]);
+        builder.register_public_inputs(&hash.elements);
+        let data = builder.build::<C>();
+        for _ in 0..2 {
+            let mut pw = PartialWitness::new();
+            pw.set_target(x, F::from_canonical_u64(3)).unwrap();
+            data.verify(data.prove(pw).unwrap()).unwrap();
+        }
+        let gates = DefaultGateSerializer;
+        let generators = DefaultGeneratorSerializer::<C, D>::default();
+        let bytes = data.to_bytes(&gates, &generators).unwrap();
+        let round_trip = CircuitData::<F, C, D>::from_bytes(&bytes, &gates, &generators).unwrap();
+        assert!(round_trip == data);
+    }
 }

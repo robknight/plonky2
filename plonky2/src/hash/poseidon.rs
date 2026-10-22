@@ -874,6 +874,7 @@ impl<T: Copy + Debug + Default + Eq + Permuter + Send + Sync> PlonkyPermutation<
 pub struct PoseidonHash;
 impl<F: RichField> Hasher<F> for PoseidonHash {
     const HASH_SIZE: usize = 4 * 8;
+    const GPU_POSEIDON: bool = true;
     type Hash = HashOut<F>;
     type Permutation = PoseidonPermutation<F>;
 

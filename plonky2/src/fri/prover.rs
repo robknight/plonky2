@@ -81,7 +81,44 @@ pub fn final_poly_coeff_len(mut degree_bits: usize, reduction_arity_bits: &Vec<u
     1 << degree_bits
 }
 
+/// The commit phase: the trees of the folded codewords and the final polynomial. With the
+/// `gpu` feature and a suitable adapter the layers are folded and committed on the device,
+/// producing the same trees as [`fri_committed_trees_cpu`].
 fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
+    coeffs: PolynomialCoeffs<F::Extension>,
+    values: PolynomialValues<F::Extension>,
+    challenger: &mut Challenger<F, C::Hasher>,
+    fri_params: &FriParams,
+    final_poly_coeff_len: Option<usize>,
+    max_num_query_steps: Option<usize>,
+) -> FriCommitedTrees<F, C, D> {
+    #[cfg(feature = "gpu")]
+    if let Some(result) = crate::gpu::fri::try_committed_trees::<F, C, D>(
+        &coeffs,
+        &values,
+        challenger,
+        fri_params,
+        final_poly_coeff_len,
+        max_num_query_steps,
+    ) {
+        return result;
+    }
+    fri_committed_trees_cpu::<F, C, D>(
+        coeffs,
+        values,
+        challenger,
+        fri_params,
+        final_poly_coeff_len,
+        max_num_query_steps,
+    )
+}
+
+/// `fri_committed_trees` on the CPU.
+pub(crate) fn fri_committed_trees_cpu<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
     mut coeffs: PolynomialCoeffs<F::Extension>,
     mut values: PolynomialValues<F::Extension>,
     challenger: &mut Challenger<F, C::Hasher>,
@@ -180,15 +217,45 @@ pub(crate) fn fri_proof_of_work<
     let witness_input_pos = challenger.input_buffer.len();
     duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
 
-    let pow_witness = (0..=F::NEG_ONE.to_canonical_u64())
-        .into_par_iter()
-        .find_any(|&candidate| {
-            let mut duplex_state = duplex_intermediate_state;
-            duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
-            duplex_state.permute();
-            let pow_response = duplex_state.squeeze().iter().last().unwrap();
-            let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
-            leading_zeros >= min_leading_zeros
+    let response_ok = |candidate: u64| {
+        let mut duplex_state = duplex_intermediate_state;
+        duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
+        duplex_state.permute();
+        let pow_response = duplex_state.squeeze().iter().last().unwrap();
+        let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
+        leading_zeros >= min_leading_zeros
+    };
+
+    // With the Poseidon hasher the search runs on the GPU when one is
+    // available; its nonce is checked here with the CPU permutation, and any
+    // failure falls back to the CPU search below.
+    #[cfg(feature = "gpu")]
+    let gpu_witness = if <C::Hasher as crate::plonk::config::Hasher<F>>::GPU_POSEIDON {
+        crate::gpu::pow::search(
+            duplex_intermediate_state.as_ref(),
+            witness_input_pos,
+            min_leading_zeros,
+        )
+        .filter(|&candidate| {
+            let ok = response_ok(candidate);
+            if !ok {
+                log::warn!(
+                    "gpu: proof-of-work candidate failed the CPU check; searching on the CPU"
+                );
+            }
+            ok
+        })
+    } else {
+        None
+    };
+    #[cfg(not(feature = "gpu"))]
+    let gpu_witness: Option<u64> = None;
+
+    let pow_witness = gpu_witness
+        .or_else(|| {
+            (0..=F::NEG_ONE.to_canonical_u64())
+                .into_par_iter()
+                .find_any(|&candidate| response_ok(candidate))
         })
         .map(F::from_canonical_u64)
         .expect("Proof of work failed. This is highly unlikely!");
@@ -201,7 +268,7 @@ pub(crate) fn fri_proof_of_work<
     pow_witness
 }
 
-fn fri_prover_query_rounds<
+pub(crate) fn fri_prover_query_rounds<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
     const D: usize,
@@ -212,11 +279,23 @@ fn fri_prover_query_rounds<
     n: usize,
     fri_params: &FriParams,
 ) -> Vec<FriQueryRound<F, C::Hasher, D>> {
-    challenger
+    let indices = challenger
         .get_n_challenges(fri_params.config.num_query_rounds)
+        .iter()
+        .map(|rand| rand.to_canonical_u64() as usize % n)
+        .collect::<Vec<_>>();
+    #[cfg(feature = "gpu")]
+    for tree in initial_merkle_trees {
+        tree.leaves.prepare_queries(&indices);
+        tree.digests.prepare_paths(
+            &indices,
+            tree.leaves.len(),
+            crate::util::log2_strict(tree.cap.len()),
+        );
+    }
+    indices
         .into_par_iter()
-        .map(|rand| {
-            let x_index = rand.to_canonical_u64() as usize % n;
+        .map(|x_index| {
             fri_prover_query_round::<F, C, D>(initial_merkle_trees, trees, x_index, fri_params)
         })
         .collect()

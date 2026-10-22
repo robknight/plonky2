@@ -96,6 +96,14 @@ where
 /// An example of using Plonky2 to prove a statement of the form
 /// "I know the square root of this field element."
 fn main() -> Result<()> {
+    let result = run();
+    // Application-owned proving state has dropped, including on an error.
+    #[cfg(feature = "gpu")]
+    plonky2::gpu::shutdown()?;
+    result
+}
+
+fn run() -> Result<()> {
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
     type F = <C as GenericConfig<D>>::F;

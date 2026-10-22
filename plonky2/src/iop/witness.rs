@@ -5,6 +5,7 @@ use core::iter::zip;
 use anyhow::{anyhow, Result};
 use hashbrown::HashMap;
 use itertools::{zip_eq, Itertools};
+use plonky2_maybe_rayon::*;
 
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::types::Field;
@@ -327,6 +328,54 @@ impl<F: Field> Witness<F> for PartialWitness<F> {
     }
 }
 
+/// Scratch allocations only; not part of the circuit's identity or serialization.
+#[cfg(feature = "std")]
+pub(crate) struct WitnessBuffers<F: Field>(std::sync::Mutex<Vec<Vec<Option<F>>>>);
+
+#[cfg(feature = "std")]
+impl<F: Field> WitnessBuffers<F> {
+    pub(crate) fn take(&self) -> Option<Vec<Option<F>>> {
+        self.0.lock().unwrap().pop()
+    }
+
+    pub(crate) fn recycle(&self, values: Vec<Option<F>>) {
+        let mut buffers = self.0.lock().unwrap();
+        // Bound idle retention even if callers temporarily issue many proofs.
+        if buffers.len() < 3 {
+            buffers.push(values);
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<F: Field> Default for WitnessBuffers<F> {
+    fn default() -> Self {
+        Self(std::sync::Mutex::new(Vec::new()))
+    }
+}
+#[cfg(feature = "std")]
+impl<F: Field> Clone for WitnessBuffers<F> {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+#[cfg(feature = "std")]
+impl<F: Field> core::fmt::Debug for WitnessBuffers<F> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WitnessBuffers")
+            .field("idle", &self.0.lock().unwrap().len())
+            .finish()
+    }
+}
+#[cfg(feature = "std")]
+impl<F: Field> PartialEq for WitnessBuffers<F> {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+#[cfg(feature = "std")]
+impl<F: Field> Eq for WitnessBuffers<F> {}
+
 /// `PartitionWitness` holds a disjoint-set forest of the targets respecting a circuit's copy constraints.
 /// The value of a target is defined to be the value of its root in the forest.
 #[derive(Clone, Debug)]
@@ -373,18 +422,46 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
         target.index(self.num_wires, self.degree)
     }
 
+    /// The wire values as columns, unset wires being zero. Blocks of rows
+    /// are gathered in parallel: a row's wires are contiguous in the
+    /// representative map, and each block writes its own range of every
+    /// column.
     pub fn full_witness(self) -> MatrixWitness<F> {
-        let mut wire_values = vec![vec![F::ZERO; self.degree]; self.num_wires];
-        for i in 0..self.degree {
-            for j in 0..self.num_wires {
-                let t = Target::Wire(Wire { row: i, column: j });
-                if let Some(x) = self.try_get_target(t) {
-                    wire_values[j][i] = x;
-                }
-            }
-        }
+        self.full_witness_and_buffer().0
+    }
 
-        MatrixWitness { wire_values }
+    pub(crate) fn full_witness_and_buffer(self) -> (MatrixWitness<F>, Vec<Option<F>>) {
+        const ROWS: usize = 1024;
+        let mut wire_values = vec![vec![F::ZERO; self.degree]; self.num_wires];
+        let mut per_column = wire_values
+            .iter_mut()
+            .map(|column| column.chunks_mut(ROWS))
+            .collect::<Vec<_>>();
+        let blocks = (0..self.degree.div_ceil(ROWS))
+            .map(|_| {
+                per_column
+                    .iter_mut()
+                    .map(|chunks| chunks.next().unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let (values, map, num_wires) = (&self.values, self.representative_map, self.num_wires);
+        blocks
+            .into_par_iter()
+            .enumerate()
+            .for_each(|(block, mut columns)| {
+                let base = block * ROWS;
+                for (r, row) in (base..(base + ROWS).min(self.degree)).enumerate() {
+                    let reps = &map[row * num_wires..(row + 1) * num_wires];
+                    for (column, &rep) in columns.iter_mut().zip(reps) {
+                        if let Some(x) = values[rep] {
+                            column[r] = x;
+                        }
+                    }
+                }
+            });
+
+        (MatrixWitness { wire_values }, self.values)
     }
 }
 

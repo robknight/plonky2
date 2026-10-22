@@ -367,6 +367,17 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         deps
     }
 
+    fn witness_operation(&self) -> Option<crate::iop::generator::WitnessOperation> {
+        use crate::iop::generator::WitnessOperation;
+        (self.gate.bits < usize::BITS as usize).then_some(WitnessOperation::RandomAccess {
+            row: self.row,
+            copy: self.copy,
+            bits: self.gate.bits,
+            num_copies: self.gate.num_copies,
+            num_extra_constants: self.gate.num_extra_constants,
+        })
+    }
+
     fn run_once(
         &self,
         witness: &PartitionWitness<F>,

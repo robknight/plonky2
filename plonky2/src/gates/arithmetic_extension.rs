@@ -184,6 +184,25 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         "ArithmeticExtensionGenerator".to_string()
     }
 
+    fn witness_operation(&self) -> Option<crate::iop::generator::WitnessOperation> {
+        use crate::iop::generator::WitnessOperation;
+        if D != 2 || !WitnessOperation::field_supported::<F>() {
+            return None;
+        }
+        Some(WitnessOperation::ExtensionArithmetic {
+            inputs: self.dependencies().try_into().ok()?,
+            outputs: ArithmeticExtensionGate::<D>::wires_ith_output(self.i)
+                .map(|col| Target::wire(self.row, col))
+                .collect::<Vec<_>>()
+                .try_into()
+                .ok()?,
+            coefficients: [
+                self.const_0.to_canonical_u64(),
+                self.const_1.to_canonical_u64(),
+            ],
+        })
+    }
+
     fn dependencies(&self) -> Vec<Target> {
         ArithmeticExtensionGate::<D>::wires_ith_multiplicand_0(self.i)
             .chain(ArithmeticExtensionGate::<D>::wires_ith_multiplicand_1(

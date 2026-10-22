@@ -536,6 +536,19 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         deps
     }
 
+    fn witness_operation(&self) -> Option<crate::iop::generator::WitnessOperation> {
+        use crate::iop::generator::WitnessOperation;
+        if D != 2 || !WitnessOperation::field_supported::<F>() {
+            return None;
+        }
+        let mut inputs = self.numerator.to_target_array().to_vec();
+        inputs.extend(self.denominator.to_target_array());
+        Some(WitnessOperation::ExtensionQuotient {
+            inputs: inputs.try_into().ok()?,
+            outputs: self.quotient.to_target_array().to_vec().try_into().ok()?,
+        })
+    }
+
     fn run_once(
         &self,
         witness: &PartitionWitness<F>,

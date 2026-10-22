@@ -4,6 +4,8 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 #![deny(missing_debug_implementations)]
 #![cfg_attr(not(feature = "std"), no_std)]
+// The auto-trait proofs for the wgpu types held by the GPU context exceed the default depth.
+#![cfg_attr(feature = "gpu", recursion_limit = "512")]
 
 #[cfg(not(feature = "std"))]
 pub extern crate alloc;
@@ -16,6 +18,8 @@ pub mod batch_fri;
 pub mod fri;
 pub mod gadgets;
 pub mod gates;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod hash;
 pub mod iop;
 pub mod plonk;

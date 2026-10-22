@@ -7,6 +7,14 @@ use plonky2::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
 
 /// An example of using Plonky2 to prove that a given value lies in a given range.
 fn main() -> Result<()> {
+    let result = run();
+    // Application-owned proving state has dropped, including on an error.
+    #[cfg(feature = "gpu")]
+    plonky2::gpu::shutdown()?;
+    result
+}
+
+fn run() -> Result<()> {
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
     type F = <C as GenericConfig<D>>::F;

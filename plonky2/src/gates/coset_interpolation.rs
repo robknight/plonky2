@@ -444,6 +444,40 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         deps
     }
 
+    fn witness_operation(&self) -> Option<crate::iop::generator::WitnessOperation> {
+        use crate::iop::generator::WitnessOperation;
+        if D != 2 || !WitnessOperation::field_supported::<F>() {
+            return None;
+        }
+        let wire = |column| Target::wire(self.row, column);
+        let mut outputs = self
+            .gate
+            .wires_shifted_evaluation_point()
+            .map(wire)
+            .collect::<Vec<_>>();
+        for i in 0..self.gate.num_intermediates() {
+            outputs.extend(self.gate.wires_intermediate_eval(i).map(wire));
+            outputs.extend(self.gate.wires_intermediate_prod(i).map(wire));
+        }
+        outputs.extend(self.gate.wires_evaluation_value().map(wire));
+        Some(WitnessOperation::CosetInterpolation {
+            inputs: self.dependencies(),
+            outputs,
+            degree: self.gate.degree(),
+            domain: self
+                .interpolation_domain
+                .iter()
+                .map(F::to_canonical_u64)
+                .collect(),
+            weights: self
+                .gate
+                .barycentric_weights
+                .iter()
+                .map(F::to_canonical_u64)
+                .collect(),
+        })
+    }
+
     fn run_once(
         &self,
         witness: &PartitionWitness<F>,

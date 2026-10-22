@@ -399,6 +399,13 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D> for Equ
         vec![self.x, self.y]
     }
 
+    fn witness_operation(&self) -> Option<crate::iop::generator::WitnessOperation> {
+        Some(crate::iop::generator::WitnessOperation::Equality {
+            inputs: [self.x, self.y],
+            outputs: [self.equal.target, self.inv],
+        })
+    }
+
     fn run_once(
         &self,
         witness: &PartitionWitness<F>,

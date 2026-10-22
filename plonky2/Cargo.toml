@@ -13,8 +13,16 @@ categories.workspace = true
 [features]
 default = ["gate_testing", "parallel", "rand_chacha", "std", "timing"]
 gate_testing = []
-parallel = ["hashbrown/rayon", "plonky2_maybe_rayon/parallel"]
+# GPU proving through wgpu (Metal, Vulkan, DirectX 12): Merkle hashing,
+# low-degree extensions, FRI, the quotient polynomial and the openings.
+# Selected at runtime when a suitable adapter exists; otherwise the CPU paths
+# run unchanged. See the `plonky2::gpu` module documentation.
+gpu = ["std", "timing", "rand_chacha", "dep:wgpu", "dep:pollster", "dep:naga", "dep:serde_json"]
+# Optional capture, shader dumps, and profiling benchmarks.
+gpu-profiling = ["gpu", "naga/msl-out", "dep:objc2-metal", "dep:objc2-foundation"]
+parallel = ["hashbrown/rayon", "plonky2_maybe_rayon/parallel", "dep:rayon"]
 std = ["anyhow/std", "rand/std", "itertools/use_std"]
+rand_chacha = ["dep:rand_chacha", "dep:chacha20", "dep:zeroize"]
 timing = ["std", "dep:web-time"]
 
 [dependencies]
@@ -26,19 +34,36 @@ keccak-hash = { version = "0.12.0", default-features = false }
 log = { workspace = true }
 num = { workspace = true }
 rand = { workspace = true }
+chacha20 = { version = "0.10.2", optional = true, default-features = false, features = ["rng", "zeroize"] }
+zeroize = { version = "1.8.2", optional = true, features = ["alloc"] }
 rand_chacha = { version = "0.3.1", optional = true, default-features = false }
 serde = { workspace = true, features = ["rc"] }
+serde_json = { version = "1.0", optional = true }
 static_assertions = { workspace = true }
 unroll = { workspace = true }
 web-time = { version = "1.0.0", optional = true }
 dyn-clone = "1.0.18"
 serde_arrays = "0.2.0"
+rayon = { version = "1.5.3", optional = true }
+wgpu = { version = "30.0", optional = true, default-features = false, features = ["std", "parking_lot", "metal", "vulkan", "dx12", "wgsl"] }
+pollster = { version = "0.4", optional = true }
+naga = { version = "30.0", optional = true, features = ["wgsl-in"] }
 
 # Local dependencies
 plonky2_field = { version = "1.0.0", path = "../field", default-features = false }
 plonky2_maybe_rayon = { version = "1.0.0", path = "../maybe_rayon", default-features = false }
 plonky2_util = { version = "1.0.0", path = "../util", default-features = false }
 
+
+[target.'cfg(unix)'.dependencies]
+# sysctl on macOS.
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# GPU debugger captures (gpu/capture.rs); both crates are already in the
+# build graph through wgpu's Metal backend.
+objc2-metal = { version = "0.3.2", optional = true, features = ["MTLCaptureManager", "MTLCaptureScope", "MTLDevice"] }
+objc2-foundation = { version = "0.3.2", optional = true, features = ["NSString", "NSURL", "NSError"] }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom = { version = "0.2", default-features = false, features = ["js"] }

@@ -120,12 +120,54 @@ where
     C::Hasher: Hasher<F>,
     C::InnerHasher: Hasher<F>,
 {
+    // The compiled executor runs only with a witness program the caller
+    // installed for these inputs (see `crate::plonk::witness_program`).
+    #[cfg(all(feature = "std", feature = "rand_chacha"))]
+    if prover_data
+        .witness_program
+        .has_all(prover_data.generators.len())
+    {
+        use crate::plonk::witness_program::region::cpu::{self, Wires};
+        // Same label as the worklist, so timing trees compare across paths.
+        match timed!(
+            timing,
+            &format!("run {} generators", prover_data.generators.len()),
+            cpu::generate_wires(&inputs, prover_data, common_data, true)
+        ) {
+            Ok(None) => {}
+            Ok(Some((public_inputs, wires, report))) => {
+                report.log();
+                #[cfg(feature = "gpu")]
+                let (witness, resident) = match wires {
+                    Wires::Host(witness) => (Some(witness), None),
+                    Wires::Resident(resident) => (None, Some(resident)),
+                };
+                #[cfg(not(feature = "gpu"))]
+                let Wires::Host(witness) = wires;
+                #[cfg(not(feature = "gpu"))]
+                let witness = Some(witness);
+                return prove_from_wires(
+                    prover_data,
+                    common_data,
+                    public_inputs,
+                    witness,
+                    timing,
+                    #[cfg(feature = "gpu")]
+                    resident,
+                );
+            }
+            // An installed program that cannot run these inputs; the worklist
+            // is correct for any inputs.
+            Err(error) => {
+                log::warn!("plonky2: witness program failed, using the worklist: {error:#}");
+            }
+        }
+    }
     let partition_witness = timed!(
         timing,
         &format!("run {} generators", prover_data.generators.len()),
         generate_partial_witness(inputs, prover_data, common_data)?
     );
-
     prove_with_partition_witness(prover_data, common_data, partition_witness, timing)
 }
 
@@ -143,45 +185,149 @@ where
     C::Hasher: Hasher<F>,
     C::InnerHasher: Hasher<F>,
 {
+    timed!(
+        timing,
+        "set lookup wires",
+        set_lookup_wires(prover_data, common_data, &mut partition_witness)
+    )?;
+    let public_inputs = timed!(
+        timing,
+        "collect public inputs",
+        partition_witness.get_targets(&prover_data.public_inputs)
+    );
+    let witness = timed!(timing, "compute full witness", {
+        let (witness, buffer) = partition_witness.full_witness_and_buffer();
+        #[cfg(feature = "std")]
+        prover_data.witness_buffers.recycle(buffer);
+        #[cfg(not(feature = "std"))]
+        drop(buffer);
+        witness
+    });
+    prove_from_wires(
+        prover_data,
+        common_data,
+        public_inputs,
+        Some(witness),
+        timing,
+        #[cfg(feature = "gpu")]
+        None,
+    )
+}
+
+/// Proves from the wire values: a host matrix, or with the `gpu` feature a
+/// resident device buffer in column-major order. The public inputs are
+/// supplied by the caller.
+pub(crate) fn prove_from_wires<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
+    public_inputs: Vec<F>,
+    witness: Option<MatrixWitness<F>>,
+    timing: &mut TimingTree,
+    #[cfg(feature = "gpu")] resident: Option<crate::gpu::resident_witness::ResidentWitness>,
+) -> Result<ProofWithPublicInputs<F, C, D>>
+where
+    C::Hasher: Hasher<F>,
+    C::InnerHasher: Hasher<F>,
+{
+    #[cfg(feature = "gpu")]
+    let gpu_plan = timed!(
+        timing,
+        "plan GPU execution",
+        crate::gpu::policy::ExecutionPlan::new(common_data, prover_data)
+    );
+    // Compile the GPU proof-of-work search in the background (Poseidon only);
+    // the guard joins the thread before this proof returns.
+    #[cfg(feature = "gpu")]
+    let _pow_warm = match &gpu_plan.prepared {
+        Some((ctx, _)) if <C::Hasher as crate::plonk::config::Hasher<F>>::GPU_POSEIDON => {
+            Some(crate::gpu::pow::warm(ctx))
+        }
+        _ => None,
+    };
+
     let has_lookup = !common_data.luts.is_empty();
     let config = &common_data.config;
     let num_challenges = config.num_challenges;
     let quotient_degree = common_data.quotient_degree();
     let degree = common_data.degree();
 
-    set_lookup_wires(prover_data, common_data, &mut partition_witness)?;
-
-    let public_inputs = partition_witness.get_targets(&prover_data.public_inputs);
-    let public_inputs_hash = C::InnerHasher::hash_no_pad(&public_inputs);
-
-    let witness = timed!(
+    let public_inputs_hash = timed!(
         timing,
-        "compute full witness",
-        partition_witness.full_witness()
+        "hash public inputs",
+        C::InnerHasher::hash_no_pad(&public_inputs)
     );
-
-    let wires_values: Vec<PolynomialValues<F>> = timed!(
-        timing,
-        "compute wire polynomials",
-        witness
-            .wire_values
-            .par_iter()
-            .map(|column| PolynomialValues::new(column.clone()))
-            .collect()
-    );
-
-    let wires_commitment = timed!(
-        timing,
-        "compute wires commitment",
-        PolynomialBatch::<F, C, D>::from_values(
-            wires_values,
-            config.fri_config.rate_bits,
-            config.zero_knowledge && PlonkOracle::WIRES.blinding,
-            config.fri_config.cap_height,
+    #[cfg(feature = "gpu")]
+    let resident_mode = resident.is_some();
+    #[cfg(not(feature = "gpu"))]
+    let resident_mode = false;
+    #[cfg(not(feature = "gpu"))]
+    debug_assert!(witness.is_some());
+    #[cfg(feature = "gpu")]
+    let mut witness = witness;
+    let wires_values = if resident_mode {
+        None
+    } else {
+        Some(timed!(
             timing,
-            prover_data.fft_root_table.as_ref(),
-        )
-    );
+            "compute wire polynomials",
+            witness
+                .as_ref()
+                .unwrap()
+                .wire_values
+                .par_iter()
+                .map(|column| PolynomialValues::new(column.clone()))
+                .collect::<Vec<_>>()
+        ))
+    };
+    // The device that holds resident wires, kept for the CPU permutation
+    // fallback so it never depends on the global context mid-proof.
+    #[cfg(feature = "gpu")]
+    let resident_ctx = resident.as_ref().map(|resident| resident.ctx.clone());
+    let mut wires_commitment = {
+        #[cfg(feature = "gpu-profiling")]
+        let _capture = crate::gpu::capture::Capture::wires();
+        #[cfg(feature = "gpu")]
+        let resident_commitment = resident.map(|resident| {
+            timed!(
+                timing,
+                "compute resident wires commitment",
+                crate::gpu::lde::from_device_values::<F, C, D>(
+                    &resident.ctx,
+                    resident.wire_values,
+                    config.num_wires,
+                    degree,
+                    config.fri_config.rate_bits,
+                    config.zero_knowledge && PlonkOracle::WIRES.blinding,
+                    config.fri_config.cap_height,
+                    timing,
+                    gpu_plan.retain_leaves()
+                )
+            )
+        });
+        #[cfg(not(feature = "gpu"))]
+        let resident_commitment: Option<PolynomialBatch<F, C, D>> = None;
+        match resident_commitment {
+            Some(commitment) => commitment,
+            None => timed!(
+                timing,
+                "compute wires commitment",
+                PolynomialBatch::<F, C, D>::from_values_with_plan(
+                    wires_values.unwrap(),
+                    config.fri_config.rate_bits,
+                    config.zero_knowledge && PlonkOracle::WIRES.blinding,
+                    config.fri_config.cap_height,
+                    timing,
+                    prover_data.fft_root_table.as_ref(),
+                    #[cfg(feature = "gpu")]
+                    Some(&gpu_plan)
+                )
+            ),
+        }
+    };
 
     let mut challenger = Challenger::<F, C::Hasher>::new();
 
@@ -217,41 +363,93 @@ where
         common_data.quotient_degree_factor < common_data.config.num_routed_wires,
         "When the number of routed wires is smaller that the degree, we should change the logic to avoid computing partial products."
     );
-    let mut partial_products_and_zs = timed!(
+    // With the `gpu` feature the partial products and Z's are computed from
+    // the wires commitment's device values and committed from the device.
+    #[cfg(feature = "gpu")]
+    let gpu_commitment = timed!(
         timing,
-        "compute partial products",
-        all_wires_permutation_partial_products(&witness, &betas, &gammas, prover_data, common_data)
-    );
-
-    // Z is expected at the front of our batch; see `zs_range` and `partial_products_range`.
-    let plonk_z_vecs = partial_products_and_zs
-        .iter_mut()
-        .map(|partial_products_and_z| partial_products_and_z.pop().unwrap())
-        .collect();
-    let zs_partial_products = [plonk_z_vecs, partial_products_and_zs.concat()].concat();
-
-    // All lookup polys: RE and partial SLDCs.
-    let lookup_polys =
-        compute_all_lookup_polys(&witness, &deltas, prover_data, common_data, has_lookup);
-
-    let zs_partial_products_lookups = if has_lookup {
-        [zs_partial_products, lookup_polys].concat()
-    } else {
-        zs_partial_products
-    };
-
-    let partial_products_zs_and_lookup_commitment = timed!(
-        timing,
-        "commit to partial products, Z's and, if any, lookup polynomials",
-        PolynomialBatch::from_values(
-            zs_partial_products_lookups,
-            config.fri_config.rate_bits,
-            config.zero_knowledge && PlonkOracle::ZS_PARTIAL_PRODUCTS.blinding,
-            config.fri_config.cap_height,
+        "compute and commit to partial products and Z's",
+        crate::gpu::permutation::try_partial_products_commitment(
+            &wires_commitment,
+            &betas,
+            &gammas,
+            prover_data,
+            common_data,
             timing,
-            prover_data.fft_root_table.as_ref(),
+            Some(&gpu_plan),
         )
     );
+    #[cfg(not(feature = "gpu"))]
+    let gpu_commitment: Option<PolynomialBatch<F, C, D>> = None;
+    let mut partial_products_zs_and_lookup_commitment = match gpu_commitment {
+        Some(commitment) => commitment,
+        None => {
+            #[cfg(feature = "gpu")]
+            if witness.is_none() {
+                let ctx = resident_ctx
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("GPU witness context unavailable"))?;
+                let values = wires_commitment.device_values.get().ok_or_else(|| {
+                    anyhow::anyhow!("GPU witness values unavailable for CPU permutation fallback")
+                })?;
+                witness = Some(MatrixWitness {
+                    wire_values: crate::gpu::lde::read_columns::<F>(
+                        &ctx,
+                        &values,
+                        config.num_wires,
+                        degree,
+                    ),
+                });
+                eprintln!("GPU_WITNESS_RESIDENT fallback_materialization=true");
+            }
+            let witness = witness
+                .as_ref()
+                .expect("CPU permutation requires host wires");
+            let mut partial_products_and_zs = timed!(
+                timing,
+                "compute partial products",
+                all_wires_permutation_partial_products(
+                    &witness,
+                    &betas,
+                    &gammas,
+                    prover_data,
+                    common_data
+                )
+            );
+
+            // Z is expected at the front of our batch; see `zs_range` and `partial_products_range`.
+            let plonk_z_vecs = partial_products_and_zs
+                .iter_mut()
+                .map(|partial_products_and_z| partial_products_and_z.pop().unwrap())
+                .collect();
+            let zs_partial_products = [plonk_z_vecs, partial_products_and_zs.concat()].concat();
+
+            // All lookup polys: RE and partial SLDCs.
+            let lookup_polys =
+                compute_all_lookup_polys(&witness, &deltas, prover_data, common_data, has_lookup);
+
+            let zs_partial_products_lookups = if has_lookup {
+                [zs_partial_products, lookup_polys].concat()
+            } else {
+                zs_partial_products
+            };
+
+            timed!(
+                timing,
+                "commit to partial products, Z's and, if any, lookup polynomials",
+                PolynomialBatch::from_values_with_plan(
+                    zs_partial_products_lookups,
+                    config.fri_config.rate_bits,
+                    config.zero_knowledge && PlonkOracle::ZS_PARTIAL_PRODUCTS.blinding,
+                    config.fri_config.cap_height,
+                    timing,
+                    prover_data.fft_root_table.as_ref(),
+                    #[cfg(feature = "gpu")]
+                    Some(&gpu_plan),
+                )
+            )
+        }
+    };
 
     challenger.observe_cap::<C::Hasher>(&partial_products_zs_and_lookup_commitment.merkle_tree.cap);
 
@@ -270,6 +468,8 @@ where
             &gammas,
             &deltas,
             &alphas,
+            #[cfg(feature = "gpu")]
+            Some(&gpu_plan),
         )
     );
 
@@ -288,16 +488,18 @@ where
             .collect()
     );
 
-    let quotient_polys_commitment = timed!(
+    let mut quotient_polys_commitment = timed!(
         timing,
         "commit to quotient polys",
-        PolynomialBatch::<F, C, D>::from_coeffs(
+        PolynomialBatch::<F, C, D>::from_coeffs_with_plan(
             all_quotient_poly_chunks,
             config.fri_config.rate_bits,
             config.zero_knowledge && PlonkOracle::QUOTIENT.blinding,
             config.fri_config.cap_height,
             timing,
             prover_data.fft_root_table.as_ref(),
+            #[cfg(feature = "gpu")]
+            Some(&gpu_plan),
         )
     );
 
@@ -349,12 +551,36 @@ where
     );
 
     let proof = Proof::<F, C, D> {
-        wires_cap: wires_commitment.merkle_tree.cap,
-        plonk_zs_partial_products_cap: partial_products_zs_and_lookup_commitment.merkle_tree.cap,
-        quotient_polys_cap: quotient_polys_commitment.merkle_tree.cap,
+        wires_cap: core::mem::take(&mut wires_commitment.merkle_tree.cap),
+        plonk_zs_partial_products_cap: core::mem::take(
+            &mut partial_products_zs_and_lookup_commitment.merkle_tree.cap,
+        ),
+        quotient_polys_cap: core::mem::take(&mut quotient_polys_commitment.merkle_tree.cap),
         openings,
         opening_proof,
     };
+    // Release the large buffers in their existing relative order, exposing
+    // host deallocation and the return/destruction of GPU buffers.
+    timed!(timing, "release prover buffers", {
+        timed!(
+            timing,
+            "release quotient commitment",
+            drop(quotient_polys_commitment)
+        );
+        timed!(
+            timing,
+            "release permutation commitment",
+            drop(partial_products_zs_and_lookup_commitment)
+        );
+        drop(challenger);
+        timed!(timing, "release wires commitment", drop(wires_commitment));
+        timed!(timing, "release witness", drop(witness));
+    });
+    // Diagnostic: log this proof's device pass timeline, after its timing.
+    #[cfg(feature = "gpu-profiling")]
+    if let Some(ctx) = crate::gpu::context() {
+        ctx.flush_pass_timeline();
+    }
     Ok(ProofWithPublicInputs::<F, C, D> {
         proof,
         public_inputs,
@@ -606,6 +832,9 @@ fn compute_all_lookup_polys<
 
 const BATCH_SIZE: usize = 32;
 
+/// The quotient polynomials, one per challenge, as coefficients. With the `gpu` feature and a
+/// suitable adapter, circuits without lookups are evaluated by a generated kernel on the device;
+/// the result is the same as [`compute_quotient_polys_cpu`].
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -621,7 +850,92 @@ fn compute_quotient_polys<
     gammas: &[F],
     deltas: &[F],
     alphas: &[F],
+    #[cfg(feature = "gpu")] plan: Option<&crate::gpu::policy::ExecutionPlan>,
 ) -> Vec<PolynomialCoeffs<F>> {
+    #[cfg(feature = "gpu")]
+    if let Some(result) = crate::gpu::quotient::try_compute_quotient_polys::<F, C, D>(
+        common_data,
+        prover_data,
+        public_inputs_hash,
+        wires_commitment,
+        zs_partial_products_and_lookup_commitment,
+        betas,
+        gammas,
+        alphas,
+        plan,
+    ) {
+        return result;
+    }
+    compute_quotient_polys_cpu::<F, C, D>(
+        common_data,
+        prover_data,
+        public_inputs_hash,
+        wires_commitment,
+        zs_partial_products_and_lookup_commitment,
+        betas,
+        gammas,
+        deltas,
+        alphas,
+    )
+}
+
+/// `compute_quotient_polys` on the CPU.
+pub(crate) fn compute_quotient_polys_cpu<
+    'a,
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    common_data: &CommonCircuitData<F, D>,
+    prover_data: &'a ProverOnlyCircuitData<F, C, D>,
+    public_inputs_hash: &<<C as GenericConfig<D>>::InnerHasher as Hasher<F>>::Hash,
+    wires_commitment: &'a PolynomialBatch<F, C, D>,
+    zs_partial_products_and_lookup_commitment: &'a PolynomialBatch<F, C, D>,
+    betas: &[F],
+    gammas: &[F],
+    deltas: &[F],
+    alphas: &[F],
+) -> Vec<PolynomialCoeffs<F>> {
+    let quotient_degree_bits = log2_ceil(common_data.quotient_degree_factor);
+    let lde_size = common_data.degree() << quotient_degree_bits;
+    let quotient_values = quotient_values_cpu::<F, C, D>(
+        common_data,
+        prover_data,
+        public_inputs_hash,
+        wires_commitment,
+        zs_partial_products_and_lookup_commitment,
+        betas,
+        gammas,
+        deltas,
+        alphas,
+        0..lde_size,
+    );
+    transpose(&quotient_values)
+        .into_par_iter()
+        .map(PolynomialValues::new)
+        .map(|values| values.coset_ifft(F::coset_shift()))
+        .collect()
+}
+
+/// The quotient's values at the points `rows` of the extended domain, one
+/// vector of `num_challenges` values per point.
+pub(crate) fn quotient_values_cpu<
+    'a,
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    common_data: &CommonCircuitData<F, D>,
+    prover_data: &'a ProverOnlyCircuitData<F, C, D>,
+    public_inputs_hash: &<<C as GenericConfig<D>>::InnerHasher as Hasher<F>>::Hash,
+    wires_commitment: &'a PolynomialBatch<F, C, D>,
+    zs_partial_products_and_lookup_commitment: &'a PolynomialBatch<F, C, D>,
+    betas: &[F],
+    gammas: &[F],
+    deltas: &[F],
+    alphas: &[F],
+    rows: core::ops::Range<usize>,
+) -> Vec<Vec<F>> {
     let num_challenges = common_data.config.num_challenges;
 
     let has_lookup = common_data.num_lookup_polys != 0;
@@ -681,8 +995,8 @@ fn compute_quotient_polys<
     let lut_re_poly_evals_refs: Vec<&[F]> =
         lut_re_poly_evals.iter().map(|v| v.as_slice()).collect();
 
-    let points_batches = points.par_chunks(BATCH_SIZE);
-    let num_batches = points.len().div_ceil(BATCH_SIZE);
+    let points_batches = points[rows.clone()].par_chunks(BATCH_SIZE);
+    let num_batches = rows.len().div_ceil(BATCH_SIZE);
 
     let quotient_values: Vec<Vec<F>> = points_batches
         .enumerate()
@@ -693,8 +1007,8 @@ fn compute_quotient_polys<
                     || (batch_i == num_batches - 1 && xs_batch.len() <= BATCH_SIZE)
             );
 
-            let indices_batch: Vec<usize> =
-                (BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + xs_batch.len()).collect();
+            let first = rows.start + BATCH_SIZE * batch_i;
+            let indices_batch: Vec<usize> = (first..first + xs_batch.len()).collect();
 
             let mut shifted_xs_batch = Vec::with_capacity(xs_batch.len());
             let mut local_zs_batch = Vec::with_capacity(xs_batch.len());
@@ -806,10 +1120,346 @@ fn compute_quotient_polys<
             quotient_values_batch
         })
         .collect();
+    quotient_values
+}
 
-    transpose(&quotient_values)
-        .into_par_iter()
-        .map(PolynomialValues::new)
-        .map(|values| values.coset_ifft(F::coset_shift()))
-        .collect()
+#[cfg(all(test, feature = "gpu"))]
+mod gpu_tests {
+    use super::*;
+    use crate::gpu::tests::{hash_chain_circuit, mixed_circuit};
+    use crate::hash::hash_types::HashOut;
+    use crate::plonk::circuit_data::CircuitData;
+    use crate::plonk::config::PoseidonGoldilocksConfig;
+
+    type F = crate::field::goldilocks_field::GoldilocksField;
+    type C = PoseidonGoldilocksConfig;
+
+    /// The prover's state after the commitment of the Z's.
+    struct Commitments {
+        public_inputs_hash: HashOut<F>,
+        wires_commitment: PolynomialBatch<F, C, 2>,
+        zs_commitment: PolynomialBatch<F, C, 2>,
+        challenger: Challenger<F, <C as GenericConfig<2>>::Hasher>,
+        betas: Vec<F>,
+        gammas: Vec<F>,
+        alphas: Vec<F>,
+    }
+
+    /// Runs the prover up to the commitment of the Z's.
+    fn commitments(data: &CircuitData<F, C, 2>, inputs: PartialWitness<F>) -> Commitments {
+        let prover_data = &data.prover_only;
+        let common_data = &data.common;
+        let config = &common_data.config;
+        let partition_witness = generate_partial_witness(inputs, prover_data, common_data).unwrap();
+        let public_inputs = partition_witness.get_targets(&prover_data.public_inputs);
+        let public_inputs_hash = <C as GenericConfig<2>>::InnerHasher::hash_no_pad(&public_inputs);
+        let witness = partition_witness.full_witness();
+        let wires_values: Vec<PolynomialValues<F>> = witness
+            .wire_values
+            .iter()
+            .map(|column| PolynomialValues::new(column.clone()))
+            .collect();
+        let mut timing = TimingTree::default();
+        let wires_commitment = PolynomialBatch::<F, C, 2>::from_values(
+            wires_values,
+            config.fri_config.rate_bits,
+            config.zero_knowledge && PlonkOracle::WIRES.blinding,
+            config.fri_config.cap_height,
+            &mut timing,
+            prover_data.fft_root_table.as_ref(),
+        );
+        let mut challenger = Challenger::<F, <C as GenericConfig<2>>::Hasher>::new();
+        common_data.fri_params.observe(&mut challenger);
+        challenger.observe_hash::<<C as GenericConfig<2>>::Hasher>(prover_data.circuit_digest);
+        challenger.observe_hash::<<C as GenericConfig<2>>::InnerHasher>(public_inputs_hash);
+        challenger
+            .observe_cap::<<C as GenericConfig<2>>::Hasher>(&wires_commitment.merkle_tree.cap);
+        let num_challenges = config.num_challenges;
+        let betas = challenger.get_n_challenges(num_challenges);
+        let gammas = challenger.get_n_challenges(num_challenges);
+        let mut partial_products_and_zs = all_wires_permutation_partial_products(
+            &witness,
+            &betas,
+            &gammas,
+            prover_data,
+            common_data,
+        );
+        let plonk_z_vecs = partial_products_and_zs
+            .iter_mut()
+            .map(|partial_products_and_z| partial_products_and_z.pop().unwrap())
+            .collect();
+        let zs_partial_products = [plonk_z_vecs, partial_products_and_zs.concat()].concat();
+        let zs_commitment = PolynomialBatch::<F, C, 2>::from_values(
+            zs_partial_products,
+            config.fri_config.rate_bits,
+            config.zero_knowledge && PlonkOracle::ZS_PARTIAL_PRODUCTS.blinding,
+            config.fri_config.cap_height,
+            &mut timing,
+            prover_data.fft_root_table.as_ref(),
+        );
+        challenger.observe_cap::<<C as GenericConfig<2>>::Hasher>(&zs_commitment.merkle_tree.cap);
+        let alphas = challenger.get_n_challenges(num_challenges);
+        Commitments {
+            public_inputs_hash,
+            wires_commitment,
+            zs_commitment,
+            challenger,
+            betas,
+            gammas,
+            alphas,
+        }
+    }
+
+    /// Runs the prover up to the quotient and compares the GPU and CPU quotients.
+    fn compare_quotients(data: &CircuitData<F, C, 2>, inputs: PartialWitness<F>) {
+        let prover_data = &data.prover_only;
+        let common_data = &data.common;
+        let Commitments {
+            public_inputs_hash,
+            wires_commitment,
+            zs_commitment,
+            betas,
+            gammas,
+            alphas,
+            ..
+        } = commitments(data, inputs);
+        let cpu = compute_quotient_polys_cpu::<F, C, 2>(
+            common_data,
+            prover_data,
+            &public_inputs_hash,
+            &wires_commitment,
+            &zs_commitment,
+            &betas,
+            &gammas,
+            &[],
+            &alphas,
+        );
+        let gpu = crate::gpu::quotient::try_compute_quotient_polys::<F, C, 2>(
+            common_data,
+            prover_data,
+            &public_inputs_hash,
+            &wires_commitment,
+            &zs_commitment,
+            &betas,
+            &gammas,
+            &alphas,
+            None,
+        )
+        .expect("the GPU takes this circuit");
+        assert_eq!(gpu.len(), cpu.len());
+        for (c, (g, e)) in gpu.iter().zip(&cpu).enumerate() {
+            assert_eq!(g.coeffs.len(), e.coeffs.len());
+            let mismatches = g
+                .coeffs
+                .iter()
+                .zip(&e.coeffs)
+                .filter(|(a, b)| a != b)
+                .count();
+            assert_eq!(
+                mismatches, 0,
+                "challenge {c}: {mismatches} coefficients differ"
+            );
+        }
+    }
+
+    /// Runs the prover through the quotient commitment and compares the GPU
+    /// and CPU opening sets and opening proofs for the same challenges.
+    fn compare_opening_phase(data: &CircuitData<F, C, 2>, inputs: PartialWitness<F>) {
+        let prover_data = &data.prover_only;
+        let common_data = &data.common;
+        let config = &common_data.config;
+        let Commitments {
+            public_inputs_hash,
+            wires_commitment,
+            zs_commitment,
+            mut challenger,
+            betas,
+            gammas,
+            alphas,
+        } = commitments(data, inputs);
+        let mut timing = TimingTree::default();
+        let quotient_polys = compute_quotient_polys::<F, C, 2>(
+            common_data,
+            prover_data,
+            &public_inputs_hash,
+            &wires_commitment,
+            &zs_commitment,
+            &betas,
+            &gammas,
+            &[],
+            &alphas,
+            #[cfg(feature = "gpu")]
+            None,
+        );
+        let degree = common_data.degree();
+        let quotient_degree = common_data.quotient_degree();
+        let chunks: Vec<PolynomialCoeffs<F>> = quotient_polys
+            .into_iter()
+            .flat_map(|mut quotient_poly| {
+                quotient_poly.trim_to_len(quotient_degree).unwrap();
+                quotient_poly.chunks(degree)
+            })
+            .collect();
+        let quotient_commitment = PolynomialBatch::<F, C, 2>::from_coeffs(
+            chunks,
+            config.fri_config.rate_bits,
+            config.zero_knowledge && PlonkOracle::QUOTIENT.blinding,
+            config.fri_config.cap_height,
+            &mut timing,
+            prover_data.fft_root_table.as_ref(),
+        );
+        challenger
+            .observe_cap::<<C as GenericConfig<2>>::Hasher>(&quotient_commitment.merkle_tree.cap);
+        let zeta = challenger.get_extension_challenge::<2>();
+        let g = <F as Extendable<2>>::Extension::primitive_root_of_unity(common_data.degree_bits());
+        let cpu_openings = OpeningSet::new_cpu(
+            zeta,
+            g,
+            &prover_data.constants_sigmas_commitment,
+            &wires_commitment,
+            &zs_commitment,
+            &quotient_commitment,
+            common_data,
+        );
+        let gpu_openings = crate::gpu::opening::try_opening_set::<F, C, 2>(
+            zeta,
+            g,
+            &prover_data.constants_sigmas_commitment,
+            &wires_commitment,
+            &zs_commitment,
+            &quotient_commitment,
+            common_data,
+        )
+        .expect("the GPU takes the opening set");
+        assert_eq!(gpu_openings, cpu_openings, "opening set");
+        challenger.observe_openings(&cpu_openings.to_fri_openings());
+        let instance = common_data.get_fri_instance(zeta);
+        let oracles = [
+            &prover_data.constants_sigmas_commitment,
+            &wires_commitment,
+            &zs_commitment,
+            &quotient_commitment,
+        ];
+        let mut cpu_challenger = challenger.clone();
+        let cpu_proof = PolynomialBatch::<F, C, 2>::prove_openings_cpu(
+            &instance,
+            &oracles,
+            &mut cpu_challenger,
+            &common_data.fri_params,
+            None,
+            None,
+            &mut timing,
+        );
+        let gpu_proof = crate::gpu::opening::try_prove_openings::<F, C, 2>(
+            &instance,
+            &oracles,
+            &mut challenger,
+            &common_data.fri_params,
+            None,
+            None,
+            &mut timing,
+        )
+        .expect("the GPU takes the opening proof");
+        assert_eq!(
+            gpu_proof.commit_phase_merkle_caps, cpu_proof.commit_phase_merkle_caps,
+            "commit phase caps"
+        );
+        assert_eq!(
+            gpu_proof.final_poly, cpu_proof.final_poly,
+            "final polynomial"
+        );
+        // The proof-of-work search takes any witness (`find_any`), so the
+        // query phase, which is unchanged code over the same trees, can
+        // legitimately differ from here on.
+        assert_eq!(
+            gpu_proof.query_round_proofs.len(),
+            cpu_proof.query_round_proofs.len()
+        );
+    }
+
+    #[test]
+    fn gpu_opening_phase_matches_cpu() {
+        let _guard = crate::gpu::tests::ENABLE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(_ctx) = crate::gpu::context() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let rows = 1usize << crate::gpu::MIN_LOG_LEAVES.saturating_sub(2).max(7);
+        let (data, pw) = hash_chain_circuit(rows);
+        compare_opening_phase(&data, pw);
+        let (data, pw) = mixed_circuit();
+        compare_opening_phase(&data, pw);
+    }
+
+    /// Compares the GPU's partial products and Z's (as the committed
+    /// polynomials) with the CPU's.
+    fn compare_partial_products(data: &CircuitData<F, C, 2>, inputs: PartialWitness<F>) {
+        let prover_data = &data.prover_only;
+        let common_data = &data.common;
+        let Commitments {
+            wires_commitment,
+            zs_commitment,
+            betas,
+            gammas,
+            ..
+        } = commitments(data, inputs);
+        let mut timing = TimingTree::default();
+        let gpu = crate::gpu::permutation::try_partial_products_commitment(
+            &wires_commitment,
+            &betas,
+            &gammas,
+            prover_data,
+            common_data,
+            &mut timing,
+            None,
+        )
+        .expect("the GPU takes the partial products");
+        assert_eq!(gpu.polynomials.len(), zs_commitment.polynomials.len());
+        for (k, (g, e)) in gpu
+            .polynomials
+            .iter()
+            .zip(&zs_commitment.polynomials)
+            .enumerate()
+        {
+            assert_eq!(g, e, "polynomial {k}");
+        }
+        assert_eq!(
+            gpu.merkle_tree.leaves.len(),
+            zs_commitment.merkle_tree.leaves.len()
+        );
+    }
+
+    #[test]
+    fn gpu_partial_products_match_cpu() {
+        let _guard = crate::gpu::tests::ENABLE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(_ctx) = crate::gpu::context() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let rows = 1usize << crate::gpu::MIN_LOG_LEAVES.saturating_sub(2).max(8);
+        let (data, pw) = hash_chain_circuit(rows);
+        compare_partial_products(&data, pw);
+        let (data, pw) = mixed_circuit();
+        compare_partial_products(&data, pw);
+    }
+
+    #[test]
+    fn gpu_quotient_matches_cpu() {
+        let _guard = crate::gpu::tests::ENABLE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(_ctx) = crate::gpu::context() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let rows = 1usize << crate::gpu::MIN_LOG_LEAVES.saturating_sub(2).max(7);
+        let (data, pw) = hash_chain_circuit(rows);
+        compare_quotients(&data, pw);
+        let (data, pw) = mixed_circuit();
+        compare_quotients(&data, pw);
+    }
 }

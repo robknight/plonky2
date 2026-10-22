@@ -2,6 +2,29 @@ use log::{log, Level};
 #[cfg(feature = "timing")]
 use web_time::{Duration, Instant};
 
+/// Critical-path diagnostic: `PLONKY2_DELAY_SCOPE=<name>` and
+/// `PLONKY2_DELAY_MS=<ms>` make the calling thread sleep at the start of
+/// every timing scope with exactly that name. A delay that lengthens the
+/// whole proof by its own length lies on the critical path; any shortfall is
+/// the slack at that point (for example GPU work already in flight). Only in
+/// `gpu-profiling` builds; the sleep is counted in the scope's own time.
+#[cfg(all(feature = "timing", feature = "gpu-profiling", feature = "std"))]
+fn injected_delay(ctx: &str) {
+    static DELAY: std::sync::OnceLock<Option<(String, std::time::Duration)>> =
+        std::sync::OnceLock::new();
+    let delay = DELAY.get_or_init(|| {
+        let scope = crate::util::switches::text("PLONKY2_DELAY_SCOPE")?;
+        let ms = crate::util::switches::number::<f64>("PLONKY2_DELAY_MS")?;
+        log::warn!("plonky2: injecting {ms} ms at the start of every \"{scope}\" scope");
+        Some((scope, std::time::Duration::from_secs_f64(ms / 1000.0)))
+    });
+    if let Some((scope, duration)) = delay {
+        if scope == ctx {
+            std::thread::sleep(*duration);
+        }
+    }
+}
+
 /// The hierarchy of scopes, and the time consumed by each one. Useful for profiling.
 #[cfg(feature = "timing")]
 #[derive(Debug)]
@@ -97,7 +120,9 @@ impl TimingTree {
             enter_time: Instant::now(),
             exit_time: None,
             children: vec![],
-        })
+        });
+        #[cfg(all(feature = "gpu-profiling", feature = "std"))]
+        injected_delay(ctx);
     }
 
     #[cfg(not(feature = "timing"))]
@@ -128,6 +153,25 @@ impl TimingTree {
             .duration_since(self.enter_time)
     }
 
+    #[cfg(feature = "timing")]
+    fn duration_at(&self, now: Instant) -> Duration {
+        self.exit_time
+            .unwrap_or(now)
+            .duration_since(self.enter_time)
+    }
+
+    // Children are inclusive: subtract direct children only, never grandchildren.
+    // A single snapshot also makes open scopes independent of logging latency.
+    #[cfg(feature = "timing")]
+    fn unattributed_at(&self, now: Instant) -> Duration {
+        self.duration_at(now).saturating_sub(
+            self.children
+                .iter()
+                .map(|child| child.duration_at(now))
+                .sum(),
+        )
+    }
+
     /// Filter out children with a low duration.
     #[cfg(feature = "timing")]
     pub fn filter(&self, min_delta: Duration) -> Self {
@@ -147,7 +191,7 @@ impl TimingTree {
 
     #[cfg(feature = "timing")]
     pub fn print(&self) {
-        self.print_helper(0);
+        self.print_helper(0, Instant::now());
     }
 
     #[cfg(not(feature = "timing"))]
@@ -159,17 +203,25 @@ impl TimingTree {
     }
 
     #[cfg(feature = "timing")]
-    fn print_helper(&self, depth: usize) {
+    fn print_helper(&self, depth: usize, now: Instant) {
         let prefix = "| ".repeat(depth);
         log!(
             self.level,
             "{}{:.4}s to {}",
             prefix,
-            self.duration().as_secs_f64(),
+            self.duration_at(now).as_secs_f64(),
             self.name
         );
         for child in &self.children {
-            child.print_helper(depth + 1);
+            child.print_helper(depth + 1, now);
+        }
+        if !self.children.is_empty() {
+            log!(
+                self.level,
+                "{}| {:.4}s to unattributed (parent minus direct children)",
+                prefix,
+                self.unattributed_at(now).as_secs_f64(),
+            );
         }
     }
 }
@@ -190,4 +242,31 @@ macro_rules! timed {
         $timing_tree.pop();
         res
     }};
+}
+
+#[cfg(all(test, feature = "timing"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unattributed_subtracts_only_direct_children_at_one_snapshot() {
+        let start = Instant::now();
+        let scope = |name: &str, begin: u64, end: Option<u64>, children| TimingTree {
+            name: name.into(),
+            level: Level::Debug,
+            enter_time: start + Duration::from_millis(begin),
+            exit_time: end.map(|ms| start + Duration::from_millis(ms)),
+            children,
+        };
+        let nested = scope("nested", 20, Some(40), vec![]);
+        let child = scope("child", 10, Some(60), vec![nested]);
+        let open = scope("open child", 80, None, vec![]);
+        let root = scope("root", 0, None, vec![child, open]);
+        let now = start + Duration::from_millis(100);
+        assert_eq!(root.unattributed_at(now), Duration::from_millis(30));
+        assert_eq!(
+            root.children[0].unattributed_at(now),
+            Duration::from_millis(30)
+        );
+    }
 }

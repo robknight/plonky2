@@ -200,6 +200,23 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         "ArithmeticBaseGenerator".to_string()
     }
 
+    fn witness_operation(&self) -> Option<crate::iop::generator::WitnessOperation> {
+        use crate::iop::generator::WitnessOperation;
+        WitnessOperation::field_supported::<F>().then(|| WitnessOperation::Arithmetic {
+            inputs: [
+                ArithmeticGate::wire_ith_multiplicand_0(self.i),
+                ArithmeticGate::wire_ith_multiplicand_1(self.i),
+                ArithmeticGate::wire_ith_addend(self.i),
+            ]
+            .map(|column| Target::wire(self.row, column)),
+            output: Target::wire(self.row, ArithmeticGate::wire_ith_output(self.i)),
+            coefficients: [
+                self.const_0.to_canonical_u64(),
+                self.const_1.to_canonical_u64(),
+            ],
+        })
+    }
+
     fn dependencies(&self) -> Vec<Target> {
         [
             ArithmeticGate::wire_ith_multiplicand_0(self.i),

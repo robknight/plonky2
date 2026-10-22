@@ -35,7 +35,7 @@ use crate::gates::lookup::Lookup;
 use crate::gates::selectors::SelectorsInfo;
 use crate::hash::hash_types::{HashOutTarget, MerkleCapTarget, RichField};
 use crate::hash::merkle_proofs::{MerkleProof, MerkleProofTarget};
-use crate::hash::merkle_tree::{MerkleCap, MerkleTree};
+use crate::hash::merkle_tree::{MerkleCap, MerkleLeaves, MerkleTree};
 use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::generator::WitnessGeneratorRef;
 use crate::iop::target::{BoolTarget, Target};
@@ -321,11 +321,19 @@ pub trait Read {
         H: Hasher<F>,
     {
         let leaves_len = self.read_usize()?;
-        let mut leaves = Vec::with_capacity(leaves_len);
-        for _ in 0..leaves_len {
-            let leaf_len = self.read_usize()?;
-            leaves.push(self.read_field_vec(leaf_len)?);
+        let mut values: Vec<F> = Vec::new();
+        let mut leaf_len = 0;
+        for i in 0..leaves_len {
+            let len = self.read_usize()?;
+            if i == 0 {
+                leaf_len = len;
+                values.reserve_exact(leaves_len * leaf_len);
+            } else if len != leaf_len {
+                return Err(IoError);
+            }
+            values.extend(self.read_field_vec::<F>(len)?);
         }
+        let leaves = MerkleLeaves::new(values, leaf_len, leaves_len);
 
         let digests_len = self.read_usize()?;
         let digests = self.read_hash_vec::<F, H>(digests_len)?;
@@ -333,7 +341,7 @@ pub trait Read {
         let cap = self.read_merkle_cap::<F, H>(cap_height)?;
         Ok(MerkleTree {
             leaves,
-            digests,
+            digests: digests.into(),
             cap,
         })
     }
@@ -743,6 +751,12 @@ pub trait Read {
             degree_log,
             rate_bits,
             blinding,
+            #[cfg(feature = "gpu")]
+            device: Default::default(),
+            #[cfg(feature = "gpu")]
+            device_coeffs: Default::default(),
+            #[cfg(feature = "gpu")]
+            device_values: Default::default(),
         })
     }
 
@@ -894,6 +908,16 @@ pub trait Read {
         Ok(ProverOnlyCircuitData {
             generators,
             generator_indices_by_watches,
+            #[cfg(feature = "std")]
+            watch_table: Default::default(),
+            #[cfg(feature = "std")]
+            generator_schedule: Default::default(),
+            #[cfg(feature = "std")]
+            witness_buffers: Default::default(),
+            #[cfg(feature = "gpu")]
+            device_sigmas: Default::default(),
+            #[cfg(all(feature = "std", feature = "rand_chacha"))]
+            witness_program: Default::default(),
             constants_sigmas_commitment,
             sigmas,
             subgroup,
@@ -1420,9 +1444,9 @@ pub trait Write {
         H: Hasher<F>,
     {
         self.write_usize(tree.leaves.len())?;
-        for i in 0..tree.leaves.len() {
-            self.write_usize(tree.leaves[i].len())?;
-            self.write_field_vec(&tree.leaves[i])?;
+        for leaf in tree.leaves.rows() {
+            self.write_usize(leaf.len())?;
+            self.write_field_vec(leaf)?;
         }
         self.write_hash_vec::<F, H>(&tree.digests)?;
         self.write_usize(tree.cap.height())?;
@@ -1844,6 +1868,16 @@ pub trait Write {
         let ProverOnlyCircuitData {
             generators,
             generator_indices_by_watches,
+            #[cfg(feature = "std")]
+                watch_table: _,
+            #[cfg(feature = "std")]
+                generator_schedule: _,
+            #[cfg(feature = "std")]
+                witness_buffers: _,
+            #[cfg(feature = "gpu")]
+                device_sigmas: _,
+            #[cfg(all(feature = "std", feature = "rand_chacha"))]
+                witness_program: _,
             constants_sigmas_commitment,
             sigmas,
             subgroup,

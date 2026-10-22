@@ -349,6 +349,14 @@ pub fn benchmark_function(
 }
 
 fn main() -> Result<()> {
+    let result = run();
+    // Application-owned proving state has dropped, including on an error.
+    #[cfg(feature = "gpu")]
+    plonky2::gpu::shutdown()?;
+    result
+}
+
+fn run() -> Result<()> {
     // Parse command line arguments, see `--help` for details.
     let options = Options::from_args_safe()?;
     // Initialize logging

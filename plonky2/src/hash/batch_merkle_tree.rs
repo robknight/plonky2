@@ -8,7 +8,7 @@ use itertools::Itertools;
 use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::merkle_proofs::MerkleProof;
 use crate::hash::merkle_tree::{
-    capacity_up_to_mut, fill_digests_buf, merkle_tree_prove, MerkleCap,
+    capacity_up_to_mut, fill_digests_buf, merkle_tree_prove, MerkleCap, MerkleLeaves,
 };
 use crate::plonk::config::{GenericHashOut, Hasher};
 use crate::util::log2_strict;
@@ -77,7 +77,7 @@ impl<F: RichField, H: Hasher<F>> BatchMerkleTree<F, H> {
                 fill_digests_buf::<F, H>(
                     &mut digests_buf[digests_buf_pos..(digests_buf_pos + num_tmp_digests)],
                     tmp_cap_buf,
-                    &cur[..],
+                    &MerkleLeaves::from_rows(cur.clone()),
                     next_cap_height,
                 );
             } else {
@@ -98,7 +98,7 @@ impl<F: RichField, H: Hasher<F>> BatchMerkleTree<F, H> {
                 fill_digests_buf::<F, H>(
                     &mut digests_buf[digests_buf_pos..(digests_buf_pos + num_tmp_digests)],
                     tmp_cap_buf,
-                    &new_leaves[..],
+                    &MerkleLeaves::from_rows(new_leaves),
                     next_cap_height,
                 );
             }

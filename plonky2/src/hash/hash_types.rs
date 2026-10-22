@@ -93,13 +93,11 @@ impl<F: RichField> GenericHashOut<F> for HashOut<F> {
 
     fn from_bytes(bytes: &[u8]) -> Self {
         HashOut {
-            elements: bytes
-                .chunks(8)
-                .take(NUM_HASH_OUT_ELTS)
-                .map(|x| F::from_canonical_u64(u64::from_le_bytes(x.try_into().unwrap())))
-                .collect::<Vec<_>>()
-                .try_into()
-                .unwrap(),
+            elements: core::array::from_fn(|i| {
+                F::from_canonical_u64(u64::from_le_bytes(
+                    bytes[8 * i..8 * (i + 1)].try_into().unwrap(),
+                ))
+            }),
         }
     }
 

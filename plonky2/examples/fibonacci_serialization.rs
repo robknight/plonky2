@@ -12,6 +12,14 @@ use plonky2::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
 /// When a == 0 and b == 1, this is proving knowledge of the 100th (standard) Fibonacci number.
 /// This example also serializes the circuit data and proof to JSON files.
 fn main() -> Result<()> {
+    let result = run();
+    // Application-owned proving state has dropped, including on an error.
+    #[cfg(feature = "gpu")]
+    plonky2::gpu::shutdown()?;
+    result
+}
+
+fn run() -> Result<()> {
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
     type F = <C as GenericConfig<D>>::F;

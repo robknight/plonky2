@@ -9,6 +9,14 @@ use plonky2::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
 /// "I know the 100th element of the Fibonacci sequence, starting with constants a and b."
 /// When a == 0 and b == 1, this is proving knowledge of the 100th (standard) Fibonacci number.
 fn main() -> Result<()> {
+    let result = run();
+    // Application-owned proving state has dropped, including on an error.
+    #[cfg(feature = "gpu")]
+    plonky2::gpu::shutdown()?;
+    result
+}
+
+fn run() -> Result<()> {
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
     type F = <C as GenericConfig<D>>::F;

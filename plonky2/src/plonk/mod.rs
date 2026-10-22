@@ -16,3 +16,5 @@ mod validate_shape;
 pub(crate) mod vanishing_poly;
 pub mod vars;
 pub mod verifier;
+#[cfg(all(feature = "std", feature = "rand_chacha"))]
+pub mod witness_program;

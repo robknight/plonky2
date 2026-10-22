@@ -76,6 +76,15 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D> for Low
         vec![self.integer]
     }
 
+    fn witness_operation(&self) -> Option<crate::iop::generator::WitnessOperation> {
+        (self.n_log < 64).then_some(crate::iop::generator::WitnessOperation::LowHigh {
+            integer: self.integer,
+            low: self.low,
+            high: self.high,
+            low_bits: self.n_log as u32,
+        })
+    }
+
     fn run_once(
         &self,
         witness: &PartitionWitness<F>,

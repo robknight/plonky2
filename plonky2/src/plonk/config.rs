@@ -37,6 +37,11 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
     /// Size of `Hash` in bytes.
     const HASH_SIZE: usize;
 
+    /// Whether this hasher is the Poseidon sponge over the base field that the GPU kernels
+    /// implement (`PoseidonHash`). The GPU paths use the CPU for any other hasher.
+    #[doc(hidden)]
+    const GPU_POSEIDON: bool = false;
+
     /// Hash Output
     type Hash: GenericHashOut<F>;
 

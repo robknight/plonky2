@@ -311,7 +311,45 @@ pub struct OpeningSet<F: RichField + Extendable<D>, const D: usize> {
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
+    /// The openings of the commitments at `zeta` (and of the Z's at `g * zeta`).
+    ///
+    /// With the `gpu` feature and a suitable adapter they are evaluated from
+    /// the device copies of the coefficients; the result is identical to
+    /// [`Self::new_cpu`].
     pub fn new<C: GenericConfig<D, F = F>>(
+        zeta: F::Extension,
+        g: F::Extension,
+        constants_sigmas_commitment: &PolynomialBatch<F, C, D>,
+        wires_commitment: &PolynomialBatch<F, C, D>,
+        zs_partial_products_lookup_commitment: &PolynomialBatch<F, C, D>,
+        quotient_polys_commitment: &PolynomialBatch<F, C, D>,
+        common_data: &CommonCircuitData<F, D>,
+    ) -> Self {
+        #[cfg(feature = "gpu")]
+        if let Some(openings) = crate::gpu::opening::try_opening_set::<F, C, D>(
+            zeta,
+            g,
+            constants_sigmas_commitment,
+            wires_commitment,
+            zs_partial_products_lookup_commitment,
+            quotient_polys_commitment,
+            common_data,
+        ) {
+            return openings;
+        }
+        Self::new_cpu(
+            zeta,
+            g,
+            constants_sigmas_commitment,
+            wires_commitment,
+            zs_partial_products_lookup_commitment,
+            quotient_polys_commitment,
+            common_data,
+        )
+    }
+
+    /// `new` on the CPU.
+    pub(crate) fn new_cpu<C: GenericConfig<D, F = F>>(
         zeta: F::Extension,
         g: F::Extension,
         constants_sigmas_commitment: &PolynomialBatch<F, C, D>,

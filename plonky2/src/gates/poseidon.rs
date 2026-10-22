@@ -433,6 +433,13 @@ impl<F: RichField + Extendable<D> + Poseidon, const D: usize> SimpleGenerator<F,
         "PoseidonGenerator".to_string()
     }
 
+    fn witness_operation(&self) -> Option<crate::iop::generator::WitnessOperation> {
+        // An equal field order alone does not promise the same Poseidon constants.
+        (core::any::TypeId::of::<F>()
+            == core::any::TypeId::of::<crate::field::goldilocks_field::GoldilocksField>())
+        .then_some(crate::iop::generator::WitnessOperation::Poseidon { row: self.row })
+    }
+
     fn dependencies(&self) -> Vec<Target> {
         (0..SPONGE_WIDTH)
             .map(|i| PoseidonGate::<F, D>::wire_input(i))
@@ -472,6 +479,8 @@ impl<F: RichField + Extendable<D> + Poseidon, const D: usize> SimpleGenerator<F,
         let mut state: [F; SPONGE_WIDTH] = state.try_into().unwrap();
         let mut round_ctr = 0;
 
+        // This witness state is in the base field. Use its optimized routines while
+        // still emitting every intermediate S-box input required by the gate.
         for r in 0..poseidon::HALF_N_FULL_ROUNDS {
             <F as Poseidon>::constant_layer_field(&mut state, round_ctr);
             if r != 0 {
@@ -482,8 +491,8 @@ impl<F: RichField + Extendable<D> + Poseidon, const D: usize> SimpleGenerator<F,
                     )?;
                 }
             }
-            <F as Poseidon>::sbox_layer_field(&mut state);
-            state = <F as Poseidon>::mds_layer_field(&state);
+            <F as Poseidon>::sbox_layer(&mut state);
+            state = <F as Poseidon>::mds_layer(&state);
             round_ctr += 1;
         }
 
@@ -496,7 +505,7 @@ impl<F: RichField + Extendable<D> + Poseidon, const D: usize> SimpleGenerator<F,
             )?;
             state[0] = <F as Poseidon>::sbox_monomial(state[0]);
             state[0] += F::from_canonical_u64(<F as Poseidon>::FAST_PARTIAL_ROUND_CONSTANTS[r]);
-            state = <F as Poseidon>::mds_partial_layer_fast_field(&state, r);
+            state = <F as Poseidon>::mds_partial_layer_fast(&state, r);
         }
         out_buffer.set_wire(
             local_wire(PoseidonGate::<F, D>::wire_partial_sbox(
@@ -505,8 +514,7 @@ impl<F: RichField + Extendable<D> + Poseidon, const D: usize> SimpleGenerator<F,
             state[0],
         )?;
         state[0] = <F as Poseidon>::sbox_monomial(state[0]);
-        state =
-            <F as Poseidon>::mds_partial_layer_fast_field(&state, poseidon::N_PARTIAL_ROUNDS - 1);
+        state = <F as Poseidon>::mds_partial_layer_fast(&state, poseidon::N_PARTIAL_ROUNDS - 1);
         round_ctr += poseidon::N_PARTIAL_ROUNDS;
 
         for r in 0..poseidon::HALF_N_FULL_ROUNDS {
@@ -517,8 +525,8 @@ impl<F: RichField + Extendable<D> + Poseidon, const D: usize> SimpleGenerator<F,
                     state[i],
                 )?;
             }
-            <F as Poseidon>::sbox_layer_field(&mut state);
-            state = <F as Poseidon>::mds_layer_field(&state);
+            <F as Poseidon>::sbox_layer(&mut state);
+            state = <F as Poseidon>::mds_layer(&state);
             round_ctr += 1;
         }
 
@@ -541,6 +549,10 @@ impl<F: RichField + Extendable<D> + Poseidon, const D: usize> SimpleGenerator<F,
         })
     }
 }
+
+#[cfg(test)]
+#[path = "poseidon_generator_neon_tests.rs"]
+mod generator_neon_tests;
 
 #[cfg(test)]
 mod tests {

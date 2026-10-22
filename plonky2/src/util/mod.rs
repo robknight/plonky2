@@ -10,11 +10,15 @@ pub use plonky2_util::*;
 use crate::field::polynomial::PolynomialValues;
 use crate::field::types::Field;
 
+#[cfg(all(feature = "std", feature = "rand_chacha"))]
+pub(crate) mod blinding_rng;
 pub(crate) mod context_tree;
 pub(crate) mod partial_products;
 pub mod reducing;
 pub mod serialization;
 pub mod strided_view;
+#[cfg(feature = "std")]
+pub(crate) mod switches;
 pub mod timing;
 
 pub(crate) fn transpose_poly_values<F: Field>(polys: Vec<PolynomialValues<F>>) -> Vec<Vec<F>> {

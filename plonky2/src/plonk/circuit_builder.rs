@@ -160,7 +160,7 @@ pub struct CircuitBuilder<F: RichField + Extendable<D>, const D: usize> {
     /// The next available index for a `VirtualTarget`.
     virtual_target_index: usize,
 
-    copy_constraints: Vec<CopyConstraint>,
+    pub(crate) copy_constraints: Vec<CopyConstraint>,
 
     /// A tree of named scopes, used for debugging.
     context_log: ContextTree,
@@ -169,7 +169,7 @@ pub struct CircuitBuilder<F: RichField + Extendable<D>, const D: usize> {
     generators: Vec<WitnessGeneratorRef<F, D>>,
 
     constants_to_targets: HashMap<F, Target>,
-    targets_to_constants: HashMap<Target, F>,
+    pub(crate) targets_to_constants: HashMap<Target, F>,
 
     /// Memoized results of `arithmetic` calls.
     pub(crate) base_arithmetic_results: HashMap<BaseArithmeticOperation<F>, Target>,
@@ -1182,14 +1182,25 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
 
         let constants_sigmas_commitment = if commit_to_sigma {
             let constants_sigmas_vecs = [constant_vecs, sigma_vecs.clone()].concat();
-            PolynomialBatch::<F, C, D>::from_values(
+            let commitment = PolynomialBatch::<F, C, D>::from_values(
                 constants_sigmas_vecs,
                 rate_bits,
                 PlonkOracle::CONSTANTS_SIGMAS.blinding,
                 cap_height,
                 &mut timing,
                 Some(&fft_root_table),
-            )
+            );
+            // Fixed commitments outlive individual proofs in application caches.
+            // Keep their query leaves and digests on the host so unused cached
+            // circuits do not pin the GPU context, and so every proof's query
+            // paths come from host data. The reusable polynomial device caches
+            // remain available and can be cleared by orderly GPU shutdown.
+            #[cfg(feature = "gpu")]
+            {
+                commitment.merkle_tree.leaves.as_flat_slice();
+                let _ = &*commitment.merkle_tree.digests;
+            }
+            commitment
         } else {
             PolynomialBatch::<F, C, D>::default()
         };
@@ -1292,6 +1303,16 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         let prover_only = ProverOnlyCircuitData::<F, C, D> {
             generators: self.generators,
             generator_indices_by_watches,
+            #[cfg(feature = "std")]
+            watch_table: Default::default(),
+            #[cfg(feature = "std")]
+            generator_schedule: Default::default(),
+            #[cfg(feature = "std")]
+            witness_buffers: Default::default(),
+            #[cfg(feature = "gpu")]
+            device_sigmas: Default::default(),
+            #[cfg(all(feature = "std", feature = "rand_chacha"))]
+            witness_program: Default::default(),
             constants_sigmas_commitment,
             sigmas: transpose_poly_values(sigma_vecs),
             subgroup,
