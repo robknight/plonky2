@@ -21,6 +21,10 @@ This is not a community fork: don't expect any commitment from the developers
 of this fork towards any need beyond pod2.  Don't expect community Pull
 Requests to be reviewed and/or merged.
 
+## GPU proving
+
+This fork adds GPU proving through [wgpu](https://wgpu.rs) (Metal, Vulkan, DirectX 12) behind the `gpu` feature of the `plonky2` crate, and compiled witness programs, which make witness generation two to three times faster for circuits proved repeatedly. Neither changes proofs, circuit data or the verifier. See [docs/gpu.md](docs/gpu.md).
+
 ## Documentation
 
 For more details about the Plonky2 argument system, see this [writeup](plonky2/plonky2.pdf).
