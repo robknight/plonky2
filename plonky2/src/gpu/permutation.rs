@@ -8,7 +8,7 @@
 //! partial products) are written in the layout `from_values` expects, so
 //! that the commitment proceeds from the device buffer. The wire values are
 //! the ones the wires commitment kept on the device; the sigma values are
-//! uploaded once per circuit.
+//! uploaded and cached per circuit within the retained-buffer budget.
 
 use crate::field::extension::Extendable;
 use crate::fri::oracle::PolynomialBatch;

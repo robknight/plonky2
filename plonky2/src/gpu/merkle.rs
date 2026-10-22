@@ -196,10 +196,10 @@ impl DeviceTree {
         self.timestamps.as_ref().map(|t| t.read(ctx, &self.done))
     }
 
-    /// Prototype: copy only authentication siblings from the resident digest
+    /// Benchmark helper: copy only authentication siblings from the resident digest
     /// array into one compact readback. Duplicate queries retain their order.
-    /// Kept outside the default prover path while public host digest storage
-    /// and serialization continue to use the existing full readback.
+    /// The prover gathers paths through `MerkleDigests::prepare_queries`;
+    /// this helper measures sparse readback directly from a `DeviceTree`.
     #[cfg(all(test, feature = "gpu-profiling"))]
     pub(crate) fn read_query_paths<F: RichField, H: Hasher<F>>(
         &self,

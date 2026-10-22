@@ -75,14 +75,13 @@ pub(crate) fn initial_witness<
 /// the start of the round, then merges what they produced and queues the
 /// unfinished generators watching a newly populated target. A generator that
 /// needs a value produced in the same round simply reports itself unfinished
-/// and runs again next round, so the rounds compute what the sequential loop
-/// did, in possibly more rounds.
+/// and is queued for another round when a watched target is populated.
 ///
-/// The round in which each generator finishes depends on the circuit, not on
-/// the inputs, so the first proof of a circuit records it (as
-/// [`GeneratorSchedule`] in the prover data) and later proofs run the recorded
+/// With `std`, the first proof of a circuit records the rounds in which its
+/// generators finish, and later proofs try to run the recorded
 /// rounds directly, without the watch table or the runs that find their
-/// dependencies missing. The replay checks that every scheduled generator
+/// dependencies missing. Input-dependent generators can change readiness;
+/// the replay checks that every scheduled generator
 /// finishes and that each round populates as many targets as recorded;
 /// otherwise the witness is generated from scratch with the worklist, which
 /// records a new schedule. Rounds are split across the generator pool's
@@ -579,9 +578,9 @@ fn poseidon_outputs(row: usize) -> [Target; 122] {
     core::array::from_fn(|i| Target::wire(row, if i < 110 { 25 + i } else { 12 + i - 110 }))
 }
 
-/// A generator's witness computation as a typed operation, which the compiled
-/// witness executor ([`crate::plonk::witness_program`]) runs in place of the
-/// generator's code. Available in every build.
+/// A generator's witness computation as a typed operation. Available in every
+/// build; with `std` and `rand_chacha`, the compiled witness executor in
+/// `crate::plonk::witness_program` can run it in place of the generator's code.
 /// Parameters describe the operation, independently of circuit identity or
 /// debug IDs. A generator that returns one must compute exactly what the
 /// operation describes.
@@ -888,7 +887,8 @@ pub trait WitnessGenerator<F: RichField + Extendable<D>, const D: usize>:
     fn watch_list(&self) -> Vec<Target>;
 
     /// This generator's witness computation as a typed operation, so the
-    /// compiled witness executor can run it ([`crate::plonk::witness_program`]).
+    /// compiled witness executor can run it (`crate::plonk::witness_program`,
+    /// available with `std` and `rand_chacha`).
     /// `None` by default; a circuit with any generator returning `None` keeps
     /// the worklist.
     fn witness_operation(&self) -> Option<WitnessOperation> {

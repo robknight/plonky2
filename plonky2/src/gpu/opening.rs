@@ -3,7 +3,8 @@
 //! The openings are dot products of each committed polynomial's coefficients
 //! with the powers of the opening point, one workgroup per polynomial, read
 //! from the coefficient buffers the GPU commitments keep (the circuit's fixed
-//! commitment is uploaded once and retained). FRI's initial polynomial is
+//! commitment is uploaded and cached within the retained-buffer budget).
+//! FRI's initial polynomial is
 //! then built from the same coefficients as `prove_openings` builds it on the
 //! CPU: for each opening batch the alpha-weighted sum of its polynomials, the
 //! synthetic division by `X - z` (a blocked scan: within each block of
@@ -11,8 +12,9 @@
 //! batches' quotients, all in coefficient form on the degree of the batch;
 //! one coset FFT gives the codeword that the commit phase folds. The trees,
 //! the final polynomial and the challenger state are the ones the CPU
-//! produces. Only the openings themselves and the first layer's values are
-//! read back.
+//! produces. This module reads back the openings and first layer's values;
+//! [`super::fri`] also reads each layer's digests, cap and folded values, and
+//! the final coefficients.
 
 use plonky2_maybe_rayon::*;
 

@@ -1,17 +1,18 @@
-//! The compiled witness executor (PERF-25): runs a `RegionProgram` on the CPU.
+//! The compiled witness executor: runs a `RegionProgram` on the CPU.
 //!
 //! A program is typed operations with resolved slot indices, grouped by kind
 //! inside dependency layers, plus alias slots for additional writers. The
 //! executor keeps one atomic value and one ready flag per slot, seeds the
 //! roots from the proof's inputs and runs the layers in order: the lanes of
-//! every group in a layer run in parallel with Rayon, one Rust loop body per
-//! operation kind, and the join at each layer boundary orders the layers.
+//! every group in a layer can run in parallel with the `parallel` feature,
+//! one Rust loop body per operation kind. Each layer finishes before the next.
 //! Readiness and conflict guards check every read and write, and each alias
-//! slot is compared with its canonical slot at the end, so a run either
-//! matches the worklist witness or fails. The gather then writes the slots
-//! straight into the column-major wire matrix, or into a mapped device buffer
-//! when the GPU prover applies, so no partition witness, merge or separate
-//! materialisation is needed.
+//! slot is compared with its canonical slot at the end to reject missing
+//! dependencies and conflicting writes. Values follow the generators' typed
+//! operation descriptions. The gather then writes the slots
+//! straight into the column-major wire matrix, or into a mapped upload buffer
+//! that is copied to device memory when the GPU prover applies. This avoids
+//! building and merging a partition witness before gathering the wires.
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -60,11 +61,12 @@ impl RegionProgram {
             .collect()
     }
 
-    /// Runs the compiled program on the calling thread. `random_values`
+    /// Runs the compiled program on the CPU, parallelizing independent lanes
+    /// when the `parallel` feature is enabled. `random_values`
     /// supplies one canonical field element per random index. Boundary
     /// roots come from `entry`; every other slot is written exactly once by
     /// its owner, additional writers go to alias slots and are compared at
-    /// the end. Returns one value per representative, as `execute` does.
+    /// the end. Returns one value per entry of `self.representatives`.
     pub fn execute_cpu<F: PrimeField64>(
         &self,
         entry: &PartitionWitness<F>,
@@ -104,7 +106,7 @@ impl RegionProgram {
 
     /// Canonical slot of every wire cell, column-major (`column * degree +
     /// row`), `u32::MAX` where the program has no slot. Built once per
-    /// program; the GPU handoff keeps the same table on the device.
+    /// program and used by both the host gather and the device upload.
     fn cell_slots(&self, map: &[usize], num_wires: usize, degree: usize) -> &[u32] {
         self.cell_slots.get_or_init(|| {
             let rep_slots = self.rep_slots(map.len());
@@ -304,13 +306,13 @@ fn q_inverse(a: Q) -> Result<Q> {
 }
 
 /// Shared inversion for the two affine coordinates. A zero denominator in
-/// either coordinate is an error, as on the device.
+/// either coordinate is an error.
 fn q_div_pair(a: Q, b: Q, c: Q, d: Q) -> Result<[Q; 2]> {
     let inverse = q_inverse(b * d)?;
     Ok([a * d * inverse, c * b * inverse])
 }
 
-/// Homogeneous (X:Z:U:T) sum of two affine points, POD2's formulas.
+/// Homogeneous (X:Z:U:T) sum of two affine points on the quintic curve.
 fn q_add_homog(x1: Q, u1: Q, x2: Q, u2: Q, b1: G) -> [Q; 4] {
     let t1 = x1 * x2;
     let t3 = u1 * u2;
@@ -336,8 +338,8 @@ fn q_add_xu(x1: Q, u1: Q, x2: Q, u2: Q, b1: G) -> Result<[Q; 2]> {
     q_div_pair(h[0], h[1], h[2], h[3])
 }
 
-/// Fractional (X:Z:U:T) addition from precomputed products, as in the
-/// device scalar multiplication. Zero Z or T at any step is an error.
+/// Fractional (X:Z:U:T) addition from precomputed products, used by scalar
+/// multiplication. Zero Z or T at any step is an error.
 fn q_add_fractional_products(xx: Q, zz: Q, uu: Q, tt: Q, xz: Q, ut: Q, b1: G) -> Result<[Q; 4]> {
     let bzz = q_mul_generator(zz, b1);
     let t7 = xx + bzz;
@@ -969,7 +971,7 @@ fn sample_random_values<F: PrimeField64>(count: usize) -> zeroize::Zeroizing<Vec
     words
 }
 
-/// Timings and counts from one `generate` or `check_against_worklist` call.
+/// Timings and counts from one `generate_wires` or `check_against_worklist` call.
 #[derive(Clone, Debug, Default)]
 pub struct CpuExecutorReport {
     pub generators: usize,
@@ -987,14 +989,15 @@ pub struct CpuExecutorReport {
     /// "installed" for a program the caller installed; diagnostics that
     /// compile their own program report "cached".
     pub plan: &'static str,
-    /// Unused since programs are installed by the caller; kept for the
-    /// report's format.
+    /// Program I/O time; zero because these executor paths perform no I/O.
     pub plan_io: Duration,
     /// How the wires were filled: "reused" (the pooled upload buffer) for
-    /// device wires, "none" otherwise.
+    /// device wires, an empty string for a host matrix, "none" for the
+    /// partition-witness test helper.
     pub gather_mode: &'static str,
-    /// "resident" when the wires went to a mapped device buffer, "host"
-    /// for a host matrix, "partition" for the stage 1 and 2 merge path.
+    /// "resident" when the wires were uploaded through a mapped staging buffer,
+    /// "host" for a host matrix, "partition" for the test helper that merges
+    /// values into a partition witness.
     pub mode: &'static str,
 }
 
@@ -1049,11 +1052,11 @@ thread_local! {
 /// Public inputs, wires and timings of one executor run.
 pub(crate) type ExecutorOutput<F> = (Vec<F>, Wires<F>, CpuExecutorReport);
 
-/// Stage 3 witness generation with the installed program: execute over the
+/// Witness generation with the installed program: execute over the
 /// compact slot state, read the public inputs from their slots and gather the
-/// column-major wire matrix directly into its destination: a mapped device
-/// buffer when the GPU commitment applies and `allow_device` is set, else a
-/// host matrix. No partition witness is built. `None` when no program is
+/// column-major wire matrix into a mapped staging buffer for upload when the
+/// GPU commitment applies and `allow_device` is set, else a host matrix.
+/// No partition witness is built. `None` when no program is
 /// installed for these inputs; nothing is compiled, loaded or saved here.
 pub(crate) fn generate_wires<
     F: RichField + Extendable<D>,
@@ -1079,8 +1082,8 @@ pub(crate) fn generate_wires_with<
     allow_device: bool,
     random_values: Option<Vec<u64>>,
 ) -> Result<Option<ExecutorOutput<F>>> {
-    // Without an installed program this costs one lock, so callers that never
-    // install one pay nothing for the executor.
+    // Without an installed program, one lock checks the slot and returns
+    // before any executor preparation.
     if !prover.witness_program.has_all(prover.generators.len()) {
         return Ok(None);
     }
@@ -1249,8 +1252,8 @@ pub(crate) fn generate_wires_with<
     Ok(Some((public_inputs, wires, report)))
 }
 
-/// Stage 1 and 2 path, kept for the exactness test: compile, execute and
-/// merge the representatives into a partition witness.
+/// Test helper: compile, execute and merge the representatives into a
+/// partition witness.
 #[cfg(test)]
 pub(crate) fn generate_with_report<
     'a,
@@ -1382,7 +1385,7 @@ pub fn check_against_worklist<
         "worklist sets {set} representatives, the program covers {}",
         program.representatives.len()
     );
-    // Stage 3: the delivered wire matrix and public inputs must equal the
+    // The delivered wire matrix and public inputs must equal the
     // worklist's full witness exactly, read back through the device buffer
     // when the GPU commitment applies.
     let expected_public = worklist.get_targets(&prover.public_inputs);

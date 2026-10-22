@@ -1,4 +1,4 @@
-//! VAL-05: constructed worst-case inputs for the shader field arithmetic.
+//! Constructed worst-case inputs for the shader field arithmetic.
 //! Random and fixed boundary values can miss reduction corner cases (a
 //! reducer that is wrong only for products such as 2^48 * 2^48 = 2^96), so
 //! every pair from a grid of powers of two and values near 2^32, p and 2^64

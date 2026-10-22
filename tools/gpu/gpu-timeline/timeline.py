@@ -90,8 +90,7 @@ else:
         if k + 1 < len(proofs):
             while len(w) > 1 and w[-1]["start"] - max(x["end"] for x in w[:-1]) >= 25e6:
                 w.pop()
-# Circuit setup and plan compilation run before the first proof; a proof has
-# a quotient pass.
+# Keep proof windows that evaluated a quotient on the GPU.
 proofs = [w for w in proofs if any(x["label"] == "quotient" for x in w)]
 gaps, by_label, spans = collections.defaultdict(list), collections.defaultdict(float), []
 for k, w in enumerate(proofs):

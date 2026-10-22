@@ -97,7 +97,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     /// Creates a list polynomial commitment for the polynomials interpolating the values in `values`.
     ///
     /// With the `gpu` feature and a suitable adapter, the IFFT, LDE, transpose and Merkle tree are
-    /// computed on the device; the result is identical to [`Self::from_values_cpu`].
+    /// computed on the device, using the same commitment format as the CPU.
+    /// With blinding enabled, each call samples fresh salt.
     pub fn from_values(
         values: Vec<PolynomialValues<F>>,
         rate_bits: usize,
@@ -185,7 +186,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     /// Creates a list polynomial commitment for the polynomials `polynomials`.
     ///
     /// With the `gpu` feature and a suitable adapter, the LDE, transpose and Merkle tree are
-    /// computed on the device; the result is identical to [`Self::from_coeffs_cpu`].
+    /// computed on the device, using the same commitment format as the CPU.
+    /// With blinding enabled, each call samples fresh salt.
     pub fn from_coeffs(
         polynomials: Vec<PolynomialCoeffs<F>>,
         rate_bits: usize,
@@ -360,8 +362,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     ///
     /// With the `gpu` feature and a suitable adapter, the initial FRI
     /// polynomial is combined from the device copies of the oracles'
-    /// coefficients and folded on the device; the proof is identical to
-    /// [`Self::prove_openings_cpu`].
+    /// coefficients and folded on the device. Both paths use the same proof
+    /// format; the proof-of-work nonce, and hence query indices, may differ.
     pub fn prove_openings(
         instance: &FriInstanceInfo<F, D>,
         oracles: &[&Self],
@@ -394,7 +396,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         )
     }
 
-    /// `prove_openings` on the CPU (the final FFT may still run on the GPU).
+    /// Combines the opening polynomial on the CPU. Its final FFT and the FRI
+    /// commit phase may still run on the GPU.
     pub(crate) fn prove_openings_cpu(
         instance: &FriInstanceInfo<F, D>,
         oracles: &[&Self],
@@ -417,7 +420,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // The final polynomial is then computed as `final_poly = sum_i alpha^(k_i) (F_i(X) - F_i(z_i))/(X-z_i)`
         // where the `k_i`s are chosen such that each power of `alpha` appears only once in the final sum.
         // There are usually two batches for the openings at `zeta` and `g * zeta`.
-        // The oracles used in Plonky2 are given in `FRI_ORACLES` in `plonky2/src/plonk/plonk_common.rs`.
+        // `PlonkOracle` in `plonky2/src/plonk/plonk_common.rs` identifies the PLONK oracles.
         for FriBatchInfo { point, polynomials } in &instance.batches {
             // Collect the coefficients of all the polynomials in `polynomials`.
             let polys_coeff = polynomials.iter().map(|fri_poly| {

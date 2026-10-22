@@ -853,8 +853,7 @@ mod tests {
 
     /// Caches filled by proving (the watch table, the recorded generator
     /// schedule, retained buffers) are not part of a circuit's value, so a
-    /// proved circuit still equals its serialized round trip, as pod2's tests
-    /// expect of upstream plonky2.
+    /// proved circuit still equals its serialized round trip.
     #[test]
     fn proved_circuit_equals_its_round_trip() {
         const D: usize = 2;

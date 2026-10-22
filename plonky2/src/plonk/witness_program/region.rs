@@ -2,7 +2,7 @@
 //! executor (`cpu`) runs when a caller installs one (see
 //! [`crate::plonk::witness_program`]), its per-circuit slot and its byte
 //! encoding. Built with the default `std` and `rand_chacha` features; the
-//! `gpu` feature only adds the gather into device memory. Every layer shares a
+//! `gpu` feature adds wire uploads from a mapped staging buffer. Every layer shares a
 //! compact slot state; coalesced output slots replace per-generator host
 //! records.
 //!
@@ -37,7 +37,7 @@ struct Group {
     coefficients_offset: u32,
 }
 
-/// Immutable compiled topology. Compilation and metadata uploads are cold costs.
+/// Immutable compiled topology, reused across executions.
 #[derive(Clone, Debug)]
 pub struct RegionProgram {
     /// Operation groups in dependency layers: every group in a layer depends
@@ -229,7 +229,7 @@ impl ProgramCache {
 }
 
 /// What the layout needs from one generator's operation, without keeping
-/// the operation (a `WitnessOperation` is about 1 KB, and MainPod has 1.6 M).
+/// the operation, keeping compiler memory use bounded for large circuits.
 struct Lane {
     index: u32,
     /// Executor kind number.
@@ -733,7 +733,7 @@ impl RegionProgram {
         }
         // Canonical slots are stable for all consumers. Each additional
         // generator writes an independent slot, even if it runs in parallel
-        // with the owner. Compare every alias after the final dispatch.
+        // with the owner. Compare every alias after executing all layers.
         let mut alias_slots = HashMap::<(usize, usize), u32>::new();
         let mut alias_pairs = Vec::<(u32, u32)>::new();
         for (target_position, generator, representative) in alias_outputs {

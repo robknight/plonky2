@@ -559,7 +559,7 @@ where
         openings,
         opening_proof,
     };
-    // Release the large buffers in their existing relative order, exposing
+    // Time the release of large buffers, including
     // host deallocation and the return/destruction of GPU buffers.
     timed!(timing, "release prover buffers", {
         timed!(
@@ -833,8 +833,9 @@ fn compute_all_lookup_polys<
 const BATCH_SIZE: usize = 32;
 
 /// The quotient polynomials, one per challenge, as coefficients. With the `gpu` feature and a
-/// suitable adapter, circuits without lookups are evaluated by a generated kernel on the device;
-/// the result is the same as [`compute_quotient_polys_cpu`].
+/// suitable adapter, supported circuits without lookups use the GPU kernel,
+/// optionally sharing rows with the CPU. The result is the same as
+/// [`compute_quotient_polys_cpu`].
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -1369,7 +1370,7 @@ mod gpu_tests {
             "final polynomial"
         );
         // The proof-of-work search takes any witness (`find_any`), so the
-        // query phase, which is unchanged code over the same trees, can
+        // query phase over the same committed trees can
         // legitimately differ from here on.
         assert_eq!(
             gpu_proof.query_round_proofs.len(),

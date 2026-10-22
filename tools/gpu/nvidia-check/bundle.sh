@@ -1,46 +1,26 @@
 #!/usr/bin/env bash
-# Makes OUT/bundle.tar.gz for job.sh: the committed HEAD of each repository
-# (tracked files only, plus Cargo.lock) and job.sh, then prints its size and
-# SHA-256. WORKSPACE holds the three checkouts side by side, under the names
-# pod2's Cargo patches use: plonky2-integrated, pod2-gpu-integrated and
-# plonky2-u32-integrated. Refuses a checkout with uncommitted changes to
-# tracked files, so the bundle matches the recorded revisions.
-#
-# Usage: bundle.sh WORKSPACE OUT
+# Makes OUT/bundle.tar.gz from this repository's committed HEAD and Cargo.lock,
+# then prints the revision, bundle size and SHA-256. Refuses tracked changes.
+# Usage: bundle.sh REPO OUT
 set -euo pipefail
-WORKSPACE=$(cd "$1" && pwd)
+REPO=$(git -C "$1" rev-parse --show-toplevel)
 OUT=$2
-HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd)
+if [ -n "$(git -C "$REPO" status --porcelain --untracked-files=no)" ]; then
+    echo "repository has uncommitted changes to tracked files" >&2
+    exit 1
+fi
+if [ ! -f "$REPO/Cargo.lock" ]; then
+    echo "generate Cargo.lock with cargo generate-lockfile before bundling" >&2
+    exit 1
+fi
 rm -rf "$OUT/src" "$OUT/bundle.tar.gz"
 mkdir -p "$OUT/src"
-
-# The tracked paths to export from each repository.
-paths() {
-    case $1 in
-        plonky2-integrated) echo "Cargo.toml rust-toolchain rustfmt.toml .cargo field maybe_rayon plonky2 starky util" ;;
-        pod2-gpu-integrated) echo "Cargo.toml build.rs rust-toolchain.toml rustfmt.toml src examples tests" ;;
-        plonky2-u32-integrated) echo "Cargo.toml src" ;;
-    esac
-}
-
-for repo in plonky2-integrated pod2-gpu-integrated plonky2-u32-integrated; do
-    dir=$WORKSPACE/$repo
-    if [ -n "$(git -C "$dir" status --porcelain --untracked-files=no)" ]; then
-        echo "$repo has uncommitted changes to tracked files" >&2
-        exit 1
-    fi
-    echo "$repo $(git -C "$dir" rev-parse --short HEAD) $(git -C "$dir" branch --show-current)"
-    # shellcheck disable=SC2046,SC2086
-    git -C "$dir" archive --prefix="$repo/" HEAD \
-        $(git -C "$dir" ls-tree --name-only HEAD $(paths "$repo")) | tar -x -C "$OUT/src"
-    if [ -f "$dir/Cargo.lock" ]; then
-        cp "$dir/Cargo.lock" "$OUT/src/$repo/"
-    fi
-done
-
-cp "$HERE/job.sh" "$OUT/job.sh"
+echo "plonky2 $(git -C "$REPO" rev-parse HEAD)"
+git -C "$REPO" archive --prefix=src/plonky2/ HEAD | tar -x -C "$OUT"
+cp "$REPO/Cargo.lock" "$OUT/src/plonky2/"
+cp "$OUT/src/plonky2/tools/gpu/nvidia-check/job.sh" "$OUT/job.sh"
 (cd "$OUT" && COPYFILE_DISABLE=1 tar -czf bundle.tar.gz src job.sh)
 ls -l "$OUT/bundle.tar.gz" | awk '{print "bytes", $5}'
 shasum -a 256 "$OUT/bundle.tar.gz"

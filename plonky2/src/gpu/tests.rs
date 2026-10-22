@@ -1,5 +1,6 @@
 //! Differential tests of the GPU kernels against the CPU implementations.
-//! Tests that need an adapter skip with a message when none is available.
+//! Most adapter-dependent tests skip with a message when none is available;
+//! hardware regression tests require a physical GPU.
 
 mod arithmetic_grid;
 mod inversion;
@@ -689,7 +690,7 @@ fn storage_pool_reuses_buffers() {
     let c = ctx.storage("pool test again", 1 << 20);
     assert!(*c == raw);
     assert_eq!(ctx.storage_pool.bytes(), before);
-    // Uploads are not pooled.
+    // Buffers created by `upload` do not enter the storage pool.
     let d = ctx.upload("pool test upload", &[1, 2]);
     drop(d);
     assert_eq!(ctx.storage_pool.bytes(), before);
@@ -957,12 +958,9 @@ fn mixed_circuit_proves_on_gpu() {
     let _ = PoseidonGoldilocksConfig;
 }
 
-/// The gate instances the tracer is tested on.
-/// A gate multiplying in the quintic extension the way pod2's EC gates do
-/// in-circuit (`nnf_mul_ext`: coefficient k as a fold of the plain products
-/// plus a fold of the products scaled by the modulus constant), once with
-/// two operands and once as a square, so that the tracer's quintic product
-/// fusion is exercised inside plonky2's own tests. Wires: x, y, x * y, x * x.
+/// A gate exercising quintic product fusion with two operands and with a
+/// square. Each coefficient is a fold of plain products plus a fold of
+/// products scaled by the modulus constant. Wires: x, y, x * y, x * x.
 #[derive(Debug, Clone)]
 struct QuinticMulTestGate {
     offset: usize,

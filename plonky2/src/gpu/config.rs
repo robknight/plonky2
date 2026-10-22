@@ -1,5 +1,5 @@
 //! Settings of the GPU context, chosen by the application before the first
-//! proof (see [`configure`]).
+//! proof (see [`configure`](super::configure)).
 
 use super::policy::ExecutionMode;
 
@@ -48,9 +48,9 @@ pub struct GpuConfig {
     /// Proofs expected to run concurrently, at least 1. Scales the default
     /// `retained_bytes` and damps the hybrid quotient's CPU share adaptation.
     pub proving_workers: usize,
-    /// Device memory that circuits' fixed-commitment extended evaluations may
-    /// occupy across proofs; beyond it they are recomputed per proof. `None`
-    /// is 2 GiB per proving worker.
+    /// Budget for retaining fixed-commitment evaluations, coefficients and
+    /// sigma values across proofs. Buffers that do not fit are recomputed or
+    /// uploaded per proof. `None` is 2 GiB per proving worker.
     pub retained_bytes: Option<u64>,
     /// Idle storage buffers kept for reuse. `None` is 4 GiB on unified-memory
     /// adapters and 0 (no pooling) on discrete ones.

@@ -1,12 +1,12 @@
 //! WGSL kernel generation.
 //!
 //! All kernels are generated from Rust so that the Poseidon constants are
-//! immediates and every loop over the sponge state is unrolled; the
-//! permutation is the generated kernel from `zk-craft-grinder`, which is
-//! bit-identical to the pinned CPU implementation. Goldilocks elements are
+//! immediates and every loop over the sponge state is unrolled. The permutation
+//! matches this crate's CPU implementation. Goldilocks elements are
 //! pairs of `u32` words with explicit carries, noncanonical in `[0, 2^64)`
-//! until they leave a kernel, exactly like the CPU code. Only the widening
-//! 32x32 product differs between the two flavors.
+//! during arithmetic, as in the CPU code. Both flavors implement the same field
+//! operations; the native flavor uses `u64` products and the portable flavor
+//! assembles wide products from 16-bit pieces.
 //!
 //! Seven modules are generated, each with its own bind group 0:
 //!
@@ -24,6 +24,7 @@
 //!   batches, in coefficient form.
 //! - [`permutation_module`]: the partial products and Z of the permutation
 //!   argument.
+//! - [`pow_module`]: `pow_search`, the proof-of-work nonce search.
 
 use core::fmt::Write;
 
@@ -46,12 +47,11 @@ pub const HASH_WORKGROUP: u32 = 64;
 /// Workgroup size of the NTT kernel.
 pub const FFT_WORKGROUP: u32 = 256;
 /// Log2 of the FFT workgroup tile (elements held in workgroup memory, 8 bytes
-/// each). Larger tiles (11, 12) were slower on the M4 (PERF-03).
+/// each). The tile size balances workgroup memory use and dispatch count.
 pub const FFT_TILE_BITS: u32 = 10;
 
 /// Later stage groups keep runs of at least `2^FFT_MIN_LOW_BITS` contiguous
-/// elements, so global memory is read in useful lengths. Shorter runs were
-/// slower on the M4 (PERF-03).
+/// elements, so global memory is read in useful lengths.
 const FFT_MIN_LOW_BITS: u32 = 3;
 
 // Flags of `FftParams.flags`.
@@ -422,7 +422,7 @@ fn mds_freq(s0: u32, s1: u32, s2: u32, s3: u32, s4: u32, s5: u32,
     let v2 = 8u * u10 - u2 - 2u * u6;
     let v6 = 0u - 8u * u2 - u6 - 2u * u10;
     let v10 = 2u * u2 - 8u * u6 - u10;
-    // Real 4-point inverse FFTs (unreduced, as in the SDK).
+    // Real 4-point inverse FFTs (unreduced, as in poseidon12_mds).
     let d0 = v0 + v2; let d1 = v0 - v2; let d2 = v.z0r; let d3 = 0u - v.z0i;
     let e0 = v4 + v6; let e1 = v4 - v6; let e2 = v.z1r; let e3 = 0u - v.z1i;
     let g0 = v8 + v10; let g1 = v8 - v10; let g2 = v.z2r; let g3 = 0u - v.z2i;
@@ -515,7 +515,7 @@ fn mds_layer(out: &mut String, next: Option<[u64; 12]>, limbs_in: bool, limbs_ou
 /// added to the input, every later round's constants ride on the previous
 /// round's MDS recombination. The 22 partial rounds (4..26) are in their plain
 /// form (S-box on word 0, then the dense layer): on the GPU the dense layer
-/// (16-bit limbs, small constant multiplies) is cheaper than Plonky2's sparse
+/// (22-bit limbs, small constant multiplies) is cheaper than Plonky2's sparse
 /// "fast" variant, whose dot products with 64-bit coefficients need a full
 /// 64x64 product and a 160-bit carry chain per term.
 fn permutation(out: &mut String) {
@@ -732,8 +732,8 @@ pub fn prelude_with_mds(flavor: Flavor) -> String {
     out
 }
 
-/// The product of two elements of the quintic extension `F[X] / (X^5 - 3)`
-/// (pod2's curve field), coefficient by coefficient: the products that wrap
+/// The product of two elements of the quintic extension `F[X] / (X^5 - 3)`,
+/// coefficient by coefficient: the products that wrap
 /// past X^5 take the second operand's coefficient scaled by 3 first.
 pub(crate) const QMUL: &str = r#"
 fn qmul(x: array<Field, 5>, y: array<Field, 5>) -> array<Field, 5> {
@@ -760,7 +760,7 @@ pub fn hash_module(flavor: Flavor) -> String {
     out
 }
 
-/// Proof-of-work search (PERF-33): each invocation tries candidate
+/// Proof-of-work search: each invocation tries candidate
 /// `base + id` in word `position` of the prepared sponge state, applies the
 /// exact permutation and keeps the smallest index whose response (word 7, the
 /// last rate element) has at least `min_zeros` leading zero bits.

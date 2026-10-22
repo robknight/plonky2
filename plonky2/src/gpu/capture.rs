@@ -2,9 +2,9 @@
 //!
 //! `PLONKY2_GPU_CAPTURE=<file.gputrace>` captures the wires commitment, and
 //! `PLONKY2_GPU_CAPTURE_QUOTIENT=<file.gputrace>` the quotient evaluation,
-//! whose zero-based index in the process is `PLONKY2_GPU_CAPTURE_INDEX`
-//! (default 1, the second proof, past the lazy pipeline compiles) into that
-//! file, which must not exist yet. The process needs `METAL_CAPTURE_ENABLED=1` in its
+//! with `PLONKY2_GPU_CAPTURE_INDEX` selecting the zero-based invocation of each
+//! phase (default 1, the second invocation). The file must not exist yet.
+//! The process needs `METAL_CAPTURE_ENABLED=1` in its
 //! environment. Other platforms and unset variables make this a no-op.
 
 use std::sync::atomic::{AtomicUsize, Ordering};

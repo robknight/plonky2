@@ -1,6 +1,7 @@
 //! Batched NTTs and the polynomial batch commitment on the device: IFFT of
 //! the values, coset LDE, and leaf hashing straight from the column-major
-//! evaluations, which also writes the row-major leaves the host keeps. The
+//! evaluations, which also writes row-major Merkle leaves. These are read back
+//! or retained on the device according to the proof's execution policy. The
 //! batch keeps both the coefficients and the extended evaluations on the
 //! device for the quotient and the opening phase.
 

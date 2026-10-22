@@ -1,4 +1,4 @@
-//! Compare every emitted wire against the former extension-field call path.
+//! Compare every emitted wire against an extension-field reference implementation.
 //! MODE bits isolate the base-field S-box, MDS and fast partial MDS routines.
 use std::hint::black_box;
 use std::time::Instant;

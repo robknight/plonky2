@@ -78,9 +78,10 @@ fn bench_merkle_query_readback() {
     }
 }
 
-/// Writes the MSL that wgpu's Metal backend generates for the hash module to
+/// Translates the hash module to MSL, or the quotient module when
+/// `PLONKY2_GPU_MSL_MODULE=quotient`, and writes it to
 /// `PLONKY2_GPU_MSL_OUT` (default `plonky2-hash.metal` in the temp dir), with
-/// the options wgpu-hal passes for modules created with runtime checks off.
+/// options matching wgpu-hal's translation with runtime checks off.
 #[test]
 #[ignore]
 fn dump_hash_msl() {
@@ -125,7 +126,7 @@ fn dump_hash_msl() {
     eprintln!("wrote {} bytes of MSL to {}", msl.len(), path.display());
 }
 
-/// Timings of the pieces of a MainPod-sized wires commitment (2^19 leaves of 139 elements).
+/// Timings of a wires commitment with 2^19 leaves of 139 elements.
 /// Run with `cargo test --release --features gpu-profiling bench_commitment -- --ignored --nocapture`.
 #[test]
 #[ignore]
@@ -195,7 +196,7 @@ fn bench_commitment() {
     );
 }
 
-/// The LDE of the wires batch (139 columns of 2^16 coefficients to 2^19
+/// The LDE of a batch (139 columns of 2^16 coefficients to 2^19
 /// points) as a whole, then each stage group alone, then a zero-stage pass
 /// through the same kernel (tile load and store only) as the memory-traffic
 /// reference. Best of six submissions each.
@@ -287,9 +288,9 @@ fn bench_fft_passes() {
         bytes / 1e6,
         bytes / copy / 1e9
     );
-    // The same two kernels into a buffer created just before each submission,
-    // as the prover does once per commitment: the difference is the cost of
-    // first use (zero initialization and page faults).
+    // The same two kernels into a buffer acquired before each submission.
+    // With storage pooling disabled, the difference includes first-use costs
+    // (zero initialization and page faults); pooling can reuse the allocation.
     for (label, zero_stage) in [
         ("whole LDE, fresh buffer", false),
         ("zero-stage pass, fresh buffer", true),
@@ -1023,8 +1024,7 @@ fn bench_opening_fft_crossover() {
 
 /// Occupancy probes for the quotient interpreter on a dumped program
 /// (`PLONKY2_GPU_PROGRAM`): the kernel at several workgroup sizes, and, for a
-/// program without quintic ops (dumped from a build whose `compile_program`
-/// does not fuse them), the kernel with and without the unused quintic case
+/// program without quintic ops, the kernel with and without the unused quintic case
 /// compiled in, which isolates that case's register cost. Blocks alternate,
 /// best of five each.
 /// Run alone: `PLONKY2_GPU_PROGRAM=... cargo test --release --features
@@ -1180,12 +1180,12 @@ fn bench_quotient_occupancy() {
     }
 }
 
-/// Transfer probes for the discrete-GPU gaps of PERF-45 and PERF-46, at the
-/// MainPod wires size (135 columns of 2^16 words, about 70 MB) and smaller:
+/// Transfer probes for discrete GPUs, at the
+/// size of 135 columns of 2^16 words (about 70 MB) and smaller:
 /// device to readback-buffer copies (what a commitment's coefficient readback
 /// costs on the queue), device to device copies for reference, and three
 /// ways to fill a device buffer from the host (a fresh buffer mapped at
-/// creation, as the witness gather does; a reused mapped staging buffer and a
+/// creation; a reused mapped staging buffer, as the witness gather uses, and a
 /// copy; a queue write). Wall times of submit-and-wait, best of five.
 /// Run alone: `cargo test --release --features gpu-profiling
 /// bench_transfer_paths -- --ignored --nocapture`.

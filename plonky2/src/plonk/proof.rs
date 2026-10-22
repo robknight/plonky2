@@ -314,8 +314,8 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
     /// The openings of the commitments at `zeta` (and of the Z's at `g * zeta`).
     ///
     /// With the `gpu` feature and a suitable adapter they are evaluated from
-    /// the device copies of the coefficients; the result is identical to
-    /// [`Self::new_cpu`].
+    /// the device copies of the coefficients, producing the same opening
+    /// values as the CPU path.
     pub fn new<C: GenericConfig<D, F = F>>(
         zeta: F::Extension,
         g: F::Extension,

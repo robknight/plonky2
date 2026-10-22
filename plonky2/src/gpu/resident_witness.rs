@@ -1,5 +1,5 @@
 //! Wire values the compiled witness executor (`plonk::witness_program`)
-//! wrote straight into device memory, handed to the prover in place of a host
+//! uploaded through a staging buffer, handed to the prover in place of a host
 //! witness matrix.
 use std::sync::Arc;
 

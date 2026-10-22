@@ -8,11 +8,11 @@
 //! accumulators. One small kernel interprets the program for every point of
 //! the extended domain, reading the committed evaluations straight from the
 //! device copies the GPU commitments keep, and adds the permutation argument
-//! terms with hand-written loops. A straight-line kernel generated from the
-//! same DAG was tried first; Metal took minutes to compile the megabyte of
-//! code of pod2's circuit, while the interpreter compiles once in
-//! milliseconds and its program is a 400 KB buffer. A coset IFFT then gives
-//! the quotient's coefficients, which the prover splits and commits as usual.
+//! terms with hand-written loops. The interpreter avoids compiling large
+//! per-circuit shaders: circuits share a kernel specialized by register count,
+//! challenge count and quintic usage, with bytecode in a device buffer. A
+//! coset IFFT then gives the quotient's coefficients, which the prover splits
+//! and commits as usual.
 
 use core::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -59,7 +59,7 @@ const OP_FINISH: u32 = 12;
 const OP_MDS: u32 = 13;
 /// `dst = regs[y]`.
 const OP_MOV: u32 = 14;
-/// `dst = regs[y]^2` (three widening products instead of four).
+/// `dst = regs[y]^2` (three widening products in the portable flavor).
 const OP_SQUARE: u32 = 15;
 /// `dst = regs[y]^7`, the Poseidon S-box, as one op.
 const OP_SBOX: u32 = 16;
@@ -302,11 +302,9 @@ enum Event {
 ///
 /// Each constraint's subtree is evaluated depth first right before it, in
 /// constraint order, visiting shared nodes once, which keeps values close to
-/// their uses (creation order held hundreds of values live for the EC gates,
-/// and folding constraints from the last to the first by Horner's rule held
-/// every round's state of the Poseidon gate). Computed values get registers
-/// released at their last use; leaves are reloaded at each use rather than
-/// held.
+/// their uses and limits the number of live intermediate values. Computed
+/// values get registers released at their last use; leaves are reloaded at
+/// each use rather than held.
 /// Multiplications by constants below 2^32 and additions of constants use
 /// the cheaper ops, and a product used only by one addition is fused into it.
 fn append_gate<F: RichField + Field64>(
@@ -884,7 +882,7 @@ pub(crate) fn gate_program<F: RichField + Field64>(
 }
 
 /// Runs a program on the host, for tests: returns the contribution of every
-/// challenge, `sum_c filter * alpha_c^(weight_offset + k) * constraint_k`.
+/// challenge `c`: `sum_k filter * alpha_c^(weight_offset + k) * constraint_k`.
 #[cfg(test)]
 pub(crate) fn run_program_host<F: RichField>(
     ops: &[[u32; 4]],
@@ -1855,7 +1853,7 @@ pub(crate) fn try_compute_quotient_polys<
         let concurrent = ctx.options.proving_workers > 1;
         let measured =
             (cpu_rate / (cpu_rate + gpu_rate)).clamp(0.02, if concurrent { 0.4 } else { 0.6 });
-        // One worker moves the share to the measured balance (PERF-41);
+        // One worker moves the share to the measured balance;
         // concurrent proofs disturb each other's rates, so they damp it.
         let weight = if concurrent { 0.25 } else { 1.0 };
         let mut share = ctx.quotient_cpu_share.lock().unwrap();

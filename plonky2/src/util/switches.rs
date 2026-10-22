@@ -1,7 +1,7 @@
 //! Diagnostic environment switches, read the same way everywhere. A flag is
 //! on when the variable is set to anything but `0`. A value that does not
-//! parse is ignored with one warning per variable. Settings that configure
-//! the GPU context are read with the context, not here.
+//! parse is ignored with one warning per variable. GPU context settings come
+//! from `crate::gpu::GpuConfig`, rather than environment variables.
 // Which helpers have callers depends on the enabled features.
 #![allow(dead_code)]
 

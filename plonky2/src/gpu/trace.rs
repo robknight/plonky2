@@ -633,10 +633,9 @@ fn lookup_mul_raw<F: PrimeField64>(dag: &Dag<F>, a: NodeId, b: NodeId) -> Option
     dag.index_of(Node::Mul(a.min(b), a.max(b)))
 }
 
-/// Replaces every quintic extension product built the way pod2's
-/// `nnf_mul_ext` builds it (coefficient `k` as a fold of the plain products
-/// `x_i y_(k-i)` plus a fold of the products `x_i y_(5+k-i)` scaled by
-/// `QMUL_W`) by one `Node::Qmul` group. The anchor is coefficient 0, an
+/// Replaces quintic extension products by `Node::Qmul` groups. Each coefficient
+/// `k` must be a fold of the plain products `x_i y_(k-i)` plus a fold of the
+/// products `x_i y_(5+k-i)` scaled by `QMUL_W`. The anchor is coefficient 0, an
 /// addition of one plain product and a four-term chain of scaled products
 /// whose factors are the operand pairs `(x_i, y_(5-i))`; every assignment of
 /// the pairs to `i` and every orientation of each pair is tried, and one is

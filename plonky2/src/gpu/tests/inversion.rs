@@ -1,4 +1,4 @@
-//! Exact checks and an isolated old/new probe for the shared field inverse.
+//! Exact checks and throughput comparisons of addition-chain and binary field inversion.
 use super::*;
 
 struct Probe {
@@ -16,7 +16,7 @@ struct Params { count: u32, pad0: u32, pad1: u32, pad2: u32 }
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> inputs: array<Field>;
 @group(0) @binding(2) var<storage, read_write> outputs: array<Field>;
-// The previous production inverse, kept only as a test/benchmark control.
+// Binary exponentiation by p - 2, used as a test and benchmark reference.
 fn inv_binary_reference(a: Field) -> Field {
     var result = a;
     var base = a;
@@ -135,7 +135,7 @@ fn inverse_chain_matches_cpu_and_previous_inverse() {
 }
 
 #[test]
-#[ignore = "explicit old/new inverse throughput experiment"]
+#[ignore = "explicit addition-chain versus binary inverse throughput experiment"]
 fn measure_inverse_chain() {
     use std::time::Instant;
     let ctx = GpuContext::new().expect("inverse benchmark requires a physical GPU");

@@ -1,4 +1,4 @@
-//! Proof-of-work nonce search on the device (PERF-33). Every invocation tries
+//! Proof-of-work nonce search on the device. Every invocation tries
 //! one candidate with the same exact permutation the Merkle kernels use, and
 //! the smallest matching index of a batch wins, so the result is the smallest
 //! valid candidate and does not depend on scheduling. Batches start at zero

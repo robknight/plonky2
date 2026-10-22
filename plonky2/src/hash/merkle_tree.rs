@@ -220,7 +220,8 @@ impl<F: crate::field::types::PrimeField64> MerkleLeaves<F> {
 #[cfg(feature = "gpu")]
 impl<F: Copy> MerkleLeaves<F> {
     /// Gather all queried rows in one submission/readback. A full CPU request
-    /// still works. A later, different query set falls back to full host data.
+    /// still works. Only the first nonempty query set is cached; accessing a
+    /// row outside that set materializes the full host data.
     pub(crate) fn prepare_queries(&self, indices: &[usize]) {
         let Some(d) = &self.values.device else { return };
         if d.full.get().is_some() || indices.is_empty() {
@@ -232,7 +233,7 @@ impl<F: Copy> MerkleLeaves<F> {
             indices.dedup();
             assert!(indices.iter().all(|&i| i < self.num_leaves));
             let resident = d.resident.lock().unwrap();
-            // Materialization may have won the lock. get() will use host data.
+            // Materialization may have won the lock. row() will use host data.
             let Some(buffer) = resident.as_ref() else {
                 return Default::default();
             };
@@ -269,7 +270,7 @@ impl<F: Copy> MerkleLeaves<F> {
     }
 
     /// Copies the rows a CPU computation will read into a compact host table
-    /// that `get` consults before the full download. Only on devices whose
+    /// that `row` consults before the full download. Only on devices whose
     /// buffers the host maps directly (unified memory), where the copy reads
     /// the GPU's own buffer; elsewhere, or once the full host copy exists,
     /// this does nothing and rows come from the full download. One set per

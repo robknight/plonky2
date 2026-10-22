@@ -14,10 +14,9 @@
 //! `VerifierCircuitData` and the verifier do not know which path produced a
 //! proof.
 //!
-//! The kernels are generated in [`shader`] from the Poseidon constants of the
-//! pinned implementation; the field arithmetic and the permutation are the
-//! `zk-craft-grinder` kernels, which run on Metal, Vulkan and DirectX 12 and
-//! have a portable flavor for adapters without 64-bit shader integers.
+//! The kernels are generated in [`shader`] from this crate's Poseidon constants.
+//! The field arithmetic and permutation run on Metal, Vulkan and DirectX 12,
+//! with a portable flavor for adapters without 64-bit shader integers.
 //!
 //! Selection is by feature plus a runtime check. A process-wide
 //! [`GpuContext`] holds the device, queue and compiled pipelines and is
@@ -48,7 +47,7 @@
 //! | `PLONKY2_GPU_TIMESTAMPS` | flag | Device timestamps for Merkle leaf and level passes and the quotient evaluation (debug logs). Adapters without timestamp queries prove without them. |
 //! | `PLONKY2_GPU_PASS_TIMELINE` | flag | Logs a device timeline of every named compute pass after each proof (`plonky2::gpu::timestamps`, info); see `tools/gpu/gpu-timeline`. |
 //! | `PLONKY2_DELAY_SCOPE`, `PLONKY2_DELAY_MS` | scope name, milliseconds | Sleeps at the start of every timing scope with that name, to probe the critical path. |
-//! | `PLONKY2_GPU_CAPTURE`, `PLONKY2_GPU_CAPTURE_QUOTIENT` | `.gputrace` path | Metal capture of the wires commitment or the quotient evaluation number `PLONKY2_GPU_CAPTURE_INDEX` (default 1) in the process; needs `METAL_CAPTURE_ENABLED=1`. |
+//! | `PLONKY2_GPU_CAPTURE`, `PLONKY2_GPU_CAPTURE_QUOTIENT` | `.gputrace` path | Metal capture of the wires commitment or quotient evaluation; `PLONKY2_GPU_CAPTURE_INDEX` selects the zero-based invocation of each phase (default 1). Needs `METAL_CAPTURE_ENABLED=1`. |
 //! | `PLONKY2_GPU_PROGRAM_DUMP` | path | Writes the quotient program, for `bench_quotient_occupancy`. |
 //! | `PLONKY2_GPU_QMUL_DEBUG`, `PLONKY2_GPU_QMUL_DUMP` | flag, path prefix | Logs quintic fusion counts; dumps the gate DAG and its fused groups. |
 //! | `PLONKY2_GPU_QUOTIENT_NONCE` | integer | Renames the quotient entry point, forcing a driver shader cache miss. |
@@ -57,9 +56,9 @@
 //! | `PLONKY2_GPU_WITNESS_CPU_EXECUTOR_PROFILE` | flag | Runs the compiled executor's groups one at a time and prints the time per operation kind. |
 //!
 //! Buffers are bound whole, so the adapter must allow storage bindings of the
-//! size of an extended polynomial batch (about 600 MB for pod2's MainPod
-//! circuit); native Metal and Vulkan adapters do, WebGPU's default limits do
-//! not. Batches that exceed the adapter's limits fall back to the CPU.
+//! size of an extended polynomial batch (about 583 MB for 139 columns of
+//! 2^19 field elements). Batches that exceed the adapter's limits fall back
+//! to the CPU.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::borrow::Cow;
@@ -204,8 +203,8 @@ impl std::error::Error for ShutdownError {}
 /// Waits for GPU work, clears retained polynomial buffers (including buffers
 /// in application circuit caches), and drops the global context and pipelines.
 ///
-/// Optional: the same shutdown runs automatically at normal process exit (see
-/// [`register_exit_shutdown`]), so applications need not call it. Call it to
+/// The same shutdown runs automatically at normal process exit when
+/// [`GpuConfig::shutdown_at_exit`] is enabled. Call it to
 /// release the GPU earlier, after stopping/joining proving workers and
 /// releasing all [`context`] handles and GPU-resident leaves. Fully
 /// materializing leaves on the host releases their device/context handles.
@@ -234,8 +233,7 @@ fn register_exit_shutdown() {
             fn atexit(callback: extern "C" fn()) -> core::ffi::c_int;
         }
         // SAFETY: atexit only stores the function pointer. The callback has
-        // the C ABI, catches every panic and never blocks, so it can run
-        // during exit on any thread that calls `exit`.
+        // the C ABI and catches panics before they cross that boundary.
         if unsafe { atexit(shutdown_at_exit) } != 0 {
             log::debug!("plonky2 gpu: could not register the exit shutdown");
         }
@@ -244,10 +242,10 @@ fn register_exit_shutdown() {
     let _ = &REGISTERED;
 }
 
-/// The exit-time shutdown: like [`shutdown`], but it never waits for a lock
-/// another thread holds and never panics. If proving is still in progress on
-/// another thread, or a handle is still held, it does nothing and exit
-/// proceeds as before.
+/// The exit-time shutdown: tries the context and cache-registry locks without
+/// waiting and catches panics. It can still wait for queued GPU work. If proving is in progress on
+/// another thread, or a handle is still held, it leaves the context alive
+/// and lets the process exit.
 pub(crate) extern "C" fn shutdown_at_exit() {
     let _ = std::panic::catch_unwind(|| {
         let Ok(mut state) = CONTEXT.try_lock() else {
@@ -357,19 +355,18 @@ pub struct GpuContext {
     pub(crate) quotient_kernels:
         Mutex<HashMap<(u32, u32, bool), std::sync::Arc<quotient::QuotientKernel>>>,
     pub(crate) row_tables: Mutex<HashMap<(u32, u32), DeviceBuffer>>,
-    /// The share of the quotient's points the CPU evaluates alongside the
-    /// kernel, adapted from the measured rates of the last proof.
     /// The whole-proof pass timeline (`PLONKY2_GPU_PASS_TIMELINE=1`).
     #[cfg(feature = "gpu-profiling")]
     pub(crate) pass_timeline: Option<timestamps::PassTimeline>,
+    /// The share of the quotient's points the CPU evaluates alongside the
+    /// kernel, adapted from the measured rates of completed proofs.
     pub(crate) quotient_cpu_share: Mutex<f64>,
 }
 
 /// A device buffer handle. Buffers from `GpuContext::storage` return to the
-/// context's pool when the last handle is dropped, so that a proof's large
-/// buffers (the wires LDE and its rows are 583 MB each for pod2's MainPod)
-/// are reused instead of created, zero-initialized and faulted in again:
-/// a fresh 583 MB buffer costs about 35 ms of its first kernel on the M4.
+/// context's pool when the last handle is dropped and pooling is enabled.
+/// Reuse avoids allocation, zero-initialization and first-use page faults
+/// for large commitment buffers.
 /// Reused buffers hold their previous contents.
 #[derive(Clone, Debug)]
 #[doc(hidden)]
@@ -870,8 +867,9 @@ impl GpuContext {
         usage
     }
 
-    /// An uninitialized storage buffer of `bytes` (at least 16), from the
-    /// pool when one of that size is free.
+    /// A storage buffer of `bytes` (at least 16), from the pool when one of
+    /// that size is free. Pooled buffers retain their contents; callers must
+    /// write every element they will read.
     pub(crate) fn storage(&self, label: &str, bytes: u64) -> DeviceBuffer {
         let size = bytes.max(16).next_multiple_of(16);
         let buffer = self.storage_pool.take(size).unwrap_or_else(|| {
@@ -1150,7 +1148,7 @@ impl GpuContext {
 
     /// A host-mappable upload buffer of at least `bytes`, mapped for writing,
     /// reused across proofs: filling freshly mapped pages costs several times
-    /// more than filling a reused mapping (PERF-46). `finish_upload` copies it
+    /// more than filling a reused mapping. `finish_upload` copies it
     /// into a device buffer and returns it to the pool. Its contents (for the
     /// witness, plaintext wire values) stay in host-visible memory until the
     /// next upload of the same size overwrites them, as with the readback pool.
@@ -1410,14 +1408,11 @@ impl GpuContext {
     }
 }
 
-/// A device copy of a polynomial batch's extended evaluations (column-major,
-/// `2^(degree_log + rate_bits)` rows per polynomial), kept by the batches a
-/// proof commits on the GPU so that the quotient kernel can read them without
-/// recomputing the LDE. The quotient takes the buffers of the batches a proof
-/// creates, so they do not outlive it, and keeps the one of the circuit's
-/// fixed commitment (constants and sigmas) across proofs, within
-/// [`GpuConfig::retained_bytes`] in total. Ignored by equality
-/// and serialization.
+/// A cached device buffer for polynomial coefficients, extended evaluations
+/// or sigma values. Proof-local buffers are consumed by subsequent GPU work;
+/// fixed circuit data can retain buffers across proofs, subject to
+/// [`GpuConfig::retained_bytes`]. Ignored by equality and serialization, and
+/// registered so shutdown can release buffers held by application caches.
 #[doc(hidden)]
 pub struct DeviceCache(Arc<CachedBuffer>);
 

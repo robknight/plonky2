@@ -12,8 +12,8 @@
 //! caller knows whether that is the case.
 //!
 //! Available with the default `std` and `rand_chacha` features, with or
-//! without `gpu`; with `gpu` the executor writes the wires straight into
-//! device memory when the GPU prover applies.
+//! without `gpu`; with `gpu` the executor gathers wires into a mapped staging
+//! buffer and uploads them when the GPU prover applies.
 //!
 //! Nothing here happens implicitly: [`CircuitData::prove`] never compiles,
 //! stores or loads a program. The caller compiles with
@@ -505,7 +505,7 @@ mod tests {
         };
         assert!(id.contains("BaseSumGenerator"), "{id}");
         assert_eq!(data.compile_witness_program(&[]).unwrap_err(), error);
-        // The worklist proves it as before.
+        // The worklist can prove a circuit with an unsupported generator.
         let mut pw = PartialWitness::new();
         for (i, bit) in bits.iter().enumerate() {
             pw.set_bool_target(*bit, i % 3 == 0).unwrap();
