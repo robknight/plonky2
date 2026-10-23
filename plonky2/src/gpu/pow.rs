@@ -40,6 +40,9 @@ pub(crate) fn search<F: RichField>(
     if !field_supported::<F>() || state.len() != 12 || position >= 12 {
         return None;
     }
+    if min_leading_zeros == 0 {
+        return Some(0);
+    }
     let ctx = context()?;
     search_on(&ctx, state, position, min_leading_zeros)
 }
@@ -103,18 +106,26 @@ pub(crate) fn search_on<F: RichField>(
     position: usize,
     min_leading_zeros: u32,
 ) -> Option<u64> {
+    if min_leading_zeros == 0 {
+        return Some(0);
+    }
+    let capacity = ctx.max_workgroups.saturating_mul(64).min(MAX_BATCH);
+    if capacity == 0 {
+        return None;
+    }
     let kernel = kernel(ctx)?;
     let words = state
         .iter()
         .map(|x| x.to_canonical_u64())
         .collect::<Vec<_>>();
     let state_buffer = ctx.upload("proof of work state", &words);
-    let budget = 1u64 << (min_leading_zeros + BUDGET_BITS).min(63);
+    let budget = 1u64 << min_leading_zeros.saturating_add(BUDGET_BITS).min(63);
     let mut base = 0u64;
     let mut count = FIRST_BATCH;
     while base < budget {
+        let batch_count = (budget - base).min(u64::from(count.min(capacity))) as u32;
         // Candidates stay canonical field elements.
-        if base.checked_add(count as u64)? > F::ORDER {
+        if base.checked_add(batch_count as u64)? > F::ORDER {
             return None;
         }
         let found = ctx.upload("proof of work result", &[u64::MAX, u64::MAX]);
@@ -124,7 +135,7 @@ pub(crate) fn search_on<F: RichField>(
                 position as u32,
                 base as u32,
                 (base >> 32) as u32,
-                count,
+                batch_count,
                 min_leading_zeros,
                 0,
                 0,
@@ -137,7 +148,7 @@ pub(crate) fn search_on<F: RichField>(
             let mut pass = ctx.begin_pass(&mut encoder, "proof of work search", None);
             pass.set_pipeline(&kernel.pipeline);
             pass.set_bind_group(0, &bindings, &[]);
-            pass.dispatch_workgroups(count.div_ceil(64), 1, 1);
+            pass.dispatch_workgroups(batch_count.div_ceil(64), 1, 1);
         }
         let done = ctx.submit_async(encoder);
         let index = ctx.read_after(&found, 16, Some(&done), |bytes| {
@@ -146,7 +157,7 @@ pub(crate) fn search_on<F: RichField>(
         if index != u32::MAX {
             return Some(base + index as u64);
         }
-        base += count as u64;
+        base += batch_count as u64;
         count = (count * 2).min(MAX_BATCH);
     }
     None

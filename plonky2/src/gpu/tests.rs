@@ -2543,26 +2543,36 @@ fn software_gpu_proofs_verify() {
     })
     .unwrap();
     assert!(context().is_some(), "a Vulkan adapter is required");
-    let mut config = CircuitConfig::standard_recursion_config();
-    config.security_bits = 1;
-    config.fri_config.num_query_rounds = 2;
-    config.fri_config.proof_of_work_bits = 0;
-    let mut builder = CircuitBuilder::<F, 2>::new(config);
-    let input = builder.add_virtual_target();
-    let mut state = vec![input; 4];
-    for _ in 0..128 {
-        state = builder.hash_n_to_hash_no_pad::<H>(state).elements.to_vec();
+    for blinded in [false, true] {
+        let mut config = if blinded {
+            CircuitConfig::standard_recursion_zk_config()
+        } else {
+            CircuitConfig::standard_recursion_config()
+        };
+        config.security_bits = 1;
+        config.fri_config.num_query_rounds = 2;
+        config.fri_config.proof_of_work_bits = 0;
+        let mut builder = CircuitBuilder::<F, 2>::new(config);
+        let input = builder.add_virtual_target();
+        let mut state = vec![input; 4];
+        for _ in 0..128 {
+            state = builder.hash_n_to_hash_no_pad::<H>(state).elements.to_vec();
+        }
+        builder.register_public_inputs(&state);
+        let data = builder.build::<C>();
+        let plan = policy::ExecutionPlan::new(&data.common, &data.prover_only);
+        assert_eq!(plan.path, policy::ExecutionPath::Resident);
+        let mut pw = PartialWitness::new();
+        pw.set_target(input, F::from_canonical_u64(42)).unwrap();
+        data.verify(data.prove(pw.clone()).unwrap()).unwrap();
+        let program = data.compile_witness_program_like(&pw).unwrap();
+        data.install_witness_program(program).unwrap();
+        data.verify(data.prove(pw).unwrap()).unwrap();
     }
-    builder.register_public_inputs(&state);
-    let data = builder.build::<C>();
-    let plan = policy::ExecutionPlan::new(&data.common, &data.prover_only);
-    assert_eq!(plan.path, policy::ExecutionPath::Resident);
-    let mut pw = PartialWitness::new();
-    pw.set_target(input, F::from_canonical_u64(42)).unwrap();
-    data.verify(data.prove(pw.clone()).unwrap()).unwrap();
-    let program = data.compile_witness_program_like(&pw).unwrap();
-    data.install_witness_program(program).unwrap();
-    data.verify(data.prove(pw).unwrap()).unwrap();
+    assert!(
+        context().unwrap().pow_kernel.get().is_none(),
+        "zero difficulty must not compile the PoW kernel"
+    );
 }
 
 #[test]
@@ -2633,6 +2643,7 @@ fn small_workloads_do_not_initialize_gpu() {
     )
     .is_none());
     assert!(fri::try_opening_fft::<F, 2>(&coeffs).is_none());
+    assert_eq!(pow::search(&[F::ZERO; 12], 0, 0), Some(0));
     let batch = &data.prover_only.constants_sigmas_commitment;
     let zeta = QuadraticExtension::<F>::ONE;
     assert!(opening::try_opening_set::<F, C, 2>(
@@ -2712,5 +2723,39 @@ fn software_gpu_opening_sets_match_cpu() {
             opening::try_opening_set::<F, C, 2>(zeta, g, &fixed, &wires, &zs, &quotient, common)
                 .expect("the GPU takes these opening sets");
         assert_eq!(actual, expected, "lookups={lookups}");
+    }
+}
+
+#[test]
+fn proof_of_work_respects_small_budgets_and_dispatch_limits() {
+    use crate::hash::hashing::PlonkyPermutation;
+    use crate::hash::poseidon::PoseidonPermutation;
+    let config = GpuConfig {
+        allow_software: true,
+        ..Default::default()
+    };
+    let Ok(mut ctx) = GpuContext::with_config(&config) else {
+        eprintln!("no compute adapter; skipping");
+        return;
+    };
+    // Force many small dispatches rather than relying on a large adapter limit.
+    ctx.max_workgroups = 1;
+    let ctx = Arc::new(ctx);
+    let state = [F::from_canonical_u64(17); 12];
+    assert_eq!(pow::search_on(&ctx, &state, 3, 0), Some(0));
+    assert!(ctx.pow_kernel.get().is_none());
+    for bits in [1u32, 3, 7, 10] {
+        let budget = 1u64 << (bits + 4);
+        let expected = (0..budget).find(|&nonce| {
+            let mut permutation = PoseidonPermutation::<F>::new(state);
+            permutation.set_elt(F::from_canonical_u64(nonce), 3);
+            permutation.permute();
+            permutation.squeeze()[7].to_canonical_u64().leading_zeros() >= bits
+        });
+        assert_eq!(
+            pow::search_on(&ctx, &state, 3, bits),
+            expected,
+            "bits={bits}"
+        );
     }
 }

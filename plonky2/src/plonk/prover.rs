@@ -243,7 +243,10 @@ where
     // the guard joins the thread before this proof returns.
     #[cfg(feature = "gpu")]
     let _pow_warm = match &gpu_plan.prepared {
-        Some((ctx, _)) if <C::Hasher as crate::plonk::config::Hasher<F>>::GPU_POSEIDON => {
+        Some((ctx, _))
+            if <C::Hasher as crate::plonk::config::Hasher<F>>::GPU_POSEIDON
+                && common_data.config.fri_config.proof_of_work_bits > 0 =>
+        {
             Some(crate::gpu::pow::warm(ctx))
         }
         _ => None,
