@@ -29,7 +29,7 @@ use crate::iop::generator::WitnessGeneratorRef;
 
 include!(concat!(env!("OUT_DIR"), "/witness_program_format.rs"));
 
-const MAGIC: &[u8; 8] = b"P2WPLAN4";
+const MAGIC: &[u8; 8] = b"P2WPLAN5";
 
 /// Identity of a whole-circuit program.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,12 +122,6 @@ impl Writer {
     fn usize(&mut self, v: usize) {
         self.u64(v as u64);
     }
-    fn u32s(&mut self, v: &[u32]) {
-        self.usize(v.len());
-        for &x in v {
-            self.u32(x);
-        }
-    }
     /// `values` as a count, then each value's difference from the previous
     /// one (starting from 0), zigzag-mapped and written as a LEB128 varint.
     /// Index arrays that mostly ascend in small steps, and coefficient
@@ -184,10 +178,6 @@ impl Reader<'_> {
         );
         Ok(n)
     }
-    fn u32s(&mut self) -> Result<Vec<u32>> {
-        let n = self.len(4)?;
-        (0..n).map(|_| self.u32()).collect()
-    }
     /// Reads what `Writer::deltas` wrote, rejecting values above `max`.
     fn deltas(&mut self, max: u64) -> Result<Vec<u64>> {
         // Every value takes at least one byte.
@@ -243,7 +233,6 @@ pub(crate) fn encode(program: &RegionProgram, key: &PlanKey) -> Vec<u8> {
     w.deltas(program.coefficients.iter().copied());
     w.deltas(program.representatives.iter().map(|&r| r as u64));
     w.deltas(program.roots.iter().map(|&r| r as u64));
-    w.u32s(&program.root_slots);
     w.u32(program.random_count);
     w.u32(program.alias_count);
     w.u32(program.alias_pair_offset);
@@ -310,14 +299,13 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(PlanKey, RegionProgram)> {
     let coefficients = r.deltas(u64::MAX)?;
     let representatives = to_usizes(r.deltas(u64::MAX)?)?;
     let roots = to_usizes(r.deltas(u64::MAX)?)?;
-    let root_slots = r.u32s()?;
     let random_count = r.u32()?;
     let alias_count = r.u32()?;
     let alias_pair_offset = r.u32()?;
     let state_slots = r.u32()?;
     ensure!(r.pos == payload.len(), "plan file has trailing data");
     ensure!(
-        roots.len() == root_slots.len() && representatives.len() as u64 <= state_slots as u64,
+        representatives.starts_with(&roots) && representatives.len() as u64 <= state_slots as u64,
         "plan slot layout is inconsistent"
     );
     for &slot in &targets {
@@ -330,10 +318,6 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(PlanKey, RegionProgram)> {
     ensure!(
         representatives.iter().all(|&r| r < key.map_len),
         "plan representative out of range"
-    );
-    ensure!(
-        root_slots.iter().all(|&slot| slot < state_slots),
-        "plan root slot out of range"
     );
     // Every random value has exactly one writer, so no blinding value can
     // be dropped by a damaged or edited plan.
@@ -366,7 +350,6 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(PlanKey, RegionProgram)> {
         coefficients,
         representatives,
         roots,
-        root_slots,
         random_count,
         alias_count,
         alias_pair_offset,

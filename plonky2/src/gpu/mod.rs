@@ -498,7 +498,7 @@ impl GpuOptions {
     /// device. Proofs decide through `ExecutionPlan::retain_leaves`, which
     /// also keeps them for hybrid proofs on unified memory.
     pub(crate) fn retain_leaves(&self, mappable: bool) -> bool {
-        self.mode.path(mappable, true) == policy::ExecutionPath::Resident
+        self.mode.path(mappable) == policy::ExecutionPath::Resident
     }
 }
 

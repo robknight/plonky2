@@ -30,6 +30,7 @@ use crate::gates::multiplication_extension::MulExtensionGate;
 use crate::gates::poseidon_mds::PoseidonMdsGate;
 use crate::gates::reducing::ReducingGate;
 use crate::gates::reducing_extension::ReducingExtensionGate;
+use crate::gpu::shader::literal;
 use crate::hash::hash_types::RichField;
 use crate::hash::poseidon::{Poseidon, SPONGE_WIDTH};
 use crate::iop::ext_target::ExtensionTarget;
@@ -1175,10 +1176,6 @@ pub(crate) fn mds_matched_trace<F: RichField>(trace: &GateTrace<F>) -> Option<Ga
 /// sums propagate signs, and an addition of a negated value becomes a
 /// subtraction. A negated value is materialised as `0 - x` only where an
 /// operation needs it positive: MDS and quintic inputs and the constraints.
-pub fn fold_negations<F: PrimeField64>(trace: &mut GateTrace<F>) {
-    *trace = negation_folded_trace(trace);
-}
-
 pub(crate) fn negation_folded_trace<F: PrimeField64>(trace: &GateTrace<F>) -> GateTrace<F> {
     let dag = &trace.dag;
     let mut new = Dag::<F>::new();
@@ -1267,10 +1264,6 @@ pub(crate) fn negation_folded_trace<F: PrimeField64>(trace: &GateTrace<F>) -> Ga
         constraints,
         dag: new,
     }
-}
-
-fn literal(value: u64) -> String {
-    format!("Field({:#x}u, {:#x}u)", value as u32, value >> 32)
 }
 
 /// WGSL for `fn <name>(row: u32, filter: Field, cs: ptr<function, array<Field, NC>>)`

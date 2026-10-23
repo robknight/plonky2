@@ -1009,7 +1009,7 @@ fn compile_attempt<F: RichField + Field64>(
     let mut registers = 0;
     // The trace rewrites before linearization, in this order: written out MDS
     // layers become MDS ops (`trace::mds_matched_trace`), quintic products are
-    // fused, then negations are folded (`trace::fold_negations`).
+    // fused, then negations are folded (`trace::negation_folded_trace`).
     for gate in gates {
         let matched = mds_matched_trace(&gate.trace);
         let trace = matched.as_ref().unwrap_or(&gate.trace);

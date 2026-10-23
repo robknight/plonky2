@@ -26,10 +26,9 @@ pub enum ExecutionMode {
 }
 
 impl ExecutionMode {
-    pub(crate) fn path(self, mappable: bool, supported: bool) -> ExecutionPath {
-        if !supported {
-            ExecutionPath::CpuQuotient
-        } else if self == Self::Resident || (self == Self::Auto && !mappable) {
+    /// Storage policy after a quotient program has been prepared successfully.
+    pub(crate) fn path(self, mappable: bool) -> ExecutionPath {
+        if self == Self::Resident || (self == Self::Auto && !mappable) {
             ExecutionPath::Resident
         } else {
             ExecutionPath::Hybrid
@@ -67,7 +66,7 @@ impl ExecutionPlan {
     ) -> Self {
         let (path, cpu_share) = match &prepared {
             Some((ctx, _)) => {
-                let path = mode.unwrap_or(ctx.options.mode).path(ctx.mappable, true);
+                let path = mode.unwrap_or(ctx.options.mode).path(ctx.mappable);
                 let share = if path == ExecutionPath::Hybrid {
                     *ctx.quotient_cpu_share.lock().unwrap()
                 } else {
@@ -108,8 +107,10 @@ mod tests {
             ExecutionMode::Resident,
             ExecutionMode::Hybrid,
         ] {
+            let unsupported = ExecutionPlan::from_prepared(None, Some(mode));
+            assert_eq!(unsupported.path, ExecutionPath::CpuQuotient);
+            assert!(!unsupported.retain_leaves());
             for mappable in [false, true] {
-                assert_eq!(mode.path(mappable, false), ExecutionPath::CpuQuotient);
                 let expected = if mode == ExecutionMode::Resident
                     || (mode == ExecutionMode::Auto && !mappable)
                 {
@@ -117,7 +118,7 @@ mod tests {
                 } else {
                     ExecutionPath::Hybrid
                 };
-                assert_eq!(mode.path(mappable, true), expected);
+                assert_eq!(mode.path(mappable), expected);
             }
         }
     }

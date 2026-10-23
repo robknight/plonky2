@@ -161,6 +161,55 @@ fn read_hashes<F: RichField, H: Hasher<F>>(
     })
 }
 
+/// Reads authentication siblings in query order, including duplicate queries.
+/// Both resident prover trees and profiling readbacks use this layout.
+pub(crate) fn read_query_paths<T: Copy>(
+    ctx: &GpuContext,
+    digests: &wgpu::Buffer,
+    leaves_len: usize,
+    cap_height: usize,
+    indices: &[usize],
+    decode: impl FnOnce(&[u8]) -> Vec<T>,
+) -> Vec<Vec<T>> {
+    let log_leaves = log2_strict(leaves_len);
+    assert!(cap_height <= log_leaves);
+    let depth = log_leaves - cap_height;
+    let num_digests = 2 * (leaves_len - (1 << cap_height));
+    assert!(digests.size() >= (num_digests * 32) as u64);
+    assert!(indices.iter().all(|&i| i < leaves_len));
+    if depth == 0 || indices.is_empty() {
+        return vec![Vec::new(); indices.len()];
+    }
+    let compact = ctx.storage("merkle query siblings", (indices.len() * depth * 32) as u64);
+    let mut encoder = ctx.encoder("gather merkle query siblings");
+    let tree_len = num_digests >> cap_height;
+    for (query, &index) in indices.iter().enumerate() {
+        // The same sibling positions as the CPU's merkle_tree_prove.
+        let tree_start = (index >> depth) * tree_len;
+        let mut pair = index & ((1 << depth) - 1);
+        for level in 0..depth {
+            let parity = pair & 1;
+            pair >>= 1;
+            let sibling = tree_start + 2 * ((pair << (level + 1)) + (1 << level) - 1) + 1 - parity;
+            encoder.copy_buffer_to_buffer(
+                digests,
+                sibling as u64 * 32,
+                &compact,
+                ((query * depth + level) * 32) as u64,
+                32,
+            );
+        }
+    }
+    let done = ctx.submit_async(encoder);
+    let hashes = ctx.read_after(
+        &compact,
+        (indices.len() * depth * 32) as u64,
+        Some(&done),
+        decode,
+    );
+    hashes.chunks_exact(depth).map(<[T]>::to_vec).collect()
+}
+
 impl DeviceTree {
     /// Reads the digests and the cap back as hashes.
     pub(crate) fn read<F: RichField, H: Hasher<F>>(
@@ -198,7 +247,7 @@ impl DeviceTree {
 
     /// Benchmark helper: copy only authentication siblings from the resident digest
     /// array into one compact readback. Duplicate queries retain their order.
-    /// The prover gathers paths through `MerkleDigests::prepare_queries`;
+    /// The prover gathers paths through `MerkleDigests::prepare_paths`;
     /// this helper measures sparse readback directly from a `DeviceTree`.
     #[cfg(all(test, feature = "gpu-profiling"))]
     pub(crate) fn read_query_paths<F: RichField, H: Hasher<F>>(
@@ -208,41 +257,21 @@ impl DeviceTree {
         cap_height: usize,
         indices: &[usize],
     ) -> Vec<Vec<H::Hash>> {
-        let log_leaves = log2_strict(leaves_len);
-        assert!(cap_height <= log_leaves);
-        let depth = log_leaves - cap_height;
         assert_eq!(self.cap_len, 1usize << cap_height);
         assert_eq!(self.num_digests, 2 * (leaves_len - self.cap_len));
-        assert!(indices.iter().all(|&i| i < leaves_len));
-        if depth == 0 || indices.is_empty() {
-            return vec![Vec::new(); indices.len()];
-        }
-        let compact = ctx.storage("merkle query siblings", (indices.len() * depth * 32) as u64);
-        let mut encoder = ctx.encoder("gather merkle query siblings");
-        let tree_len = self.num_digests >> cap_height;
-        for (query, &index) in indices.iter().enumerate() {
-            let tree_start = (index >> depth) * tree_len;
-            let mut pair = index & ((1 << depth) - 1);
-            for level in 0..depth {
-                let parity = pair & 1;
-                pair >>= 1;
-                let sibling =
-                    tree_start + 2 * ((pair << (level + 1)) + (1 << level) - 1) + 1 - parity;
-                encoder.copy_buffer_to_buffer(
-                    &self.digests,
-                    sibling as u64 * 32,
-                    &compact,
-                    ((query * depth + level) * 32) as u64,
-                    32,
-                );
-            }
-        }
-        let done = ctx.submit_async(encoder);
-        let hashes = read_hashes::<F, H>(ctx, &compact, indices.len() * depth, &done, None);
-        hashes
-            .chunks_exact(depth)
-            .map(<[H::Hash]>::to_vec)
-            .collect()
+        read_query_paths(
+            ctx,
+            &self.digests,
+            leaves_len,
+            cap_height,
+            indices,
+            |bytes| {
+                bytes
+                    .par_chunks_exact(32)
+                    .map(H::Hash::from_bytes)
+                    .collect()
+            },
+        )
     }
 
     /// Reads only the cap, leaving the digests on the device.

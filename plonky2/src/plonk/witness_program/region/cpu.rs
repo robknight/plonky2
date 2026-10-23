@@ -153,9 +153,10 @@ impl RegionProgram {
                 .map(|_| AtomicBool::new(false))
                 .collect(),
         };
-        for (&value, &slot) in root_values.iter().zip(&self.root_slots) {
+        // The compiler places boundary roots at the start of canonical state.
+        for (slot, &value) in root_values.iter().enumerate() {
             ensure!(value < G::ORDER, "boundary input {value} is not canonical");
-            executor.store(slot, G::from_canonical_u64(value))?;
+            executor.store(slot as u32, G::from_canonical_u64(value))?;
         }
         // Operations in one layer are independent: every unseeded slot has
         // one writer, additional writers use private alias slots, and
@@ -1009,8 +1010,6 @@ pub struct CpuExecutorReport {
     /// "installed" for a program the caller installed; diagnostics that
     /// compile their own program report "cached".
     pub plan: &'static str,
-    /// Program I/O time; zero because these executor paths perform no I/O.
-    pub plan_io: Duration,
     /// How the wires were filled: "reused" (the pooled upload buffer) for
     /// device wires, an empty string for a host matrix, "none" for the
     /// partition-witness test helper.
@@ -1026,10 +1025,9 @@ impl CpuExecutorReport {
     pub fn log(&self) {
         log::debug!(
             target: "plonky2::witness_program::executor",
-            "mode={} plan={} plan_io={:?} gather_mode={} generators={} representatives={} random={} layers={} initial={:?} compile={:?} cached={} sample={:?} execute={:?} merge={:?} gather={:?}",
+            "mode={} plan={} gather_mode={} generators={} representatives={} random={} layers={} initial={:?} compile={:?} cached={} sample={:?} execute={:?} merge={:?} gather={:?}",
             self.mode,
             self.plan,
-            self.plan_io,
             self.gather_mode,
             self.generators,
             self.representatives,
@@ -1323,7 +1321,6 @@ pub(crate) fn generate_with_report<
             worklist: Duration::ZERO,
             mode: "partition",
             plan: "cached",
-            plan_io: Duration::ZERO,
             gather_mode: "none",
         },
     ))
@@ -1458,7 +1455,6 @@ pub fn check_against_worklist<
         worklist: worklist_time,
         mode: wires_report.mode,
         plan: wires_report.plan,
-        plan_io: wires_report.plan_io,
         gather_mode: wires_report.gather_mode,
     })
 }
@@ -1733,9 +1729,9 @@ pub(crate) mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("random"), "{error}");
-        // Root slot out of range: rejected.
+        // Roots must occupy the prefix of canonical state: reject a changed root.
         let mut roots = (*program).clone();
-        roots.root_slots[0] = roots.state_slots;
+        roots.roots[0] = roots.representatives[0].wrapping_add(1);
         assert!(plan_bytes::decode(&plan_bytes::encode(&roots, &key)).is_err());
         // A flipped byte: rejected by the checksum.
         let mut damaged = bytes.clone();

@@ -38,12 +38,19 @@ fn ctx() -> Option<std::sync::Arc<GpuContext>> {
 #[test]
 fn resident_merkle_query_paths() {
     let _guard = ENABLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(_available) = ctx() else { return };
+    let config = GpuConfig {
+        allow_software: true,
+        ..Default::default()
+    };
     for force_staging in [false, true] {
-        let mut ctx = GpuContext::new().expect("query test requires a GPU");
+        let Ok(mut ctx) = GpuContext::with_config(&config) else {
+            eprintln!("no compute adapter; skipping");
+            return;
+        };
         if force_staging {
             ctx.mappable = false;
         }
+        let ctx = Arc::new(ctx);
         let words = (0..128 * 9).map(|i| i as u64).collect::<Vec<_>>();
         let source = ctx.upload("query test leaves", &words);
         let leaves = MerkleLeaves::new(
@@ -62,6 +69,16 @@ fn resident_merkle_query_paths() {
                 None,
             );
             assert_eq!(tree.read_cap::<F, H>(&ctx, None), expected.cap.0);
+            let resident = MerkleTree {
+                leaves: expected.leaves.clone(),
+                digests: crate::hash::merkle_tree::MerkleDigests::from_device::<F, H>(
+                    ctx.clone(),
+                    tree.digests.clone(),
+                    tree.num_digests,
+                    tree.done.clone(),
+                ),
+                cap: expected.cap.clone(),
+            };
             for indices in [vec![], vec![0, 127, 64, 63, 0], (0..128).collect()] {
                 let actual = tree.read_query_paths::<F, H>(&ctx, 128, cap_height, &indices);
                 let expected = indices
@@ -69,6 +86,11 @@ fn resident_merkle_query_paths() {
                     .map(|&i| expected.prove(i).siblings)
                     .collect::<Vec<_>>();
                 assert_eq!(actual, expected, "cap height {cap_height}");
+                resident.digests.prepare_paths(&indices, 128, cap_height);
+                for (&index, path) in indices.iter().zip(&expected) {
+                    assert_eq!(resident.prove(index).siblings, *path);
+                }
+                assert!(resident.digests.is_device_resident());
             }
             // Full reads still agree after sparse reads and after repeated queries.
             let (digests, cap) = tree.read::<F, H>(&ctx);

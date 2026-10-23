@@ -737,47 +737,11 @@ impl<T: Copy> MerkleDigests<T> {
         let mut indices = indices.to_vec();
         indices.sort_unstable();
         indices.dedup();
-        let depth = log2_strict(leaves_len) - cap_height;
         assert_eq!(d.count, 2 * (leaves_len - (1 << cap_height)));
-        assert!(indices.iter().all(|&i| i < leaves_len));
-        let paths = if depth == 0 {
-            indices.iter().map(|&i| (i, Vec::new())).collect()
-        } else {
-            let ctx = &r.context;
-            let compact = ctx.storage("merkle query siblings", (indices.len() * depth * 32) as u64);
-            let mut encoder = ctx.encoder("gather merkle query siblings");
-            let tree_len = d.count >> cap_height;
-            for (query, &index) in indices.iter().enumerate() {
-                // The same sibling positions as `merkle_tree_prove`.
-                let tree_start = (index >> depth) * tree_len;
-                let mut pair = index & ((1 << depth) - 1);
-                for level in 0..depth {
-                    let parity = pair & 1;
-                    pair >>= 1;
-                    let sibling =
-                        tree_start + 2 * ((pair << (level + 1)) + (1 << level) - 1) + 1 - parity;
-                    encoder.copy_buffer_to_buffer(
-                        &r.buffer,
-                        sibling as u64 * 32,
-                        &compact,
-                        ((query * depth + level) * 32) as u64,
-                        32,
-                    );
-                }
-            }
-            let done = ctx.submit_async(encoder);
-            let hashes = ctx.read_after(
-                &compact,
-                (indices.len() * depth * 32) as u64,
-                Some(&done),
-                d.decode,
-            );
-            indices
-                .iter()
-                .zip(hashes.chunks_exact(depth))
-                .map(|(&i, path)| (i, path.to_vec()))
-                .collect()
-        };
+        let paths = crate::gpu::merkle::read_query_paths(
+            &r.context, &r.buffer, leaves_len, cap_height, &indices, d.decode,
+        );
+        let paths = indices.into_iter().zip(paths).collect();
         drop(resident);
         *d.paths.lock().unwrap() = paths;
     }

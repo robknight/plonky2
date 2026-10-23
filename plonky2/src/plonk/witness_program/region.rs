@@ -140,7 +140,6 @@ pub struct RegionProgram {
     coefficients: Vec<u64>,
     representatives: Vec<usize>,
     roots: Vec<usize>,
-    root_slots: Vec<u32>,
     random_count: u32,
     alias_count: u32,
     alias_pair_offset: u32,
@@ -844,14 +843,12 @@ impl RegionProgram {
         if profile {
             log::debug!(target: COMPILE_LOG,"compile phase aliases {:?}", phase.elapsed());
         }
-        let root_slots = (0..roots.len()).map(|i| i as u32).collect();
         Ok(Self {
             groups,
             targets,
             coefficients,
             representatives,
             roots,
-            root_slots,
             random_count,
             alias_count,
             alias_pair_offset,
