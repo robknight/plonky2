@@ -135,7 +135,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             rate_bits,
             blinding,
         ) {
-            return crate::gpu::lde::from_values_with_residency(
+            let batch = crate::gpu::lde::from_values_with_residency(
                 &ctx,
                 values,
                 rate_bits,
@@ -147,6 +147,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     |p| p.retain_leaves(),
                 ),
             );
+            if plan.is_none() {
+                batch.device.retain_within_limit(&ctx);
+                batch.device_coeffs.retain_within_limit(&ctx);
+                batch.device_values.retain_within_limit(&ctx);
+            }
+            return batch;
         }
         Self::from_values_cpu(
             values,
@@ -224,7 +230,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             rate_bits,
             blinding,
         ) {
-            return crate::gpu::lde::from_coeffs_with_residency(
+            let batch = crate::gpu::lde::from_coeffs_with_residency(
                 &ctx,
                 polynomials,
                 rate_bits,
@@ -236,6 +242,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     |p| p.retain_leaves(),
                 ),
             );
+            if plan.is_none() {
+                batch.device.retain_within_limit(&ctx);
+                batch.device_coeffs.retain_within_limit(&ctx);
+                batch.device_values.retain_within_limit(&ctx);
+            }
+            return batch;
         }
         Self::from_coeffs_cpu(
             polynomials,

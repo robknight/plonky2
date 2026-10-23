@@ -1539,7 +1539,7 @@ fn device_lde<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D:
     batch: &PolynomialBatch<F, C, D>,
     keep: bool,
 ) -> DeviceBuffer {
-    let cached = if keep && ctx.retained_within_limit() {
+    let cached = if keep {
         batch.device.get()
     } else {
         batch.device.take()

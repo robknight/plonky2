@@ -91,6 +91,7 @@ pub(crate) mod pow;
 #[doc(hidden)]
 pub mod quotient;
 pub(crate) mod resident_witness;
+mod retained;
 #[doc(hidden)]
 pub mod shader;
 #[cfg(test)]
@@ -317,6 +318,7 @@ pub struct GpuContext {
     /// Free storage buffers for reuse by `storage`.
     pub(crate) storage_pool: Arc<StoragePool>,
     pub(crate) options: GpuOptions,
+    retained: Arc<retained::RetainedBudget>,
     pub max_binding: u64,
     pub max_workgroups: u32,
     hash_layout: wgpu::BindGroupLayout,
@@ -822,6 +824,7 @@ impl GpuContext {
                 free: Mutex::new(Vec::new()),
                 limit: options.pool_bytes,
             }),
+            retained: Arc::new(retained::RetainedBudget::new(options.retained_bytes)),
             options,
             hash_layout,
             hash_leaves,
@@ -1417,21 +1420,20 @@ impl GpuContext {
 pub struct DeviceCache(Arc<CachedBuffer>);
 
 #[derive(Default)]
-struct CachedBuffer(Mutex<Option<DeviceBuffer>>);
+struct CachedBuffer {
+    entry: Mutex<Option<CacheEntry>>,
+}
+
+#[derive(Clone)]
+struct CacheEntry {
+    buffer: DeviceBuffer,
+    // Cloned cache slots share this reservation, counting the allocation once.
+    reservation: Option<Arc<retained::Reservation>>,
+}
 
 impl CachedBuffer {
     fn take(&self) -> Option<DeviceBuffer> {
-        let buffer = self.0.lock().unwrap().take();
-        if let Some(buffer) = &buffer {
-            RETAINED_BYTES.fetch_sub(buffer.size(), Ordering::Relaxed);
-        }
-        buffer
-    }
-}
-
-impl Drop for CachedBuffer {
-    fn drop(&mut self) {
-        self.take();
+        self.entry.lock().unwrap().take().map(|entry| entry.buffer)
     }
 }
 
@@ -1440,49 +1442,47 @@ impl Drop for CachedBuffer {
 static DEVICE_CACHES: Mutex<Vec<Weak<CachedBuffer>>> = Mutex::new(Vec::new());
 
 impl DeviceCache {
-    fn register(buffer: Option<DeviceBuffer>, caches: &mut Vec<Weak<CachedBuffer>>) -> Self {
+    fn register(entry: Option<CacheEntry>, caches: &mut Vec<Weak<CachedBuffer>>) -> Self {
         caches.retain(|cache| cache.strong_count() != 0);
-        if let Some(buffer) = &buffer {
-            RETAINED_BYTES.fetch_add(buffer.size(), Ordering::Relaxed);
-        }
-        let cache = Arc::new(CachedBuffer(Mutex::new(buffer)));
+        let cache = Arc::new(CachedBuffer {
+            entry: Mutex::new(entry),
+        });
         caches.push(Arc::downgrade(&cache));
         Self(cache)
     }
-}
 
-impl Default for DeviceCache {
-    fn default() -> Self {
-        Self::register(None, &mut DEVICE_CACHES.lock().unwrap())
-    }
-}
-
-/// Bytes of device buffers currently kept across proofs by `DeviceCache`s.
-static RETAINED_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-impl GpuContext {
-    /// Whether the buffers currently retained are within this context's
-    /// [`GpuConfig::retained_bytes`] budget.
-    pub(crate) fn retained_within_limit(&self) -> bool {
-        RETAINED_BYTES.load(Ordering::Relaxed) <= self.options.retained_bytes
-    }
-}
-
-impl DeviceCache {
-    /// Stores `buffer`, counting it as retained.
+    /// Stores a proof-local buffer, outside the persistent circuit-cache budget.
     pub(crate) fn set(&self, buffer: DeviceBuffer) {
-        let mut slot = self.0 .0.lock().unwrap();
-        if let Some(old) = slot.take() {
-            RETAINED_BYTES.fetch_sub(old.size(), Ordering::Relaxed);
-        }
-        RETAINED_BYTES.fetch_add(buffer.size(), Ordering::Relaxed);
-        *slot = Some(buffer);
+        *self.0.entry.lock().unwrap() = Some(CacheEntry {
+            buffer,
+            reservation: None,
+        });
     }
 
-    /// Stores `buffer` if that keeps the retained total within `ctx`'s budget.
+    /// Promotes an outside-proof commitment's buffer to persistent storage,
+    /// or clears its cache when the budget cannot accommodate it.
+    pub(crate) fn retain_within_limit(&self, ctx: &GpuContext) {
+        let mut slot = self.0.entry.lock().unwrap();
+        if let Some(entry) = slot.as_mut() {
+            if entry.reservation.is_none() {
+                entry.reservation = ctx.retained.reserve(entry.buffer.size());
+                if entry.reservation.is_none() {
+                    *slot = None;
+                }
+            }
+        }
+    }
+
+    /// Fills an empty persistent cache if this allocation fits the budget.
     pub(crate) fn set_if_within_limit(&self, ctx: &GpuContext, buffer: DeviceBuffer) {
-        if RETAINED_BYTES.load(Ordering::Relaxed) + buffer.size() <= ctx.options.retained_bytes {
-            self.set(buffer);
+        let mut slot = self.0.entry.lock().unwrap();
+        if slot.is_none() {
+            if let Some(reservation) = ctx.retained.reserve(buffer.size()) {
+                *slot = Some(CacheEntry {
+                    buffer,
+                    reservation: Some(reservation),
+                });
+            }
         }
     }
 
@@ -1493,20 +1493,31 @@ impl DeviceCache {
 
     /// A handle to the buffer, which stays cached.
     pub(crate) fn get(&self) -> Option<DeviceBuffer> {
-        self.0 .0.lock().unwrap().clone()
+        self.0
+            .entry
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|entry| entry.buffer.clone())
+    }
+}
+
+impl Default for DeviceCache {
+    fn default() -> Self {
+        Self::register(None, &mut DEVICE_CACHES.lock().unwrap())
     }
 }
 
 impl Clone for DeviceCache {
     fn clone(&self) -> Self {
         let mut caches = DEVICE_CACHES.lock().unwrap();
-        Self::register(self.get(), &mut caches)
+        Self::register(self.0.entry.lock().unwrap().clone(), &mut caches)
     }
 }
 
 impl core::fmt::Debug for DeviceCache {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "DeviceCache({})", self.0 .0.lock().unwrap().is_some())
+        write!(f, "DeviceCache({})", self.0.entry.lock().unwrap().is_some())
     }
 }
 

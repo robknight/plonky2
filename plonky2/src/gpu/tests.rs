@@ -2314,6 +2314,7 @@ fn resident_cached_setup_shutdown() {
 fn orderly_shutdown() {
     let _ = env_logger::try_init();
     let ctx = context().expect("shutdown test requires a GPU");
+    let retained = ctx.retained.clone();
     assert!(matches!(shutdown(), Err(ShutdownError::InUse)));
     let weak = Arc::downgrade(&ctx);
     drop(ctx);
@@ -2334,7 +2335,7 @@ fn orderly_shutdown() {
     assert!(cached.get().is_some());
     let cloned = cached.clone();
     assert!(cloned.get().is_some());
-    assert!(RETAINED_BYTES.load(Ordering::Relaxed) > 0);
+    assert!(retained.bytes() > 0);
 
     // Submit work without a readback: shutdown itself must wait for it.
     let ctx = context().unwrap();
@@ -2362,7 +2363,7 @@ fn orderly_shutdown() {
     );
     assert!(cached.get().is_none());
     assert!(cloned.get().is_none());
-    assert_eq!(RETAINED_BYTES.load(Ordering::Relaxed), 0);
+    assert_eq!(retained.bytes(), 0);
     assert!(!is_available());
     set_enabled(true);
     assert!(!is_available());
@@ -2428,6 +2429,7 @@ fn proving_never_builds_the_compatible_row_view() {
 fn exit_shutdown_skips_while_in_use() {
     let _ = env_logger::try_init();
     let ctx = context().expect("exit shutdown test requires a GPU");
+    let retained = ctx.retained.clone();
     shutdown_at_exit();
     assert!(is_available(), "a held handle must keep the GPU");
     drop(ctx);
@@ -2449,10 +2451,10 @@ fn exit_shutdown_skips_while_in_use() {
     // A proof leaves a retained LDE; with no handle held, exit shuts down.
     let (data, pw) = hash_chain_circuit(256);
     data.verify(data.prove(pw.clone()).unwrap()).unwrap();
-    assert!(RETAINED_BYTES.load(Ordering::Relaxed) > 0);
+    assert!(retained.bytes() > 0);
     shutdown_at_exit();
     assert!(!is_available());
-    assert_eq!(RETAINED_BYTES.load(Ordering::Relaxed), 0);
+    assert_eq!(retained.bytes(), 0);
     data.verify(data.prove(pw).unwrap()).unwrap();
 }
 
