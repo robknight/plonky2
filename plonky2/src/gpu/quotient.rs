@@ -1411,10 +1411,7 @@ impl GpuContext {
         common_data: &CommonCircuitData<F, D>,
     ) -> Option<Arc<QuotientProgram>> {
         let key = circuit_key(common_data);
-        let mut cache = self.quotient_programs.lock().unwrap();
-        if let Some(program) = cache.get(&key) {
-            return program.clone();
-        }
+        self.quotient_programs.get_or_init(key, || {
         let start = std::time::Instant::now();
         let program = build_program(self, common_data).map(Arc::new);
         match &program {
@@ -1428,8 +1425,8 @@ impl GpuContext {
                 "plonky2 gpu: circuit {key:#x} cannot be traced, the quotient stays on the CPU"
             ),
         }
-        cache.insert(key, program.clone());
         program
+        })
     }
 
     /// The interpreter specialized to the program's register count, challenge
@@ -1440,10 +1437,8 @@ impl GpuContext {
         num_challenges: u32,
         uses_qmul: bool,
     ) -> Arc<QuotientKernel> {
-        let mut cache = self.quotient_kernels.lock().unwrap();
-        cache
-            .entry((registers, num_challenges, uses_qmul))
-            .or_insert_with(|| {
+        self.quotient_kernels
+            .get_or_init((registers, num_challenges, uses_qmul), || {
                 let source = kernel_source(self.flavor, registers, num_challenges, uses_qmul);
                 #[cfg(feature = "gpu-profiling")]
                 let (source, entry) = shader_identity(&source);
@@ -1467,7 +1462,6 @@ impl GpuContext {
                 let pipeline = pipeline(&self.device, &layout, &module, &entry);
                 Arc::new(QuotientKernel { layout, pipeline })
             })
-            .clone()
     }
 
     /// The per-point constants of the quotient domain.
@@ -1477,28 +1471,24 @@ impl GpuContext {
         quotient_degree_bits: usize,
     ) -> DeviceBuffer {
         let key = (degree_bits as u32, quotient_degree_bits as u32);
-        let mut cache = self.row_tables.lock().unwrap();
-        cache
-            .entry(key)
-            .or_insert_with(|| {
-                let z_h = ZeroPolyOnCoset::<F>::new(degree_bits, quotient_degree_bits);
-                let points = F::two_adic_subgroup(degree_bits + quotient_degree_bits);
-                let shift = F::coset_shift();
-                let words = points
-                    .par_iter()
-                    .enumerate()
-                    .flat_map_iter(|(i, &x)| {
-                        let shifted_x = shift * x;
-                        [
-                            shifted_x.to_noncanonical_u64(),
-                            z_h.eval_l_0(i, shifted_x).to_noncanonical_u64(),
-                            z_h.eval_inverse(i).to_noncanonical_u64(),
-                        ]
-                    })
-                    .collect::<Vec<_>>();
-                self.upload("quotient row table", &words)
-            })
-            .clone()
+        self.row_tables.get_or_init(key, || {
+            let z_h = ZeroPolyOnCoset::<F>::new(degree_bits, quotient_degree_bits);
+            let points = F::two_adic_subgroup(degree_bits + quotient_degree_bits);
+            let shift = F::coset_shift();
+            let words = points
+                .par_iter()
+                .enumerate()
+                .flat_map_iter(|(i, &x)| {
+                    let shifted_x = shift * x;
+                    [
+                        shifted_x.to_noncanonical_u64(),
+                        z_h.eval_l_0(i, shifted_x).to_noncanonical_u64(),
+                        z_h.eval_inverse(i).to_noncanonical_u64(),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            self.upload("quotient row table", &words)
+        })
     }
 }
 

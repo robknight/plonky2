@@ -64,13 +64,13 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use hashbrown::HashMap;
 use wgpu::util::DeviceExt;
 
 use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::types::{Field, Field64, PrimeField64};
 use crate::gpu::shader::Flavor;
 
+mod cache;
 #[cfg(feature = "gpu-profiling")]
 pub(crate) mod capture;
 mod config;
@@ -348,16 +348,14 @@ pub struct GpuContext {
     /// As `dummy`, for read-write bindings (a buffer cannot be bound both ways in one dispatch).
     pub(crate) dummy_rw: DeviceBuffer,
     /// `g^k` for `k < 2^(log_n - 1)`, with `g` the primitive `2^log_n`-th root of unity.
-    twiddles: Mutex<HashMap<u32, DeviceBuffer>>,
+    twiddles: cache::GpuCache<u32, DeviceBuffer>,
     /// Powers of a coset shift.
-    shift_pows: Mutex<HashMap<(u64, u32), DeviceBuffer>>,
+    shift_pows: cache::GpuCache<(u64, u32), DeviceBuffer>,
     /// Quotient programs by circuit key (`None` when a circuit cannot be traced).
-    pub(crate) quotient_programs:
-        Mutex<HashMap<u64, Option<std::sync::Arc<quotient::QuotientProgram>>>>,
+    quotient_programs: cache::GpuCache<u64, Option<Arc<quotient::QuotientProgram>>>,
     /// Quotient kernels by register count, challenge count and quintic usage.
-    pub(crate) quotient_kernels:
-        Mutex<HashMap<(u32, u32, bool), std::sync::Arc<quotient::QuotientKernel>>>,
-    pub(crate) row_tables: Mutex<HashMap<(u32, u32), DeviceBuffer>>,
+    quotient_kernels: cache::GpuCache<(u32, u32, bool), Arc<quotient::QuotientKernel>>,
+    row_tables: cache::GpuCache<(u32, u32), DeviceBuffer>,
     /// The whole-proof pass timeline (`PLONKY2_GPU_PASS_TIMELINE=1`).
     #[cfg(feature = "gpu-profiling")]
     pub(crate) pass_timeline: Option<timestamps::PassTimeline>,
@@ -846,11 +844,11 @@ impl GpuContext {
             permutation,
             dummy: DeviceBuffer::unpooled(dummy),
             dummy_rw: DeviceBuffer::unpooled(dummy_rw),
-            twiddles: Mutex::new(HashMap::new()),
-            shift_pows: Mutex::new(HashMap::new()),
-            quotient_programs: Mutex::new(HashMap::new()),
-            quotient_kernels: Mutex::new(HashMap::new()),
-            row_tables: Mutex::new(HashMap::new()),
+            twiddles: cache::GpuCache::default(),
+            shift_pows: cache::GpuCache::default(),
+            quotient_programs: cache::GpuCache::default(),
+            quotient_kernels: cache::GpuCache::default(),
+            row_tables: cache::GpuCache::default(),
             #[cfg(feature = "gpu-profiling")]
             pass_timeline,
             quotient_cpu_share: Mutex::new(config.quotient_cpu_share),
@@ -1351,28 +1349,22 @@ impl GpuContext {
 
     /// The twiddle table of a `2^log_n`-point NTT.
     pub(crate) fn twiddles(&self, log_n: u32) -> DeviceBuffer {
-        let mut cache = self.twiddles.lock().unwrap();
-        cache
-            .entry(log_n)
-            .or_insert_with(|| {
-                let half = 1usize << log_n.saturating_sub(1);
-                let g = GoldilocksField::primitive_root_of_unity(log_n as usize);
-                let table = g
-                    .powers()
-                    .take(half)
-                    .map(|x| x.to_canonical_u64())
-                    .collect::<Vec<_>>();
-                self.upload("twiddles", &table)
-            })
-            .clone()
+        self.twiddles.get_or_init(log_n, || {
+            let half = 1usize << log_n.saturating_sub(1);
+            let g = GoldilocksField::primitive_root_of_unity(log_n as usize);
+            let table = g
+                .powers()
+                .take(half)
+                .map(|x| x.to_canonical_u64())
+                .collect::<Vec<_>>();
+            self.upload("twiddles", &table)
+        })
     }
 
     /// `shift^k` for `k < len`.
     pub(crate) fn shift_pows(&self, shift: GoldilocksField, len: u32) -> DeviceBuffer {
-        let mut cache = self.shift_pows.lock().unwrap();
-        cache
-            .entry((shift.to_canonical_u64(), len))
-            .or_insert_with(|| {
+        self.shift_pows
+            .get_or_init((shift.to_canonical_u64(), len), || {
                 let table = shift
                     .powers()
                     .take(len as usize)
@@ -1380,7 +1372,6 @@ impl GpuContext {
                     .collect::<Vec<_>>();
                 self.upload("shift powers", &table)
             })
-            .clone()
     }
 
     /// Applies the Poseidon permutation to each state.
