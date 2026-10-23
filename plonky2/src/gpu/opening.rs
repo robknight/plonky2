@@ -132,8 +132,6 @@ pub(crate) fn try_opening_set<
     if D != 2 || !field_supported::<F>() {
         return None;
     }
-    let ctx = context()?;
-    let ctx = &*ctx;
     let batches = [
         constants_sigmas_commitment,
         wires_commitment,
@@ -149,7 +147,12 @@ pub(crate) fn try_opening_set<
         .unwrap_or(0);
     if (degree_log + wires_commitment.rate_bits) < crate::gpu::MIN_LOG_LEAVES as usize
         || batches.iter().any(|b| !uniform_degree(b, degree_log))
-        || !ctx.fits((columns * degree * 8) as u64)
+    {
+        return None;
+    }
+    let ctx = context()?;
+    let ctx = &*ctx;
+    if !ctx.fits((columns * degree * 8) as u64)
         || columns > ctx.max_workgroups as usize / MAX_ORACLES
     {
         return None;
@@ -216,8 +219,6 @@ pub(crate) fn try_prove_openings<
     {
         return None;
     }
-    let ctx = context()?;
-    let ctx = &ctx;
     let degree_log = oracles[0].degree_log;
     let rate_bits = fri_params.config.rate_bits;
     let degree = 1usize << degree_log;
@@ -230,7 +231,8 @@ pub(crate) fn try_prove_openings<
         .map(|o| o.polynomials.len())
         .max()
         .unwrap_or(0);
-    if degree < COMBINE_BLOCK as usize
+    if log_n < crate::gpu::MIN_LOG_LEAVES
+        || degree < COMBINE_BLOCK as usize
         || oracles
             .iter()
             .any(|o| o.rate_bits != rate_bits || !uniform_degree(o, degree_log))
@@ -240,7 +242,12 @@ pub(crate) fn try_prove_openings<
                     || p.polynomial_index >= oracles[p.oracle_index].polynomials.len()
             })
         })
-        || !commit_phase_fits(ctx, log_n, fri_params)
+    {
+        return None;
+    }
+    let ctx = context()?;
+    let ctx = &ctx;
+    if !commit_phase_fits(ctx, log_n, fri_params)
         || !ctx.fits((columns * degree * 8) as u64)
         || fft_plan(log_n)
             .iter()

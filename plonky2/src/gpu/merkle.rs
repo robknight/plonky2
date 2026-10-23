@@ -273,11 +273,13 @@ pub(crate) fn try_new<F: RichField, H: Hasher<F>>(
     if !supported::<F, H>() {
         return None;
     }
+    let log_leaves = log2_strict(leaves.len()) as u32;
+    if log_leaves < crate::gpu::MIN_LOG_LEAVES {
+        return None;
+    }
     let ctx = context()?;
     let ctx = &*ctx;
-    let log_leaves = log2_strict(leaves.len()) as u32;
-    if log_leaves < crate::gpu::MIN_LOG_LEAVES
-        || !ctx.fits(leaves.num_values() as u64 * 8)
+    if !ctx.fits(leaves.num_values() as u64 * 8)
         || (leaves.len() as u32).div_ceil(HASH_WORKGROUP) > ctx.max_workgroups
     {
         return None;

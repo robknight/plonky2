@@ -1640,7 +1640,6 @@ pub(crate) fn prepare<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, 
     {
         return None;
     }
-    let ctx = context()?;
     let quotient_degree_bits = log2_ceil(common_data.quotient_degree_factor);
     let rate_bits = common_data.config.fri_config.rate_bits;
     if quotient_degree_bits > rate_bits {
@@ -1648,6 +1647,9 @@ pub(crate) fn prepare<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, 
     }
     let degree_bits = common_data.degree_bits();
     let log_n = (degree_bits + quotient_degree_bits) as u32;
+    if log_n < crate::gpu::MIN_LOG_LEAVES {
+        return None;
+    }
     let challenges = common_data.config.num_challenges;
     let permutation_columns = challenges * (common_data.num_partial_products + 1);
     let requirements = QuotientRequirements {
@@ -1662,6 +1664,7 @@ pub(crate) fn prepare<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, 
         routed_wires: common_data.config.num_routed_wires,
         terms: challenges + permutation_columns + common_data.num_gate_constraints,
     };
+    let ctx = context()?;
     if !requirements.fits(ctx.max_binding, ctx.max_workgroups) {
         return None;
     }

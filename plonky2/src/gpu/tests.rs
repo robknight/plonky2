@@ -2600,3 +2600,63 @@ fn quotient_and_openings_share_the_fixed_coefficient_upload() {
     drop(cloned);
     assert_eq!(ctx.retained.bytes(), 0);
 }
+
+/// Context initialization is process-wide, so this regression runs in isolation.
+#[test]
+#[ignore = "run alone with --ignored to check that small jobs never initialize a GPU"]
+fn small_workloads_do_not_initialize_gpu() {
+    use crate::field::extension::quadratic::QuadraticExtension;
+    use crate::iop::challenger::Challenger;
+    use crate::plonk::circuit_builder::CircuitBuilder;
+    use crate::plonk::circuit_data::CircuitConfig;
+    use crate::plonk::config::PoseidonGoldilocksConfig as C;
+    assert!(matches!(
+        *CONTEXT.lock().unwrap(),
+        ContextState::Uninitialized
+    ));
+    let data = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config()).build::<C>();
+    assert!(policy::ExecutionPlan::new(&data.common, &data.prover_only)
+        .prepared
+        .is_none());
+    assert!(lde::applicable::<F, C, 2>(1, 8, 2, false).is_none());
+    MerkleTree::<F, H>::new(vec![vec![F::ONE]; 8], 0);
+    let coeffs = PolynomialCoeffs::new(vec![QuadraticExtension::<F>::ONE; 8]);
+    let values = coeffs.coset_fft(F::coset_shift().into());
+    let mut challenger = Challenger::<F, H>::new();
+    assert!(fri::try_committed_trees::<F, C, 2>(
+        &coeffs,
+        &values,
+        &mut challenger,
+        &data.common.fri_params,
+        None,
+        None,
+    )
+    .is_none());
+    assert!(fri::try_opening_fft::<F, 2>(&coeffs).is_none());
+    let batch = &data.prover_only.constants_sigmas_commitment;
+    let zeta = QuadraticExtension::<F>::ONE;
+    assert!(opening::try_opening_set::<F, C, 2>(
+        zeta,
+        zeta,
+        batch,
+        batch,
+        batch,
+        batch,
+        &data.common
+    )
+    .is_none());
+    assert!(opening::try_prove_openings::<F, C, 2>(
+        &data.common.get_fri_instance(zeta),
+        &[batch; 4],
+        &mut challenger,
+        &data.common.fri_params,
+        None,
+        None,
+        &mut TimingTree::default(),
+    )
+    .is_none());
+    assert!(matches!(
+        *CONTEXT.lock().unwrap(),
+        ContextState::Uninitialized
+    ));
+}

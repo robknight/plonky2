@@ -223,15 +223,17 @@ pub(crate) fn applicable<
     if !supported::<F, C::Hasher>() || num_polys == 0 || !degree.is_power_of_two() {
         return None;
     }
-    let ctx = context()?;
     let log_n = (log2_strict(degree) + rate_bits) as u32;
-    let n = 1u64 << log_n;
     let columns = num_polys + if blinding { SALT_SIZE } else { 0 };
+    if log_n < crate::gpu::MIN_LOG_LEAVES || columns > u16::MAX as usize {
+        return None;
+    }
+    let ctx = context()?;
+    let n = 1u64 << log_n;
     let fits = ctx.fits(columns as u64 * n * 8);
     let workgroups = (n >> FFT_WORKGROUP.trailing_zeros()).max(n.div_ceil(HASH_WORKGROUP as u64))
         <= ctx.max_workgroups as u64;
-    (log_n >= crate::gpu::MIN_LOG_LEAVES && fits && columns <= u16::MAX as usize && workgroups)
-        .then_some(ctx)
+    (fits && workgroups).then_some(ctx)
 }
 
 pub(crate) fn upload_columns<F: PrimeField64>(

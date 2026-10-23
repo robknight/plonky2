@@ -74,13 +74,16 @@ pub(crate) fn try_committed_trees<
     if D != 2 || !supported::<F, C::Hasher>() {
         return None;
     }
-    let ctx = context()?;
-    let ctx = &ctx;
     let n = values.len();
     if n != coeffs.len() || !n.is_power_of_two() {
         return None;
     }
     let log_n = log2_strict(n) as u32;
+    if log_n < crate::gpu::MIN_LOG_LEAVES {
+        return None;
+    }
+    let ctx = context()?;
+    let ctx = &ctx;
     if !commit_phase_fits(ctx, log_n, fri_params) {
         return None;
     }
@@ -280,13 +283,13 @@ pub(crate) fn try_opening_fft_from<F: RichField + Extendable<D>, const D: usize>
     if D != 2 || !crate::gpu::field_supported::<F>() {
         return None;
     }
+    let n = coeffs.len();
+    if !n.is_power_of_two() || n.ilog2() < min_log_n.max(1) || n > u32::MAX as usize / D {
+        return None;
+    }
     let ctx = context()?;
     let ctx = &*ctx;
-    let n = coeffs.len();
-    if !n.is_power_of_two()
-        || n.ilog2() < min_log_n.max(1)
-        || n > u32::MAX as usize / D
-        || !ctx.fits((D * n * 8) as u64)
+    if !ctx.fits((D * n * 8) as u64)
         || crate::gpu::shader::fft_plan(n.ilog2())
             .iter()
             .any(|&(_, stages, low_bits)| (n >> (stages + low_bits)) > ctx.max_workgroups as usize)
