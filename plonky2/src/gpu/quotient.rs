@@ -181,6 +181,19 @@ pub struct QuotientKernel {
     pipeline: wgpu::ComputePipeline,
 }
 
+impl super::cache::CacheValue for Arc<QuotientProgram> {
+    fn bytes(&self) -> u64 {
+        self.ops.size()
+    }
+}
+
+impl super::cache::CacheValue for Arc<QuotientKernel> {
+    // Driver pipeline allocation sizes are opaque; the cache caps entries.
+    fn bytes(&self) -> u64 {
+        0
+    }
+}
+
 /// The identity of a circuit as far as the program is concerned.
 fn circuit_key<F: RichField + Extendable<D>, const D: usize>(
     common_data: &CommonCircuitData<F, D>,

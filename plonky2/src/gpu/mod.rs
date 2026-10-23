@@ -387,6 +387,12 @@ impl Drop for DeviceBufferInner {
     }
 }
 
+impl cache::CacheValue for DeviceBuffer {
+    fn bytes(&self) -> u64 {
+        self.size()
+    }
+}
+
 impl core::ops::Deref for DeviceBuffer {
     type Target = wgpu::Buffer;
     fn deref(&self) -> &wgpu::Buffer {
@@ -806,6 +812,7 @@ impl GpuContext {
             mapped_at_creation: false,
         });
         let options = GpuOptions::new(config, mappable);
+        let retained = Arc::new(retained::RetainedBudget::new(options.retained_bytes));
         Ok(Self {
             max_binding: device
                 .limits()
@@ -823,7 +830,7 @@ impl GpuContext {
                 free: Mutex::new(Vec::new()),
                 limit: options.pool_bytes,
             }),
-            retained: Arc::new(retained::RetainedBudget::new(options.retained_bytes)),
+            retained: retained.clone(),
             options,
             hash_layout,
             hash_leaves,
@@ -844,11 +851,11 @@ impl GpuContext {
             permutation,
             dummy: DeviceBuffer::unpooled(dummy),
             dummy_rw: DeviceBuffer::unpooled(dummy_rw),
-            twiddles: cache::GpuCache::default(),
-            shift_pows: cache::GpuCache::default(),
-            quotient_programs: cache::GpuCache::default(),
-            quotient_kernels: cache::GpuCache::default(),
-            row_tables: cache::GpuCache::default(),
+            twiddles: cache::GpuCache::new(retained.clone()),
+            shift_pows: cache::GpuCache::new(retained.clone()),
+            quotient_programs: cache::GpuCache::new(retained.clone()),
+            quotient_kernels: cache::GpuCache::new(retained.clone()),
+            row_tables: cache::GpuCache::new(retained.clone()),
             #[cfg(feature = "gpu-profiling")]
             pass_timeline,
             quotient_cpu_share: Mutex::new(config.quotient_cpu_share),

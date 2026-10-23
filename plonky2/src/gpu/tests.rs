@@ -2549,10 +2549,14 @@ fn subgroup_values_are_retained_only_for_permutation() {
             retain_values,
         );
         assert_eq!(batch.batch.device_values.get().is_some(), retain_values);
+        let retained_tables = ctx.retained.bytes();
+        drop(batch.batch.device.take());
+        drop(batch.batch.device_coeffs.take());
+        drop(batch.batch.device_values.take());
         assert_eq!(
             ctx.retained.bytes(),
-            0,
-            "proof buffers are not persistent caches"
+            retained_tables,
+            "proof buffers have no persistent reservation"
         );
         assert!(batch.polynomials()[0].coeffs[0] == F::ONE);
     }
@@ -2616,6 +2620,16 @@ fn proof_local_coefficients_materialize_only_for_cpu_access() {
 #[test]
 #[ignore = "run alone with --ignored to exercise the complete Vulkan prover on software"]
 fn software_gpu_proofs_verify() {
+    software_gpu_proofs(None);
+}
+
+#[test]
+#[ignore = "run alone with --ignored to exercise uncached Vulkan proofs"]
+fn software_gpu_proofs_without_retained_buffers() {
+    software_gpu_proofs(Some(0));
+}
+
+fn software_gpu_proofs(retained_bytes: Option<u64>) {
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::CircuitConfig;
@@ -2623,6 +2637,7 @@ fn software_gpu_proofs_verify() {
     configure(GpuConfig {
         backend: Some(Backend::Vulkan),
         allow_software: true,
+        retained_bytes,
         ..Default::default()
     })
     .unwrap();

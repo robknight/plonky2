@@ -48,9 +48,11 @@ pub struct GpuConfig {
     /// Proofs expected to run concurrently, at least 1. Scales the default
     /// `retained_bytes` and damps the hybrid quotient's CPU share adaptation.
     pub proving_workers: usize,
-    /// Budget for retaining fixed-commitment evaluations, coefficients and
-    /// sigma values across proofs. Buffers that do not fit are recomputed or
-    /// uploaded per proof. `None` is 2 GiB per proving worker.
+    /// Shared budget for fixed commitments, sigma values, quotient bytecode
+    /// and constant tables retained across proofs. Context caches evict their
+    /// least recently used entries; buffers that do not fit are recomputed or
+    /// uploaded per proof. Each context cache also holds at most 128 entries.
+    /// `None` is 2 GiB per proving worker.
     pub retained_bytes: Option<u64>,
     /// Idle storage buffers kept for reuse. `None` is 4 GiB on unified-memory
     /// adapters and 0 (no pooling) on discrete ones.

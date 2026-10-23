@@ -15,6 +15,10 @@ impl RetainedBudget {
         }
     }
 
+    pub(super) fn limit(&self) -> u64 {
+        self.limit
+    }
+
     pub(super) fn reserve(self: &Arc<Self>, bytes: u64) -> Option<Arc<Reservation>> {
         self.used
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
