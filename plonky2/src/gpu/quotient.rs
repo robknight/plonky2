@@ -1589,6 +1589,57 @@ fn device_lde<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D:
     lde
 }
 
+/// All buffers and dispatches needed by quotient evaluation and its LDEs.
+/// Keep this independent of a device so fallback limits can be tested without a GPU.
+struct QuotientRequirements {
+    log_n: u32,
+    log_lde: u32,
+    columns: [usize; 3],
+    challenges: usize,
+    routed_wires: usize,
+    terms: usize,
+}
+
+impl QuotientRequirements {
+    fn fits(&self, max_binding: u64, max_workgroups: u32) -> bool {
+        let Some(n) = 1u64.checked_shl(self.log_n) else {
+            return false;
+        };
+        let Some(n_lde) = 1u64.checked_shl(self.log_lde) else {
+            return false;
+        };
+        if n_lde > u32::MAX as u64
+            || self.log_n < crate::gpu::MIN_LOG_LEAVES
+            || n.div_ceil(HASH_WORKGROUP as u64) > max_workgroups as u64
+            || self
+                .columns
+                .iter()
+                .any(|&columns| columns > max_workgroups as usize)
+            || shader::fft_plan(self.log_lde)
+                .iter()
+                .any(|&(_, stages, low_bits)| n_lde >> (stages + low_bits) > max_workgroups as u64)
+        {
+            return false;
+        }
+        let challenge_words =
+            2 * self.challenges + 4 + self.challenges * (self.routed_wires + self.terms);
+        self.columns
+            .iter()
+            .map(|&columns| (columns as u64, n_lde))
+            .chain([
+                (3, n),
+                (self.challenges as u64, n),
+                (challenge_words as u64, 1),
+            ])
+            .all(|(columns, len)| {
+                columns
+                    .checked_mul(len)
+                    .and_then(|words| words.checked_mul(8))
+                    .is_some_and(|bytes| bytes.max(16).next_multiple_of(16) <= max_binding)
+            })
+    }
+}
+
 /// The same eligibility checks are used before commitments and by direct callers.
 pub(crate) fn prepare<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     common_data: &CommonCircuitData<F, D>,
@@ -1610,15 +1661,27 @@ pub(crate) fn prepare<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, 
     }
     let degree_bits = common_data.degree_bits();
     let log_n = (degree_bits + quotient_degree_bits) as u32;
-    let n = 1usize << log_n;
-    let n_lde = 1usize << (degree_bits + rate_bits);
-    if log_n < crate::gpu::MIN_LOG_LEAVES
-        || (n as u32).div_ceil(HASH_WORKGROUP) > ctx.max_workgroups
-        || !ctx.fits((prover_data.constants_sigmas_commitment.polynomials.len() * n_lde * 8) as u64)
-    {
+    let challenges = common_data.config.num_challenges;
+    let permutation_columns = challenges * (common_data.num_partial_products + 1);
+    let requirements = QuotientRequirements {
+        log_n,
+        log_lde: (degree_bits + rate_bits) as u32,
+        columns: [
+            prover_data.constants_sigmas_commitment.polynomials.len(),
+            common_data.config.num_wires,
+            permutation_columns,
+        ],
+        challenges,
+        routed_wires: common_data.config.num_routed_wires,
+        terms: challenges + permutation_columns + common_data.num_gate_constraints,
+    };
+    if !requirements.fits(ctx.max_binding, ctx.max_workgroups) {
         return None;
     }
     let program = ctx.quotient_program(common_data)?;
+    if !ctx.fits(program.num_ops as u64 * 16) {
+        return None;
+    }
     Some((ctx, program))
 }
 
@@ -1908,4 +1971,32 @@ pub(crate) fn try_compute_quotient_polys<
                 .collect()
         },
     ))
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+
+    #[test]
+    fn quotient_checks_every_buffer_before_selecting_the_gpu() {
+        let mut requirements = QuotientRequirements {
+            log_n: 17,
+            log_lde: 17,
+            columns: [82, 135, 20],
+            challenges: 2,
+            routed_wires: 80,
+            terms: 150,
+        };
+        let binding = 128 << 20;
+        // Fixed columns fit, but the wire LDE does not.
+        assert!(!requirements.fits(binding, 65535));
+        requirements.columns[1] = 100;
+        assert!(requirements.fits(binding, 65535));
+        requirements.columns[2] = 129;
+        assert!(!requirements.fits(binding, 65535));
+        requirements.columns = [1; 3];
+        // The per-row table is three fields even for a one-column circuit.
+        assert!(!requirements.fits(2 << 20, 65535));
+        assert!(!requirements.fits(binding, 1));
+    }
 }
