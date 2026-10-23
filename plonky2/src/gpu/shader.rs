@@ -933,6 +933,28 @@ fn fft_group(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id
 }
 "#;
 
+/// Reduce quotient padding to a single failure flag, without a tail readback.
+pub(crate) fn quotient_tail_module(flavor: Flavor) -> String {
+    let mut out = prelude(flavor);
+    out.push_str(
+        r#"
+struct TailParams { stride: u32, kept: u32, tail: u32, pad: u32 }
+@group(0) @binding(0) var<uniform> tp: TailParams;
+@group(0) @binding(1) var<storage, read> coeffs: array<Field>;
+@group(0) @binding(2) var<storage, read_write> invalid: atomic<u32>;
+@compute @workgroup_size(64)
+fn check_tail(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x >= tp.tail) { return; }
+    let value = canonical(coeffs[id.y * tp.stride + tp.kept + id.x]);
+    if (any(value != Field(0u, 0u))) {
+        atomicOr(&invalid, 1u);
+    }
+}
+"#,
+    );
+    out
+}
+
 /// The NTT module.
 pub fn fft_module(flavor: Flavor) -> String {
     let mut out = prelude(flavor);

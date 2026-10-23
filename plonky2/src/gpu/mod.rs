@@ -331,6 +331,7 @@ pub struct GpuContext {
     pub(crate) fold: wgpu::ComputePipeline,
     /// The proof-of-work search, compiled on first use.
     pub(crate) pow_kernel: OnceLock<Option<pow::PowKernel>>,
+    pub(crate) quotient_tail: OnceLock<quotient::TailCheckKernel>,
     open_layout: wgpu::BindGroupLayout,
     pub(crate) point_powers: wgpu::ComputePipeline,
     pub(crate) eval_openings: wgpu::ComputePipeline,
@@ -835,6 +836,7 @@ impl GpuContext {
             fold_layout,
             fold,
             pow_kernel: OnceLock::new(),
+            quotient_tail: OnceLock::new(),
             open_layout,
             point_powers,
             eval_openings,

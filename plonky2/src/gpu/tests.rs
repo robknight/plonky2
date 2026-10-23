@@ -186,6 +186,7 @@ fn shaders_validate() {
             ("fold", shader::fold_module(flavor)),
             ("open", shader::open_module(flavor)),
             ("combine", shader::combine_module(flavor)),
+            ("quotient tail", shader::quotient_tail_module(flavor)),
         ] {
             let module = naga::front::wgsl::parse_str(&source)
                 .unwrap_or_else(|error| panic!("{name}: {}", error.emit_to_string(&source)));

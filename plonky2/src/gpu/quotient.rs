@@ -1678,6 +1678,11 @@ pub(crate) fn prepare<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, 
     Some((ctx, program))
 }
 
+pub(crate) struct TailCheckKernel {
+    layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::ComputePipeline,
+}
+
 /// Quotient coefficients awaiting commitment, still in device memory.
 pub(crate) struct DeviceQuotient {
     ctx: Arc<GpuContext>,
@@ -1689,15 +1694,34 @@ pub(crate) struct DeviceQuotient {
 impl DeviceQuotient {
     /// Remove each challenge's padding, checking the same zero tail as the
     /// CPU's `trim_to_len`. A power-of-two quotient needs neither copy nor readback.
-    fn compact<F: RichField>(&self, len: usize) -> DeviceBuffer {
+    fn compact(&self, len: usize) -> DeviceBuffer {
         assert!(len <= self.len);
         if len == self.len {
             return self.coeffs.clone();
         }
         let tail = self.len - len;
-        let tails = self
+        let kernel = self.ctx.quotient_tail.get_or_init(|| {
+            let layout = storage_layout(
+                &self.ctx.device,
+                "quotient tail",
+                &[(true, true), (false, true), (false, false)],
+            );
+            let module = module(
+                &self.ctx.device,
+                "quotient tail",
+                &shader::quotient_tail_module(self.ctx.flavor),
+            );
+            let pipeline = pipeline(&self.ctx.device, &layout, &module, "check_tail");
+            TailCheckKernel { layout, pipeline }
+        });
+        let invalid = self.ctx.upload("quotient tail status", &[0, 0]);
+        let params = self.ctx.uniform(
+            "quotient tail params",
+            &[self.len as u32, len as u32, tail as u32, 0],
+        );
+        let bindings = self
             .ctx
-            .storage("quotient tails", (self.challenges * tail * 8) as u64);
+            .bind(&kernel.layout, &[&params, &self.coeffs, &invalid]);
         let compact = self
             .ctx
             .storage("quotient chunks", (self.challenges * len * 8) as u64);
@@ -1710,20 +1734,25 @@ impl DeviceQuotient {
                 (c * len * 8) as u64,
                 (len * 8) as u64,
             );
-            encoder.copy_buffer_to_buffer(
-                &self.coeffs,
-                ((c * self.len + len) * 8) as u64,
-                &tails,
-                (c * tail * 8) as u64,
-                (tail * 8) as u64,
+        }
+        {
+            let mut pass = self
+                .ctx
+                .begin_pass(&mut encoder, "check quotient tail", None);
+            pass.set_pipeline(&kernel.pipeline);
+            pass.set_bind_group(0, &bindings, &[]);
+            pass.dispatch_workgroups(
+                (tail as u32).div_ceil(HASH_WORKGROUP),
+                self.challenges as u32,
+                1,
             );
         }
-        self.ctx.submit_async(encoder);
-        assert!(
-            self.ctx
-                .read_u64(&tails, self.challenges * tail)
-                .into_iter()
-                .all(|word| F::from_noncanonical_u64(word) == F::ZERO),
+        let done = self.ctx.submit_async(encoder);
+        let invalid = self.ctx.read_after(&invalid, 16, Some(&done), |bytes| {
+            u32::from_le_bytes(bytes[..4].try_into().unwrap())
+        });
+        assert_eq!(
+            invalid, 0,
             "Quotient has failed, the vanishing polynomial is not divisible by Z_H"
         );
         compact
@@ -1739,7 +1768,7 @@ impl DeviceQuotient {
         timing: &mut crate::util::timing::TimingTree,
         retain_leaves: bool,
     ) -> ProverPolynomialBatch<F, C, D> {
-        let coeffs = self.compact::<F>(common.quotient_degree());
+        let coeffs = self.compact(common.quotient_degree());
         crate::gpu::lde::from_device_coeffs(
             &self.ctx,
             coeffs,
@@ -2130,9 +2159,9 @@ mod device_coefficient_tests {
             len: 4,
             challenges: 2,
         };
-        let unchanged = quotient.compact::<GoldilocksField>(4);
+        let unchanged = quotient.compact(4);
         assert_eq!(*unchanged, *quotient.coeffs);
-        let compact = quotient.compact::<GoldilocksField>(3);
+        let compact = quotient.compact(3);
         assert_eq!(ctx.read_u64(&compact, 6), [1, 2, 3, 4, 5, 6]);
         let batch = crate::gpu::lde::from_device_coeffs::<
             GoldilocksField,
@@ -2154,10 +2183,27 @@ mod device_coefficient_tests {
             batch.polynomials()[1].coeffs,
             [4, 5, 6, 0].map(GoldilocksField::from_canonical_u64)
         );
+        let mut padded = vec![GoldilocksField::ORDER; 2 * 512];
+        padded[0] = 11;
+        padded[512] = 17;
+        let mut large = DeviceQuotient {
+            ctx: ctx.clone(),
+            coeffs: ctx.upload("large quotient", &padded),
+            len: 512,
+            challenges: 2,
+        };
+        let compact = large.compact(128);
+        let expected = [padded[..128].to_vec(), padded[512..640].to_vec()].concat();
+        assert_eq!(ctx.read_u64(&compact, 256), expected);
+        padded[1023] = 1;
+        large.coeffs = ctx.upload("invalid large quotient", &padded);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| large.compact(128))).is_err()
+        );
         quotient.coeffs = ctx.upload("invalid quotient", &[1, 2, 3, 0, 4, 5, 6, 7]);
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            quotient.compact::<GoldilocksField>(3)
-        }))
-        .is_err());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { quotient.compact(3) }))
+                .is_err()
+        );
     }
 }
