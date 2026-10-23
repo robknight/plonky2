@@ -161,13 +161,16 @@ pub(crate) fn try_opening_set<
         .iter()
         .map(|b| device_coefficients(ctx, b, "opening"))
         .collect::<Vec<_>>();
-    // Every polynomial at zeta, then the Z's at g * zeta, in one dispatch.
+    // Every polynomial at zeta; only Z and lookup polynomials need g * zeta.
     let num_zs = zs_partial_products_lookup_commitment.polynomials.len();
+    let next_columns = common_data
+        .zs_range()
+        .chain(common_data.lookup_range().start..num_zs);
     let terms = batches
         .iter()
         .enumerate()
         .flat_map(|(o, b)| (0..b.polynomials.len()).map(move |c| term(o, c, 0)))
-        .chain((0..num_zs).map(|c| term(2, c, 1)))
+        .chain(next_columns.map(|c| term(2, c, 1)))
         .collect::<Vec<_>>();
     let evals = evaluate::<F, D>(ctx, &coeffs, degree, &terms, &[zeta, g * zeta]);
     let mut evals = evals.as_slice();
@@ -180,17 +183,18 @@ pub(crate) fn try_opening_set<
     let wires = take(wires_commitment.polynomials.len());
     let zs = take(num_zs);
     let quotient_polys = take(quotient_polys_commitment.polynomials.len());
-    let zs_next = take(num_zs);
+    let zs_next = take(common_data.zs_range().len());
+    let lookup_zs_next = take(common_data.num_all_lookup_polys());
     Some(OpeningSet {
         constants: constants_sigmas[common_data.constants_range()].to_vec(),
         plonk_sigmas: constants_sigmas[common_data.sigmas_range()].to_vec(),
         wires: wires.to_vec(),
         plonk_zs: zs[common_data.zs_range()].to_vec(),
-        plonk_zs_next: zs_next[common_data.zs_range()].to_vec(),
+        plonk_zs_next: zs_next.to_vec(),
         partial_products: zs[common_data.partial_products_range()].to_vec(),
         quotient_polys: quotient_polys.to_vec(),
         lookup_zs: zs[common_data.lookup_range()].to_vec(),
-        lookup_zs_next: zs_next[common_data.lookup_range()].to_vec(),
+        lookup_zs_next: lookup_zs_next.to_vec(),
     })
 }
 

@@ -2660,3 +2660,57 @@ fn small_workloads_do_not_initialize_gpu() {
         ContextState::Uninitialized
     ));
 }
+
+#[test]
+#[ignore = "run alone with --ignored to compare GPU openings on software Vulkan"]
+fn software_gpu_opening_sets_match_cpu() {
+    use crate::field::extension::quadratic::QuadraticExtension;
+    use crate::gates::noop::NoopGate;
+    use crate::plonk::circuit_builder::CircuitBuilder;
+    use crate::plonk::circuit_data::CircuitConfig;
+    use crate::plonk::config::PoseidonGoldilocksConfig as C;
+    use crate::plonk::proof::OpeningSet;
+    configure(GpuConfig {
+        backend: Some(Backend::Vulkan),
+        allow_software: true,
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(context().is_some());
+    for lookups in [false, true] {
+        let mut builder = CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config());
+        for _ in 0..128 {
+            builder.add_gate(NoopGate, vec![]);
+        }
+        if lookups {
+            let input = builder.add_virtual_target();
+            let table = builder.add_lookup_table_from_fn(|x| x * x, &[0, 1, 2, 3]);
+            let output = builder.add_lookup_from_index(input, table);
+            builder.register_public_input(output);
+        }
+        let data = builder.build::<C>();
+        let common = &data.common;
+        // The opening routines consume coefficients, independently of Merkle data.
+        let batch = |columns: usize| PolynomialBatch::<F, C, 2> {
+            polynomials: (0..columns)
+                .map(|c| {
+                    PolynomialCoeffs::new(vec![F::from_canonical_usize(c + 1); common.degree()])
+                })
+                .collect(),
+            degree_log: common.degree_bits(),
+            rate_bits: common.config.fri_config.rate_bits,
+            ..Default::default()
+        };
+        let fixed = batch(common.sigmas_range().end);
+        let wires = batch(common.config.num_wires);
+        let zs = batch(common.lookup_range().start + common.num_all_lookup_polys());
+        let quotient = batch(common.config.num_challenges * common.quotient_degree_factor);
+        let zeta = QuadraticExtension([F::from_canonical_u64(7), F::ONE]);
+        let g = QuadraticExtension::<F>::primitive_root_of_unity(common.degree_bits());
+        let expected = OpeningSet::new_cpu(zeta, g, &fixed, &wires, &zs, &quotient, common);
+        let actual =
+            opening::try_opening_set::<F, C, 2>(zeta, g, &fixed, &wires, &zs, &quotient, common)
+                .expect("the GPU takes these opening sets");
+        assert_eq!(actual, expected, "lookups={lookups}");
+    }
+}
