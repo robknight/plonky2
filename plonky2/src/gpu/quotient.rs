@@ -24,7 +24,9 @@ use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::polynomial::PolynomialCoeffs;
 use crate::field::types::{Field, Field64};
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
+#[cfg(test)]
 use crate::fri::oracle::PolynomialBatch;
+use crate::fri::oracle::{ProverOracle, ProverPolynomialBatch};
 use crate::gates::selectors::UNUSED_SELECTOR;
 use crate::gpu::lde::{fft, FftJob};
 use crate::gpu::shader::HASH_WORKGROUP;
@@ -1536,20 +1538,20 @@ fn dump_program(path: &str, program: &QuotientProgram, params: &[u32], columns: 
 /// fixed commitment); otherwise it is taken.
 fn device_lde<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     ctx: &GpuContext,
-    batch: &PolynomialBatch<F, C, D>,
+    batch: &dyn ProverOracle<F, C, D>,
     keep: bool,
 ) -> DeviceBuffer {
     let cached = if keep {
-        batch.device.get()
+        batch.batch().device.get()
     } else {
-        batch.device.take()
+        batch.batch().device.take()
     };
     if let Some(buffer) = cached {
         return buffer;
     }
-    let degree = 1usize << batch.degree_log;
-    let n = degree << batch.rate_bits;
-    let columns = batch.polynomials.len();
+    let degree = 1usize << batch.batch().degree_log;
+    let n = degree << batch.batch().rate_bits;
+    let columns = batch.num_polynomials();
     let coeffs = crate::gpu::lde::device_coefficients(ctx, batch, "quotient_lde");
     let lde = ctx.storage("lde", (columns * n * 8) as u64);
     let mut encoder = ctx.encoder("lde");
@@ -1571,7 +1573,7 @@ fn device_lde<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D:
     );
     ctx.submit(encoder);
     if keep {
-        batch.device.set_if_within_limit(ctx, lde.clone());
+        batch.batch().device.set_if_within_limit(ctx, lde.clone());
     }
     lde
 }
@@ -1735,7 +1737,7 @@ impl DeviceQuotient {
         common: &CommonCircuitData<F, D>,
         timing: &mut crate::util::timing::TimingTree,
         retain_leaves: bool,
-    ) -> PolynomialBatch<F, C, D> {
+    ) -> ProverPolynomialBatch<F, C, D> {
         let coeffs = self.compact::<F>(common.quotient_degree());
         crate::gpu::lde::from_device_coeffs(
             &self.ctx,
@@ -1768,8 +1770,8 @@ pub(crate) fn try_compute_quotient<
     common_data: &CommonCircuitData<F, D>,
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     public_inputs_hash: &HashOut<F>,
-    wires_commitment: &PolynomialBatch<F, C, D>,
-    zs_commitment: &PolynomialBatch<F, C, D>,
+    wires_commitment: &dyn ProverOracle<F, C, D>,
+    zs_commitment: &dyn ProverOracle<F, C, D>,
     betas: &[F],
     gammas: &[F],
     alphas: &[F],
@@ -1844,8 +1846,16 @@ pub(crate) fn try_compute_quotient<
     // Where the host maps device buffers directly, the CPU share copies only
     // the rows it reads. Unsupported circuits still fall back to the CPU
     // through the normal, parallel host-materialization path.
-    let resident = wires_commitment.merkle_tree.leaves.is_device_resident()
-        || zs_commitment.merkle_tree.leaves.is_device_resident();
+    let resident = wires_commitment
+        .batch()
+        .merkle_tree
+        .leaves
+        .is_device_resident()
+        || zs_commitment
+            .batch()
+            .merkle_tree
+            .leaves
+            .is_device_resident();
     let cpu_rows = if cpu_share > 0.0 && (!resident || ctx.mappable) {
         ((n as f64 * cpu_share) as usize).min(n / 2)
     } else {
@@ -1905,8 +1915,8 @@ pub(crate) fn try_compute_quotient<
             ],
             &[
                 prover_data.constants_sigmas_commitment.polynomials.len() as u32,
-                wires_commitment.polynomials.len() as u32,
-                zs_commitment.polynomials.len() as u32,
+                wires_commitment.num_polynomials() as u32,
+                zs_commitment.num_polynomials() as u32,
                 chal_len as u32,
                 num_challenges as u32,
                 program.registers,
@@ -1956,8 +1966,10 @@ pub(crate) fn try_compute_quotient<
             let start = std::time::Instant::now();
             // The rows this share reads: each point's own row, and for the
             // Z polynomials also the row `next_step` points ahead.
-            wires_commitment.prepare_lde_values(gpu_rows..n, step as usize);
-            zs_commitment.prepare_lde_values(
+            wires_commitment
+                .batch()
+                .prepare_lde_values(gpu_rows..n, step as usize);
+            zs_commitment.batch().prepare_lde_values(
                 (gpu_rows..n).flat_map(|i| [i, (i + next_step as usize) % n]),
                 step as usize,
             );
@@ -1965,8 +1977,8 @@ pub(crate) fn try_compute_quotient<
                 common_data,
                 prover_data,
                 public_inputs_hash,
-                wires_commitment,
-                zs_commitment,
+                wires_commitment.batch(),
+                zs_commitment.batch(),
                 betas,
                 gammas,
                 &[],
@@ -2129,9 +2141,9 @@ mod device_coefficient_tests {
             &mut crate::util::timing::TimingTree::default(),
             false,
         );
-        assert_eq!(*batch.device_coeffs.get().unwrap(), *quotient.coeffs);
+        assert_eq!(*batch.batch.device_coeffs.get().unwrap(), *quotient.coeffs);
         assert_eq!(
-            batch.polynomials[1].coeffs,
+            batch.polynomials()[1].coeffs,
             [4, 5, 6, 0].map(GoldilocksField::from_canonical_u64)
         );
         quotient.coeffs = ctx.upload("invalid quotient", &[1, 2, 3, 0, 4, 5, 6, 7]);

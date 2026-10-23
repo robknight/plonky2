@@ -83,7 +83,10 @@ fn unified_residency_matrix() {
         resident,
         false,
     );
-    assert_eq!(probe.merkle_tree.leaves.is_device_resident(), resident);
+    assert_eq!(
+        probe.batch.merkle_tree.leaves.is_device_resident(),
+        resident
+    );
     drop(probe);
     println!("matrix shape={shape} degree_bits={} wires={} lookups={} blinded={blinded} resident={resident} threads={threads} verify={verify}",
         data.common.degree_bits(), data.common.config.num_wires, data.common.num_lookup_polys);

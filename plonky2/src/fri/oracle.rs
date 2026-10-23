@@ -23,6 +23,9 @@ use crate::util::reducing::ReducingFactor;
 use crate::util::timing::TimingTree;
 use crate::util::{log2_strict, reverse_bits};
 
+mod prover;
+pub(crate) use prover::{ProverOracle, ProverPolynomialBatch};
+
 /// Four (~64 bit) field elements gives ~128 bit security.
 pub const SALT_SIZE: usize = 4;
 
@@ -119,6 +122,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             #[cfg(feature = "gpu")]
             false,
         )
+        .into_host()
     }
 
     pub(crate) fn from_values_with_plan(
@@ -130,7 +134,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         fft_root_table: Option<&FftRootTable<F>>,
         #[cfg(feature = "gpu")] plan: Option<&crate::gpu::policy::ExecutionPlan>,
         #[cfg(feature = "gpu")] retain_values: bool,
-    ) -> Self {
+    ) -> ProverPolynomialBatch<F, C, D> {
         #[cfg(feature = "gpu")]
         if let Some(ctx) = crate::gpu::lde::applicable::<F, C, D>(
             values.len(),
@@ -152,8 +156,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 retain_values,
             );
             if plan.is_none() {
-                batch.device.retain_within_limit(&ctx);
-                batch.device_coeffs.retain_within_limit(&ctx);
+                batch.batch.device.retain_within_limit(&ctx);
+                batch.batch.device_coeffs.retain_within_limit(&ctx);
             }
             return batch;
         }
@@ -165,6 +169,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             timing,
             fft_root_table,
         )
+        .into()
     }
 
     /// `from_values` on the CPU.
@@ -215,6 +220,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             #[cfg(feature = "gpu")]
             None,
         )
+        .into_host()
     }
 
     pub(crate) fn from_coeffs_with_plan(
@@ -225,7 +231,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         timing: &mut TimingTree,
         fft_root_table: Option<&FftRootTable<F>>,
         #[cfg(feature = "gpu")] plan: Option<&crate::gpu::policy::ExecutionPlan>,
-    ) -> Self {
+    ) -> ProverPolynomialBatch<F, C, D> {
         #[cfg(feature = "gpu")]
         if let Some(ctx) = crate::gpu::lde::applicable::<F, C, D>(
             polynomials.len(),
@@ -246,8 +252,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 ),
             );
             if plan.is_none() {
-                batch.device.retain_within_limit(&ctx);
-                batch.device_coeffs.retain_within_limit(&ctx);
+                batch.batch.device.retain_within_limit(&ctx);
+                batch.batch.device_coeffs.retain_within_limit(&ctx);
             }
             return batch;
         }
@@ -259,6 +265,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             timing,
             fft_root_table,
         )
+        .into()
     }
 
     /// `from_coeffs` on the CPU.
@@ -387,6 +394,30 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         max_num_query_steps: Option<usize>,
         timing: &mut TimingTree,
     ) -> FriProof<F, C::Hasher, D> {
+        let oracles = oracles
+            .iter()
+            .map(|&o| o as &dyn ProverOracle<F, C, D>)
+            .collect::<Vec<_>>();
+        Self::prove_openings_with_batches(
+            instance,
+            &oracles,
+            challenger,
+            fri_params,
+            final_poly_coeff_len,
+            max_num_query_steps,
+            timing,
+        )
+    }
+
+    pub(crate) fn prove_openings_with_batches(
+        instance: &FriInstanceInfo<F, D>,
+        oracles: &[&dyn ProverOracle<F, C, D>],
+        challenger: &mut Challenger<F, C::Hasher>,
+        fri_params: &FriParams,
+        final_poly_coeff_len: Option<usize>,
+        max_num_query_steps: Option<usize>,
+        timing: &mut TimingTree,
+    ) -> FriProof<F, C::Hasher, D> {
         #[cfg(feature = "gpu")]
         if let Some(proof) = crate::gpu::opening::try_prove_openings::<F, C, D>(
             instance,
@@ -399,7 +430,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         ) {
             return proof;
         }
-        Self::prove_openings_cpu(
+        Self::prove_openings_cpu_with_batches(
             instance,
             oracles,
             challenger,
@@ -412,9 +443,34 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
 
     /// Combines the opening polynomial on the CPU. Its final FFT and the FRI
     /// commit phase may still run on the GPU.
+    #[cfg(test)]
     pub(crate) fn prove_openings_cpu(
         instance: &FriInstanceInfo<F, D>,
         oracles: &[&Self],
+        challenger: &mut Challenger<F, C::Hasher>,
+        fri_params: &FriParams,
+        final_poly_coeff_len: Option<usize>,
+        max_num_query_steps: Option<usize>,
+        timing: &mut TimingTree,
+    ) -> FriProof<F, C::Hasher, D> {
+        let oracles = oracles
+            .iter()
+            .map(|&o| o as &dyn ProverOracle<F, C, D>)
+            .collect::<Vec<_>>();
+        Self::prove_openings_cpu_with_batches(
+            instance,
+            &oracles,
+            challenger,
+            fri_params,
+            final_poly_coeff_len,
+            max_num_query_steps,
+            timing,
+        )
+    }
+
+    pub(crate) fn prove_openings_cpu_with_batches(
+        instance: &FriInstanceInfo<F, D>,
+        oracles: &[&dyn ProverOracle<F, C, D>],
         challenger: &mut Challenger<F, C::Hasher>,
         fri_params: &FriParams,
         final_poly_coeff_len: Option<usize>,
@@ -438,7 +494,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         for FriBatchInfo { point, polynomials } in &instance.batches {
             // Collect the coefficients of all the polynomials in `polynomials`.
             let polys_coeff = polynomials.iter().map(|fri_poly| {
-                &oracles[fri_poly.oracle_index].polynomials[fri_poly.polynomial_index]
+                &oracles[fri_poly.oracle_index].polynomials()[fri_poly.polynomial_index]
             });
             let composition_poly = timed!(
                 timing,
@@ -467,7 +523,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let fri_proof = fri_proof::<F, C, D>(
             &oracles
                 .par_iter()
-                .map(|c| &c.merkle_tree)
+                .map(|c| &c.batch().merkle_tree)
                 .collect::<Vec<_>>(),
             lde_final_poly,
             lde_final_values,

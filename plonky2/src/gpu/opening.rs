@@ -17,7 +17,7 @@
 
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::types::Field;
-use crate::fri::oracle::PolynomialBatch;
+use crate::fri::oracle::ProverOracle;
 use crate::fri::proof::FriProof;
 use crate::fri::prover::{fri_proof_of_work, fri_prover_query_rounds};
 use crate::fri::structure::FriInstanceInfo;
@@ -43,16 +43,6 @@ const MAX_ORACLES: usize = 4;
 /// first word.
 fn term(oracle: usize, column: usize, point: usize) -> u64 {
     oracle as u64 | ((point as u64) << 16) | ((column as u64) << 32)
-}
-
-/// Whether the batch has `2^degree_log` coefficients per polynomial.
-fn uniform_degree<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
-    batch: &PolynomialBatch<F, C, D>,
-    degree_log: usize,
-) -> bool {
-    !batch.polynomials.is_empty()
-        && batch.degree_log == degree_log
-        && batch.polynomials.iter().all(|p| p.len() == 1 << degree_log)
 }
 
 /// The components of an extension element as kernel words.
@@ -123,10 +113,10 @@ pub(crate) fn try_opening_set<
 >(
     zeta: F::Extension,
     g: F::Extension,
-    constants_sigmas_commitment: &PolynomialBatch<F, C, D>,
-    wires_commitment: &PolynomialBatch<F, C, D>,
-    zs_partial_products_lookup_commitment: &PolynomialBatch<F, C, D>,
-    quotient_polys_commitment: &PolynomialBatch<F, C, D>,
+    constants_sigmas_commitment: &dyn ProverOracle<F, C, D>,
+    wires_commitment: &dyn ProverOracle<F, C, D>,
+    zs_partial_products_lookup_commitment: &dyn ProverOracle<F, C, D>,
+    quotient_polys_commitment: &dyn ProverOracle<F, C, D>,
     common_data: &CommonCircuitData<F, D>,
 ) -> Option<OpeningSet<F, D>> {
     if D != 2 || !field_supported::<F>() {
@@ -138,15 +128,15 @@ pub(crate) fn try_opening_set<
         zs_partial_products_lookup_commitment,
         quotient_polys_commitment,
     ];
-    let degree_log = wires_commitment.degree_log;
+    let degree_log = wires_commitment.batch().degree_log;
     let degree = 1usize << degree_log;
     let columns = batches
         .iter()
-        .map(|b| b.polynomials.len())
+        .map(|b| b.num_polynomials())
         .max()
         .unwrap_or(0);
-    if (degree_log + wires_commitment.rate_bits) < crate::gpu::MIN_LOG_LEAVES as usize
-        || batches.iter().any(|b| !uniform_degree(b, degree_log))
+    if (degree_log + wires_commitment.batch().rate_bits) < crate::gpu::MIN_LOG_LEAVES as usize
+        || batches.iter().any(|b| !b.uniform_degree(degree_log))
     {
         return None;
     }
@@ -159,17 +149,17 @@ pub(crate) fn try_opening_set<
     }
     let coeffs = batches
         .iter()
-        .map(|b| device_coefficients(ctx, b, "opening"))
+        .map(|&b| device_coefficients(ctx, b, "opening"))
         .collect::<Vec<_>>();
     // Every polynomial at zeta; only Z and lookup polynomials need g * zeta.
-    let num_zs = zs_partial_products_lookup_commitment.polynomials.len();
+    let num_zs = zs_partial_products_lookup_commitment.num_polynomials();
     let next_columns = common_data
         .zs_range()
         .chain(common_data.lookup_range().start..num_zs);
     let terms = batches
         .iter()
         .enumerate()
-        .flat_map(|(o, b)| (0..b.polynomials.len()).map(move |c| term(o, c, 0)))
+        .flat_map(|(o, b)| (0..b.num_polynomials()).map(move |c| term(o, c, 0)))
         .chain(next_columns.map(|c| term(2, c, 1)))
         .collect::<Vec<_>>();
     let evals = evaluate::<F, D>(ctx, &coeffs, degree, &terms, &[zeta, g * zeta]);
@@ -179,10 +169,10 @@ pub(crate) fn try_opening_set<
         evals = tail;
         head
     };
-    let constants_sigmas = take(constants_sigmas_commitment.polynomials.len());
-    let wires = take(wires_commitment.polynomials.len());
+    let constants_sigmas = take(constants_sigmas_commitment.num_polynomials());
+    let wires = take(wires_commitment.num_polynomials());
     let zs = take(num_zs);
-    let quotient_polys = take(quotient_polys_commitment.polynomials.len());
+    let quotient_polys = take(quotient_polys_commitment.num_polynomials());
     let zs_next = take(common_data.zs_range().len());
     let lookup_zs_next = take(common_data.num_all_lookup_polys());
     Some(OpeningSet {
@@ -207,7 +197,7 @@ pub(crate) fn try_prove_openings<
     const D: usize,
 >(
     instance: &FriInstanceInfo<F, D>,
-    oracles: &[&PolynomialBatch<F, C, D>],
+    oracles: &[&dyn ProverOracle<F, C, D>],
     challenger: &mut Challenger<F, C::Hasher>,
     fri_params: &FriParams,
     final_poly_coeff_len: Option<usize>,
@@ -223,7 +213,7 @@ pub(crate) fn try_prove_openings<
     {
         return None;
     }
-    let degree_log = oracles[0].degree_log;
+    let degree_log = oracles[0].batch().degree_log;
     let rate_bits = fri_params.config.rate_bits;
     let degree = 1usize << degree_log;
     let log_n = (degree_log + rate_bits) as u32;
@@ -232,18 +222,18 @@ pub(crate) fn try_prove_openings<
     let num_blocks = degree / COMBINE_BLOCK as usize;
     let columns = oracles
         .iter()
-        .map(|o| o.polynomials.len())
+        .map(|o| o.num_polynomials())
         .max()
         .unwrap_or(0);
     if log_n < crate::gpu::MIN_LOG_LEAVES
         || degree < COMBINE_BLOCK as usize
         || oracles
             .iter()
-            .any(|o| o.rate_bits != rate_bits || !uniform_degree(o, degree_log))
+            .any(|o| o.batch().rate_bits != rate_bits || !o.uniform_degree(degree_log))
         || instance.batches.iter().any(|b| {
             b.polynomials.iter().any(|p| {
                 p.oracle_index >= oracles.len()
-                    || p.polynomial_index >= oracles[p.oracle_index].polynomials.len()
+                    || p.polynomial_index >= oracles[p.oracle_index].num_polynomials()
             })
         })
     {
@@ -303,7 +293,7 @@ pub(crate) fn try_prove_openings<
         let params = ctx.uniform("combine params", &params);
         let coeff_buffers = oracles
             .iter()
-            .map(|o| device_coefficients(ctx, o, "opening"))
+            .map(|&o| device_coefficients(ctx, o, "opening"))
             .collect::<Vec<_>>();
         let terms = ctx.upload("combination terms", &terms);
         let alphas = ctx.upload("alpha powers", &alphas);
@@ -387,7 +377,10 @@ pub(crate) fn try_prove_openings<
         "find proof-of-work witness",
         fri_proof_of_work::<F, C, D>(challenger, &fri_params.config)
     );
-    let initial_merkle_trees = oracles.iter().map(|o| &o.merkle_tree).collect::<Vec<_>>();
+    let initial_merkle_trees = oracles
+        .iter()
+        .map(|o| &o.batch().merkle_tree)
+        .collect::<Vec<_>>();
     let query_round_proofs = timed!(
         timing,
         "query rounds",

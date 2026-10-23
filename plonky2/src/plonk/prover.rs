@@ -14,7 +14,9 @@ use crate::field::extension::Extendable;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
-use crate::fri::oracle::PolynomialBatch;
+#[cfg(not(feature = "gpu"))]
+use crate::fri::oracle::ProverPolynomialBatch;
+use crate::fri::oracle::{PolynomialBatch, ProverOracle};
 use crate::gates::lookup::LookupGate;
 use crate::gates::lookup_table::LookupTableGate;
 use crate::gates::selectors::LookupSelectors;
@@ -313,7 +315,7 @@ where
             )
         });
         #[cfg(not(feature = "gpu"))]
-        let resident_commitment: Option<PolynomialBatch<F, C, D>> = None;
+        let resident_commitment: Option<ProverPolynomialBatch<F, C, D>> = None;
         match resident_commitment {
             Some(commitment) => commitment,
             None => timed!(
@@ -344,7 +346,7 @@ where
     challenger.observe_hash::<C::Hasher>(prover_data.circuit_digest);
     challenger.observe_hash::<C::InnerHasher>(public_inputs_hash);
 
-    challenger.observe_cap::<C::Hasher>(&wires_commitment.merkle_tree.cap);
+    challenger.observe_cap::<C::Hasher>(&wires_commitment.batch.merkle_tree.cap);
 
     // We need 4 values per challenge: 2 for the combos, 1 for (X-combo) in the accumulators and 1 to prove that the lookup table was computed correctly.
     // We can reuse betas and gammas for two of them.
@@ -386,7 +388,7 @@ where
         )
     );
     #[cfg(not(feature = "gpu"))]
-    let gpu_commitment: Option<PolynomialBatch<F, C, D>> = None;
+    let gpu_commitment: Option<ProverPolynomialBatch<F, C, D>> = None;
     let mut partial_products_zs_and_lookup_commitment = match gpu_commitment {
         Some(commitment) => commitment,
         None => {
@@ -395,7 +397,7 @@ where
                 let ctx = resident_ctx
                     .clone()
                     .ok_or_else(|| anyhow::anyhow!("GPU witness context unavailable"))?;
-                let values = wires_commitment.device_values.take().ok_or_else(|| {
+                let values = wires_commitment.batch.device_values.take().ok_or_else(|| {
                     anyhow::anyhow!("GPU witness values unavailable for CPU permutation fallback")
                 })?;
                 witness = Some(MatrixWitness {
@@ -459,7 +461,12 @@ where
         }
     };
 
-    challenger.observe_cap::<C::Hasher>(&partial_products_zs_and_lookup_commitment.merkle_tree.cap);
+    challenger.observe_cap::<C::Hasher>(
+        &partial_products_zs_and_lookup_commitment
+            .batch
+            .merkle_tree
+            .cap,
+    );
 
     let alphas = challenger.get_n_challenges(num_challenges);
 
@@ -521,7 +528,7 @@ where
         }
     };
 
-    challenger.observe_cap::<C::Hasher>(&quotient_polys_commitment.merkle_tree.cap);
+    challenger.observe_cap::<C::Hasher>(&quotient_polys_commitment.batch.merkle_tree.cap);
 
     let zeta = challenger.get_extension_challenge::<D>();
     // To avoid leaking witness data, we want to ensure that our opening locations, `zeta` and
@@ -536,7 +543,7 @@ where
     let openings = timed!(
         timing,
         "construct the opening set, including lookups",
-        OpeningSet::new(
+        OpeningSet::new_with_batches(
             zeta,
             g,
             &prover_data.constants_sigmas_commitment,
@@ -552,7 +559,7 @@ where
     let opening_proof = timed!(
         timing,
         "compute opening proofs",
-        PolynomialBatch::<F, C, D>::prove_openings(
+        PolynomialBatch::<F, C, D>::prove_openings_with_batches(
             &instance,
             &[
                 &prover_data.constants_sigmas_commitment,
@@ -569,11 +576,14 @@ where
     );
 
     let proof = Proof::<F, C, D> {
-        wires_cap: core::mem::take(&mut wires_commitment.merkle_tree.cap),
+        wires_cap: core::mem::take(&mut wires_commitment.batch.merkle_tree.cap),
         plonk_zs_partial_products_cap: core::mem::take(
-            &mut partial_products_zs_and_lookup_commitment.merkle_tree.cap,
+            &mut partial_products_zs_and_lookup_commitment
+                .batch
+                .merkle_tree
+                .cap,
         ),
-        quotient_polys_cap: core::mem::take(&mut quotient_polys_commitment.merkle_tree.cap),
+        quotient_polys_cap: core::mem::take(&mut quotient_polys_commitment.batch.merkle_tree.cap),
         openings,
         opening_proof,
     };
@@ -879,8 +889,8 @@ fn compute_quotient_polys<
     common_data: &CommonCircuitData<F, D>,
     prover_data: &'a ProverOnlyCircuitData<F, C, D>,
     public_inputs_hash: &<<C as GenericConfig<D>>::InnerHasher as Hasher<F>>::Hash,
-    wires_commitment: &'a PolynomialBatch<F, C, D>,
-    zs_partial_products_and_lookup_commitment: &'a PolynomialBatch<F, C, D>,
+    wires_commitment: &'a dyn ProverOracle<F, C, D>,
+    zs_partial_products_and_lookup_commitment: &'a dyn ProverOracle<F, C, D>,
     betas: &[F],
     gammas: &[F],
     deltas: &[F],
@@ -917,8 +927,8 @@ fn compute_quotient_polys<
         common_data,
         prover_data,
         public_inputs_hash,
-        wires_commitment,
-        zs_partial_products_and_lookup_commitment,
+        wires_commitment.batch(),
+        zs_partial_products_and_lookup_commitment.batch(),
         betas,
         gammas,
         deltas,
@@ -1216,7 +1226,8 @@ mod gpu_tests {
             prover_data.fft_root_table.as_ref(),
             None,
             true,
-        );
+        )
+        .into_host();
         let mut challenger = Challenger::<F, <C as GenericConfig<2>>::Hasher>::new();
         common_data.fri_params.observe(&mut challenger);
         challenger.observe_hash::<<C as GenericConfig<2>>::Hasher>(prover_data.circuit_digest);
@@ -1402,7 +1413,7 @@ mod gpu_tests {
         );
         let gpu_proof = crate::gpu::opening::try_prove_openings::<F, C, 2>(
             &instance,
-            &oracles,
+            &oracles.map(|o| o as &dyn ProverOracle<F, C, 2>),
             &mut challenger,
             &common_data.fri_params,
             None,
@@ -1465,7 +1476,8 @@ mod gpu_tests {
             &mut timing,
             None,
         )
-        .expect("the GPU takes the partial products");
+        .expect("the GPU takes the partial products")
+        .into_host();
         assert!(wires_commitment.device_values.get().is_none());
         assert!(gpu.device_values.get().is_none());
         assert_eq!(gpu.polynomials.len(), zs_commitment.polynomials.len());

@@ -12,7 +12,7 @@ use plonky2_maybe_rayon::*;
 use serde::{Deserialize, Serialize};
 
 use crate::field::extension::Extendable;
-use crate::fri::oracle::PolynomialBatch;
+use crate::fri::oracle::{PolynomialBatch, ProverOracle};
 use crate::fri::proof::{
     CompressedFriProof, FriChallenges, FriChallengesTarget, FriProof, FriProofTarget,
 };
@@ -325,6 +325,26 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         quotient_polys_commitment: &PolynomialBatch<F, C, D>,
         common_data: &CommonCircuitData<F, D>,
     ) -> Self {
+        Self::new_with_batches(
+            zeta,
+            g,
+            constants_sigmas_commitment,
+            wires_commitment,
+            zs_partial_products_lookup_commitment,
+            quotient_polys_commitment,
+            common_data,
+        )
+    }
+
+    pub(crate) fn new_with_batches<C: GenericConfig<D, F = F>>(
+        zeta: F::Extension,
+        g: F::Extension,
+        constants_sigmas_commitment: &dyn ProverOracle<F, C, D>,
+        wires_commitment: &dyn ProverOracle<F, C, D>,
+        zs_partial_products_lookup_commitment: &dyn ProverOracle<F, C, D>,
+        quotient_polys_commitment: &dyn ProverOracle<F, C, D>,
+        common_data: &CommonCircuitData<F, D>,
+    ) -> Self {
         #[cfg(feature = "gpu")]
         if let Some(openings) = crate::gpu::opening::try_opening_set::<F, C, D>(
             zeta,
@@ -337,7 +357,7 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         ) {
             return openings;
         }
-        Self::new_cpu(
+        Self::new_cpu_with_batches(
             zeta,
             g,
             constants_sigmas_commitment,
@@ -349,6 +369,7 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
     }
 
     /// `new` on the CPU.
+    #[cfg(test)]
     pub(crate) fn new_cpu<C: GenericConfig<D, F = F>>(
         zeta: F::Extension,
         g: F::Extension,
@@ -358,8 +379,28 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         quotient_polys_commitment: &PolynomialBatch<F, C, D>,
         common_data: &CommonCircuitData<F, D>,
     ) -> Self {
-        let eval_commitment = |z: F::Extension, c: &PolynomialBatch<F, C, D>| {
-            c.polynomials
+        Self::new_cpu_with_batches(
+            zeta,
+            g,
+            constants_sigmas_commitment,
+            wires_commitment,
+            zs_partial_products_lookup_commitment,
+            quotient_polys_commitment,
+            common_data,
+        )
+    }
+
+    pub(crate) fn new_cpu_with_batches<C: GenericConfig<D, F = F>>(
+        zeta: F::Extension,
+        g: F::Extension,
+        constants_sigmas_commitment: &dyn ProverOracle<F, C, D>,
+        wires_commitment: &dyn ProverOracle<F, C, D>,
+        zs_partial_products_lookup_commitment: &dyn ProverOracle<F, C, D>,
+        quotient_polys_commitment: &dyn ProverOracle<F, C, D>,
+        common_data: &CommonCircuitData<F, D>,
+    ) -> Self {
+        let eval_commitment = |z: F::Extension, c: &dyn ProverOracle<F, C, D>| {
+            c.polynomials()
                 .par_iter()
                 .map(|p| p.to_extension().eval(z))
                 .collect::<Vec<_>>()

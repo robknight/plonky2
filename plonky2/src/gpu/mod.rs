@@ -1264,6 +1264,7 @@ impl GpuContext {
     /// Calls `f` with the first `bytes` of `staging`, a `readback_buffer`
     /// filled by a copy in submission `index`, then recycles it. Later
     /// submissions may still be running: the mapping waits only for `index`.
+    #[cfg(all(test, feature = "gpu-profiling"))]
     pub(crate) fn read_staged_with_timing<R>(
         &self,
         staging: wgpu::Buffer,

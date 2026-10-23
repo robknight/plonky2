@@ -11,7 +11,7 @@ use crate::field::extension::Extendable;
 use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::{Field, PrimeField64};
-use crate::fri::oracle::{PolynomialBatch, SALT_SIZE};
+use crate::fri::oracle::{PolynomialBatch, ProverOracle, ProverPolynomialBatch, SALT_SIZE};
 use crate::gpu::merkle::{build_tree, supported, LeafSource};
 use crate::gpu::shader::{
     fft_plan, FFT_INVERSE, FFT_LOAD_BITREV, FFT_SHIFT_IN, FFT_SHIFT_OUT, FFT_TO_OUTPUT,
@@ -58,15 +58,15 @@ pub(crate) fn device_coefficients<
     const D: usize,
 >(
     ctx: &GpuContext,
-    batch: &PolynomialBatch<F, C, D>,
+    batch: &dyn ProverOracle<F, C, D>,
     stage: &str,
 ) -> DeviceBuffer {
-    if let Some(buffer) = batch.device_coeffs.get() {
+    if let Some(buffer) = batch.batch().device_coeffs.get() {
         if crate::gpu::lde::coefficient_audit_enabled() {
             eprintln!(
                 "GPU_COEFFICIENT_CACHE hit=true columns={} len={}",
-                batch.polynomials.len(),
-                1usize << batch.degree_log
+                batch.num_polynomials(),
+                1usize << batch.batch().degree_log
             );
         }
         return buffer;
@@ -74,18 +74,21 @@ pub(crate) fn device_coefficients<
     let buffer = crate::gpu::lde::audit_coefficient_transfer(
         "upload",
         stage,
-        batch.polynomials.len(),
-        1usize << batch.degree_log,
+        batch.num_polynomials(),
+        1usize << batch.batch().degree_log,
         || {
             let columns = batch
-                .polynomials
+                .polynomials()
                 .iter()
                 .map(|p| p.coeffs.as_slice())
                 .collect::<Vec<_>>();
             upload_columns(ctx, "coeffs", &columns)
         },
     );
-    batch.device_coeffs.set_if_within_limit(ctx, buffer.clone());
+    batch
+        .batch()
+        .device_coeffs
+        .set_if_within_limit(ctx, buffer.clone());
     buffer
 }
 
@@ -373,17 +376,10 @@ fn decode_columns<F: PrimeField64>(bytes: &[u8], len: usize) -> Vec<Vec<F>> {
         .collect()
 }
 
-/// A commitment's coefficients for the host: already there, or staged on
-/// the device by a copy in submission `done`, decoded by `commit` once its
-/// own device work is queued.
+/// Coefficients already on the host, or their device-only shape.
 enum HostCoefficients<F: Field> {
     Ready(Vec<PolynomialCoeffs<F>>),
-    Staged {
-        staging: wgpu::Buffer,
-        done: wgpu::SubmissionIndex,
-        columns: usize,
-        degree: usize,
-    },
+    Device { columns: usize, degree: usize },
 }
 
 /// `PolynomialBatch::from_values` on the device.
@@ -410,6 +406,7 @@ pub(crate) fn from_values<
         ctx.options.retain_leaves(ctx.mappable),
         false,
     )
+    .into_host()
 }
 
 pub(crate) fn from_values_with_residency<
@@ -425,7 +422,7 @@ pub(crate) fn from_values_with_residency<
     timing: &mut TimingTree,
     retain_leaves: bool,
     retain_values: bool,
-) -> PolynomialBatch<F, C, D> {
+) -> ProverPolynomialBatch<F, C, D> {
     let degree = values[0].len();
     let num_polys = values.len();
     let vals = timed!(timing, "gpu: upload values", {
@@ -468,7 +465,7 @@ pub(crate) fn from_device_values<
     timing: &mut TimingTree,
     retain_leaves: bool,
     retain_values: bool,
-) -> PolynomialBatch<F, C, D> {
+) -> ProverPolynomialBatch<F, C, D> {
     let log_d = log2_strict(degree) as u32;
     let (coeffs, work) = timed!(timing, "gpu: allocate IFFT buffers", {
         let coeffs = ctx.storage("coeffs", (num_polys * degree * 8) as u64);
@@ -500,23 +497,7 @@ pub(crate) fn from_device_values<
         encoder
     });
     let device_values = crate::gpu::DeviceCache::default();
-    // The IFFT's submission also copies the coefficients into a readback
-    // buffer, so the LDE can read them on the device right away while the
-    // host maps the copy later (mapping the coefficient buffer itself would
-    // wait for the LDE that reads it).
-    let bytes = (num_polys * degree * 8) as u64;
-    let mut encoder = encoder;
-    let staging = ctx.readback_buffer(bytes);
-    encoder.copy_buffer_to_buffer(&coeffs, 0, &staging, 0, bytes.next_multiple_of(16));
-    let done = timed!(
-        timing,
-        "gpu: IFFT",
-        timed!(
-            timing,
-            "gpu: finish and submit commands",
-            ctx.submit_async(encoder)
-        )
-    );
+    timed!(timing, "gpu: IFFT", ctx.submit_async(encoder));
     // Queue order keeps the scratch buffer intact for the IFFT even if the
     // pool hands it out again; releasing it here lowers peak memory.
     timed!(timing, "gpu: release IFFT work", drop(work));
@@ -527,9 +508,7 @@ pub(crate) fn from_device_values<
     }
     commit(
         ctx,
-        HostCoefficients::Staged {
-            staging,
-            done,
+        HostCoefficients::Device {
             columns: num_polys,
             degree,
         },
@@ -543,8 +522,8 @@ pub(crate) fn from_device_values<
     )
 }
 
-/// Commits column-major device coefficients, staging the host copy while the
-/// LDE and Merkle hashing run. No coefficient upload or host chunking is needed.
+/// Commits column-major device coefficients without a host copy. CPU opening
+/// fallbacks materialize the coefficients only if needed.
 pub(crate) fn from_device_coeffs<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -559,20 +538,10 @@ pub(crate) fn from_device_coeffs<
     cap_height: usize,
     timing: &mut TimingTree,
     retain_leaves: bool,
-) -> PolynomialBatch<F, C, D> {
-    let bytes = (columns * degree * 8) as u64;
-    let staging = ctx.readback_buffer(bytes);
-    let mut encoder = ctx.encoder("stage device coefficients");
-    encoder.copy_buffer_to_buffer(&coeffs, 0, &staging, 0, bytes.next_multiple_of(16));
-    let done = ctx.submit_async(encoder);
+) -> ProverPolynomialBatch<F, C, D> {
     commit(
         ctx,
-        HostCoefficients::Staged {
-            staging,
-            done,
-            columns,
-            degree,
-        },
+        HostCoefficients::Device { columns, degree },
         coeffs,
         crate::gpu::DeviceCache::default(),
         rate_bits,
@@ -606,6 +575,7 @@ pub(crate) fn from_coeffs<
         timing,
         ctx.options.retain_leaves(ctx.mappable),
     )
+    .into_host()
 }
 
 pub(crate) fn from_coeffs_with_residency<
@@ -620,7 +590,7 @@ pub(crate) fn from_coeffs_with_residency<
     cap_height: usize,
     timing: &mut TimingTree,
     retain_leaves: bool,
-) -> PolynomialBatch<F, C, D> {
+) -> ProverPolynomialBatch<F, C, D> {
     let coeffs = timed!(timing, "gpu: upload coefficients", {
         audit_coefficient_transfer(
             "upload",
@@ -661,7 +631,7 @@ fn commit<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usi
     cap_height: usize,
     timing: &mut TimingTree,
     retain_leaves: bool,
-) -> PolynomialBatch<F, C, D> {
+) -> ProverPolynomialBatch<F, C, D> {
     let (num_polys, degree) = match &host_coeffs {
         HostCoefficients::Ready(polynomials) => {
             let degree = polynomials[0].len();
@@ -671,9 +641,7 @@ fn commit<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usi
             );
             (polynomials.len(), degree)
         }
-        HostCoefficients::Staged {
-            columns, degree, ..
-        } => (*columns, *degree),
+        HostCoefficients::Device { columns, degree } => (*columns, *degree),
     };
     let log_n = (log2_strict(degree) + rate_bits) as u32;
     let n = 1usize << log_n;
@@ -722,7 +690,7 @@ fn commit<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usi
     });
     // The opening phase evaluates the polynomials from these coefficients.
     let device_coeffs = crate::gpu::DeviceCache::default();
-    device_coeffs.set(coeffs);
+    device_coeffs.set(coeffs.clone());
     timed!(timing, "gpu: pack and enqueue salt writes", {
         // The salt columns follow the polynomials' columns in the LDE buffer.
         ctx.write(&lde, (num_polys * n) as u64, &salts);
@@ -748,35 +716,6 @@ fn commit<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usi
             Some(&rows),
         )
     );
-    // With the device work queued, the host decodes the staged coefficients
-    // while the leaves are hashed.
-    let polynomials: Vec<PolynomialCoeffs<F>> = match host_coeffs {
-        HostCoefficients::Ready(polynomials) => polynomials,
-        HostCoefficients::Staged {
-            staging,
-            done,
-            columns,
-            degree,
-        } => {
-            let polynomials = timed!(
-                timing,
-                "gpu: read coefficients",
-                audit_coefficient_transfer("download", "commitment", columns, degree, || {
-                    ctx.read_staged_with_timing(
-                        staging,
-                        (columns * degree * 8) as u64,
-                        &done,
-                        Some(timing),
-                        |bytes| decode_columns::<F>(bytes, degree),
-                    )
-                    .into_iter()
-                    .map(PolynomialCoeffs::new)
-                    .collect::<Vec<_>>()
-                })
-            );
-            polynomials
-        }
-    };
     // The rows are complete once the leaves are hashed; they are read while
     // the levels above are still being hashed.
     let leaves = if retain_leaves {
@@ -818,8 +757,8 @@ fn commit<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usi
     let device = crate::gpu::DeviceCache::default();
     device.set(lde);
     timed!(timing, "gpu: release blinding salts", drop(salts));
-    PolynomialBatch {
-        polynomials,
+    let batch = PolynomialBatch {
+        polynomials: Vec::new(),
         merkle_tree: MerkleTree {
             leaves,
             digests,
@@ -831,6 +770,15 @@ fn commit<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usi
         device,
         device_coeffs,
         device_values,
+    };
+    match host_coeffs {
+        HostCoefficients::Ready(polynomials) => ProverPolynomialBatch::from(PolynomialBatch {
+            polynomials,
+            ..batch
+        }),
+        HostCoefficients::Device { columns, degree } => {
+            ProverPolynomialBatch::from_device(batch, ctx.clone(), coeffs, columns, degree)
+        }
     }
 }
 

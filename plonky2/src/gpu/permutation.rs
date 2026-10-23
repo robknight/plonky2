@@ -11,7 +11,7 @@
 //! uploaded and cached per circuit within the retained-buffer budget.
 
 use crate::field::extension::Extendable;
-use crate::fri::oracle::PolynomialBatch;
+use crate::fri::oracle::{ProverOracle, ProverPolynomialBatch};
 use crate::gpu::lde::{from_device_values, upload_columns};
 use crate::gpu::merkle::supported;
 use crate::gpu::shader::{HASH_WORKGROUP, PERMUTATION_BLOCK};
@@ -58,14 +58,14 @@ pub(crate) fn try_partial_products_commitment<
     C: GenericConfig<D, F = F>,
     const D: usize,
 >(
-    wires_commitment: &PolynomialBatch<F, C, D>,
+    wires_commitment: &dyn ProverOracle<F, C, D>,
     betas: &[F],
     gammas: &[F],
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     common_data: &CommonCircuitData<F, D>,
     timing: &mut TimingTree,
     plan: Option<&crate::gpu::policy::ExecutionPlan>,
-) -> Option<PolynomialBatch<F, C, D>> {
+) -> Option<ProverPolynomialBatch<F, C, D>> {
     let config = &common_data.config;
     if !supported::<F, C::Hasher>()
         || !common_data.luts.is_empty()
@@ -83,15 +83,15 @@ pub(crate) fn try_partial_products_commitment<
     if num_chunks != num_prods + 1
         || degree % PERMUTATION_BLOCK as usize != 0
         || prover_data.sigmas.len() != degree
-        || wires_commitment.degree_log != crate::util::log2_strict(degree)
+        || wires_commitment.batch().degree_log != crate::util::log2_strict(degree)
         || betas.len() != num_challenges
         || gammas.len() != num_challenges
     {
         return None;
     }
-    let wires = wires_commitment.device_values.get()?;
+    let wires = wires_commitment.batch().device_values.get()?;
     let ctx = context()?;
-    wires_commitment.device_values.take();
+    wires_commitment.batch().device_values.take();
     let num_blocks = degree / PERMUTATION_BLOCK as usize;
     let num_columns = num_challenges * (1 + num_prods);
     let out = timed!(timing, "gpu: partial products and Z's", {

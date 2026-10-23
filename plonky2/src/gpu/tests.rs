@@ -14,7 +14,7 @@ use super::*;
 use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::{Field, PrimeField64};
-use crate::fri::oracle::{PolynomialBatch, SALT_SIZE};
+use crate::fri::oracle::{PolynomialBatch, ProverOracle, SALT_SIZE};
 use crate::hash::merkle_tree::{MerkleLeaves, MerkleTree};
 use crate::hash::poseidon::{Poseidon, PoseidonHash};
 use crate::util::timing::TimingTree;
@@ -25,6 +25,10 @@ type H = PoseidonHash;
 /// Held by tests that disable the GPU for the whole process, and by tests
 /// that must see it enabled.
 pub(crate) static ENABLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+thread_local! {
+    pub(crate) static COEFFICIENT_READBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 fn ctx() -> Option<std::sync::Arc<GpuContext>> {
     let ctx = context();
@@ -1767,20 +1771,23 @@ fn hybrid_proof_plan_keeps_leaves_and_prepares_quotient_rows() {
     };
     let in_proof = commit(Some(&plan));
     let outside = commit(None);
-    assert!(!outside.merkle_tree.leaves.is_device_resident());
-    assert_eq!(in_proof.merkle_tree.cap, outside.merkle_tree.cap);
+    assert!(!outside.batch.merkle_tree.leaves.is_device_resident());
+    assert_eq!(
+        in_proof.batch.merkle_tree.cap,
+        outside.batch.merkle_tree.cap
+    );
     let step = 2;
     let points = 100..300;
-    in_proof.prepare_lde_values(points.clone(), step);
+    in_proof.batch.prepare_lde_values(points.clone(), step);
     for i in points {
         assert_eq!(
-            in_proof.get_lde_values(i, step),
-            outside.get_lde_values(i, step)
+            in_proof.batch.get_lde_values(i, step),
+            outside.batch.get_lde_values(i, step)
         );
     }
     // The prepared rows came from the mapped buffer, not a full download.
     assert_eq!(
-        in_proof.merkle_tree.leaves.is_device_resident(),
+        in_proof.batch.merkle_tree.leaves.is_device_resident(),
         ctx.mappable
     );
     drop((in_proof, outside, plan));
@@ -1822,27 +1829,27 @@ fn proof_commitments_prepare_query_paths_without_digest_download() {
     };
     let in_proof = commit(Some(&plan));
     let outside = commit(None);
-    let tree = &in_proof.merkle_tree;
+    let tree = &in_proof.batch.merkle_tree;
     assert!(tree.digests.is_device_resident());
     // Outside a proof the context's own policy decides: resident mode (the
     // default on discrete adapters) keeps digests on the device as it keeps leaves.
     assert_eq!(
-        outside.merkle_tree.digests.is_device_resident(),
+        outside.batch.merkle_tree.digests.is_device_resident(),
         ctx.options.retain_leaves(ctx.mappable)
     );
-    assert_eq!(tree.cap, outside.merkle_tree.cap);
+    assert_eq!(tree.cap, outside.batch.merkle_tree.cap);
     let leaves = tree.leaves.len();
     let indices = [0, 7, leaves - 1, 7, leaves / 2];
     tree.digests
         .prepare_paths(&indices, leaves, crate::util::log2_strict(tree.cap.len()));
     for i in indices {
-        assert_eq!(tree.prove(i), outside.merkle_tree.prove(i));
+        assert_eq!(tree.prove(i), outside.batch.merkle_tree.prove(i));
     }
     assert!(tree.digests.is_device_resident());
     // Any other path falls back to the full download, with the same result.
-    assert_eq!(tree.prove(3), outside.merkle_tree.prove(3));
+    assert_eq!(tree.prove(3), outside.batch.merkle_tree.prove(3));
     assert!(!tree.digests.is_device_resident());
-    assert_eq!(tree.digests, outside.merkle_tree.digests);
+    assert_eq!(tree.digests, outside.batch.merkle_tree.digests);
     drop((in_proof, outside, plan));
     data.verify(data.prove(pw).unwrap()).unwrap();
 }
@@ -2265,7 +2272,7 @@ fn memory_policy_proof_and_shutdown(unified: bool) {
             Some(&plan),
             false,
         );
-        assert!(!batch.merkle_tree.leaves.is_device_resident());
+        assert!(!batch.batch.merkle_tree.leaves.is_device_resident());
         drop(batch);
         // Different immutable paths coexist on one context. Resident proofs
         // must not materialize just because the lookup proof needs host leaves.
@@ -2540,13 +2547,67 @@ fn subgroup_values_are_retained_only_for_permutation() {
             false,
             retain_values,
         );
-        assert_eq!(batch.device_values.get().is_some(), retain_values);
+        assert_eq!(batch.batch.device_values.get().is_some(), retain_values);
         assert_eq!(
             ctx.retained.bytes(),
             0,
             "proof buffers are not persistent caches"
         );
-        assert!(batch.polynomials[0].coeffs[0] == F::ONE);
+        assert!(batch.polynomials()[0].coeffs[0] == F::ONE);
+    }
+}
+
+#[test]
+fn proof_local_coefficients_materialize_only_for_cpu_access() {
+    use crate::plonk::config::PoseidonGoldilocksConfig as C;
+    let Ok(ctx) = GpuContext::with_config(&GpuConfig {
+        allow_software: true,
+        ..Default::default()
+    }) else {
+        eprintln!("no compute adapter; skipping");
+        return;
+    };
+    let ctx = Arc::new(ctx);
+    for resident in [false, true] {
+        let values = vec![PolynomialValues::new(
+            (0..512).map(F::from_canonical_usize).collect(),
+        )];
+        let expected = PolynomialBatch::<F, C, 2>::from_values_cpu(
+            values.clone(),
+            2,
+            false,
+            2,
+            &mut TimingTree::default(),
+            None,
+        );
+        let batch = lde::from_values_with_residency::<F, C, 2>(
+            &ctx,
+            values,
+            2,
+            false,
+            2,
+            &mut TimingTree::default(),
+            resident,
+            false,
+        );
+        assert!(!batch.host_coefficients_materialized());
+        assert_eq!(batch.num_polynomials(), 1);
+        assert!(batch.uniform_degree(9));
+        assert!(!batch.uniform_degree(8));
+        assert!(
+            !batch.host_coefficients_materialized(),
+            "shape checks must not download coefficients"
+        );
+        assert_eq!(batch.polynomials(), expected.polynomials);
+        assert!(batch.host_coefficients_materialized());
+        let reads = COEFFICIENT_READBACKS.with(|reads| reads.get());
+        let host = batch.into_host();
+        assert_eq!(COEFFICIENT_READBACKS.with(|reads| reads.get()), reads);
+        assert_eq!(host, expected);
+        assert_eq!(
+            serde_cbor::to_vec(&host).unwrap(),
+            serde_cbor::to_vec(&expected).unwrap()
+        );
     }
 }
 
@@ -2586,10 +2647,21 @@ fn software_gpu_proofs_verify() {
         assert_eq!(plan.path, policy::ExecutionPath::Resident);
         let mut pw = PartialWitness::new();
         pw.set_target(input, F::from_canonical_u64(42)).unwrap();
+        let reads = COEFFICIENT_READBACKS.with(|reads| reads.get());
         data.verify(data.prove(pw.clone()).unwrap()).unwrap();
+        assert_eq!(
+            COEFFICIENT_READBACKS.with(|reads| reads.get()),
+            reads,
+            "GPU proof must not download commitment coefficients"
+        );
         let program = data.compile_witness_program_like(&pw).unwrap();
         data.install_witness_program(program).unwrap();
         data.verify(data.prove(pw).unwrap()).unwrap();
+        assert_eq!(
+            COEFFICIENT_READBACKS.with(|reads| reads.get()),
+            reads,
+            "compiled-witness GPU proof must not download commitment coefficients"
+        );
     }
     assert!(
         context().unwrap().pow_kernel.get().is_none(),
@@ -2680,7 +2752,7 @@ fn small_workloads_do_not_initialize_gpu() {
     .is_none());
     assert!(opening::try_prove_openings::<F, C, 2>(
         &data.common.get_fri_instance(zeta),
-        &[batch; 4],
+        &[batch as &dyn ProverOracle<F, C, 2>; 4],
         &mut challenger,
         &data.common.fri_params,
         None,
