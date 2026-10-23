@@ -17,7 +17,7 @@ use crate::gpu::shader::{
     fft_plan, FFT_INVERSE, FFT_LOAD_BITREV, FFT_SHIFT_IN, FFT_SHIFT_OUT, FFT_TO_OUTPUT,
     FFT_WORKGROUP, HASH_WORKGROUP,
 };
-use crate::gpu::{context, field_words, DeviceBuffer, GpuContext};
+use crate::gpu::{context, DeviceBuffer, GpuContext};
 use crate::hash::hash_types::RichField;
 use crate::hash::merkle_tree::{MerkleCap, MerkleDigests, MerkleLeaves, MerkleTree};
 use crate::plonk::config::GenericConfig;
@@ -271,13 +271,15 @@ fn upload_columns_with_timing<F: PrimeField64>(
                 || {
                     columns.par_iter().enumerate().for_each(|(i, column)| {
                         assert_eq!(column.len() * 8, column_bytes);
-                        let words = field_words(column);
                         let start = (i * column_bytes) as u64;
-                        buffer
+                        let mut view = buffer
                             .slice(start..start + column_bytes as u64)
                             .get_mapped_range_mut()
-                            .expect("mapped upload")
-                            .copy_from_slice(crate::gpu::u64_bytes(&words));
+                            .expect("mapped upload");
+                        let (words, _) = view.slice(..).into_chunks::<8>();
+                        for (word, value) in words.into_iter().zip(*column) {
+                            word.write(value.to_noncanonical_u64().to_le_bytes());
+                        }
                     })
                 },
             );
