@@ -29,12 +29,105 @@ pub(crate) const COMPILE_LOG: &str = "plonky2::witness_program::compile";
 /// No owner or slot yet, in the compiler's dense per-representative arrays.
 const NONE: u32 = u32::MAX;
 
+// One declaration defines both the operation IDs and their checked decoder.
+macro_rules! operation_kinds {
+    ($($kind:ident = $code:literal),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+        #[repr(u8)]
+        enum OperationKind { $($kind = $code),+ }
+        impl OperationKind {
+            const COUNT: usize = [$(Self::$kind),+].len();
+            fn code(self) -> usize { self as usize }
+            fn from_code(code: usize) -> Result<Self> {
+                match code { $($code => Ok(Self::$kind),)+
+                    _ => anyhow::bail!("plan has an unknown operation kind {code}"),
+                }
+            }
+        }
+    };
+}
+
+operation_kinds! {
+    Poseidon = 0,
+    Arithmetic = 1,
+    Copy = 2,
+    Constant = 3,
+    Equality = 4,
+    ExtensionArithmetic = 5,
+    ExtensionMultiply = 6,
+    RandomAccess = 7,
+    BaseSplit = 8,
+    WireSplit = 9,
+    LowHigh = 10,
+    Reducing = 11,
+    ReducingExtension = 12,
+    TableLookup = 13,
+    ExtensionQuotient = 14,
+    EcAddXu = 15,
+    PoseidonMds = 16,
+    RandomValue = 17,
+    ConditionalZero = 18,
+    LtMask = 19,
+    QuinticMultiply = 20,
+    QuinticQuotient = 21,
+    EcAddHomogOffset = 22,
+    EcScalarMul = 23,
+    CosetInterpolation = 24,
+    Comparison = 25,
+}
+use OperationKind as Kind;
+
+#[derive(Clone, Debug)]
+enum GroupArgument {
+    Coefficients(u32),
+    Parameter(u32),
+}
+
+impl GroupArgument {
+    fn word(&self) -> u32 {
+        match *self {
+            Self::Coefficients(word) | Self::Parameter(word) => word,
+        }
+    }
+}
+
+impl OperationKind {
+    fn argument(self, word: u32) -> GroupArgument {
+        match self {
+            Self::RandomAccess
+            | Self::BaseSplit
+            | Self::WireSplit
+            | Self::LowHigh
+            | Self::Reducing
+            | Self::ReducingExtension
+            | Self::LtMask => GroupArgument::Parameter(word),
+            _ => GroupArgument::Coefficients(word),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Group {
-    kind: usize,
+    kind: Kind,
     count: u32,
     targets_offset: u32,
-    coefficients_offset: u32,
+    argument: GroupArgument,
+}
+
+impl Group {
+    fn coefficients_offset(&self) -> Result<u32> {
+        match self.argument {
+            GroupArgument::Coefficients(offset) => Ok(offset),
+            GroupArgument::Parameter(_) => anyhow::bail!("operation has an immediate parameter"),
+        }
+    }
+
+    fn parameter(&self) -> Result<u32> {
+        match self.argument {
+            GroupArgument::Parameter(value) => Ok(value),
+            GroupArgument::Coefficients(_) => anyhow::bail!("operation has coefficient storage"),
+        }
+    }
 }
 
 /// Immutable compiled topology, reused across executions.
@@ -225,7 +318,7 @@ impl ProgramCache {
 struct Lane {
     index: u32,
     /// Executor kind number.
-    kind: usize,
+    kind: Kind,
     /// Shape parameter, part of the grouping key.
     parameter: u32,
     /// Operation name, for errors.
@@ -239,38 +332,38 @@ struct Lane {
 impl Lane {
     fn new(index: u32, op: &Op, inputs: Vec<usize>, outputs: Vec<usize>) -> Self {
         let kind = match op {
-            Op::Poseidon { .. } => 0,
-            Op::Arithmetic { .. } => 1,
-            Op::Copy { .. } => 2,
-            Op::Constant { .. } => 3,
-            Op::Equality { .. } => 4,
-            Op::ExtensionArithmetic { .. } => 5,
-            Op::ExtensionMultiply { .. } => 6,
-            Op::RandomAccess { .. } => 7,
-            Op::BaseSplit { .. } => 8,
-            Op::WireSplit { .. } => 9,
-            Op::LowHigh { .. } => 10,
+            Op::Poseidon { .. } => Kind::Poseidon,
+            Op::Arithmetic { .. } => Kind::Arithmetic,
+            Op::Copy { .. } => Kind::Copy,
+            Op::Constant { .. } => Kind::Constant,
+            Op::Equality { .. } => Kind::Equality,
+            Op::ExtensionArithmetic { .. } => Kind::ExtensionArithmetic,
+            Op::ExtensionMultiply { .. } => Kind::ExtensionMultiply,
+            Op::RandomAccess { .. } => Kind::RandomAccess,
+            Op::BaseSplit { .. } => Kind::BaseSplit,
+            Op::WireSplit { .. } => Kind::WireSplit,
+            Op::LowHigh { .. } => Kind::LowHigh,
             Op::Reducing {
                 extension_coeffs: false,
                 ..
-            } => 11,
+            } => Kind::Reducing,
             Op::Reducing {
                 extension_coeffs: true,
                 ..
-            } => 12,
-            Op::TableLookup { .. } => 13,
-            Op::ExtensionQuotient { .. } => 14,
-            Op::EcAddXu { .. } => 15,
-            Op::PoseidonMds { .. } => 16,
-            Op::RandomValue { .. } => 17,
-            Op::ConditionalZero { .. } => 18,
-            Op::LtMask { .. } => 19,
-            Op::QuinticMultiply { .. } => 20,
-            Op::QuinticQuotient { .. } => 21,
-            Op::EcAddHomogOffset { .. } => 22,
-            Op::EcScalarMul { .. } => 23,
-            Op::CosetInterpolation { .. } => 24,
-            Op::Comparison { .. } => 25,
+            } => Kind::ReducingExtension,
+            Op::TableLookup { .. } => Kind::TableLookup,
+            Op::ExtensionQuotient { .. } => Kind::ExtensionQuotient,
+            Op::EcAddXu { .. } => Kind::EcAddXu,
+            Op::PoseidonMds { .. } => Kind::PoseidonMds,
+            Op::RandomValue { .. } => Kind::RandomValue,
+            Op::ConditionalZero { .. } => Kind::ConditionalZero,
+            Op::LtMask { .. } => Kind::LtMask,
+            Op::QuinticMultiply { .. } => Kind::QuinticMultiply,
+            Op::QuinticQuotient { .. } => Kind::QuinticQuotient,
+            Op::EcAddHomogOffset { .. } => Kind::EcAddHomogOffset,
+            Op::EcScalarMul { .. } => Kind::EcScalarMul,
+            Op::CosetInterpolation { .. } => Kind::CosetInterpolation,
+            Op::Comparison { .. } => Kind::Comparison,
         };
         let parameter = match op {
             Op::BaseSplit { limb_bits, .. } => *limb_bits,
@@ -639,7 +732,7 @@ impl RegionProgram {
             by_depth[depth[i]].push(i);
         }
         for selected in by_depth {
-            let mut by_kind = BTreeMap::<(usize, usize, usize, u32), Vec<usize>>::new();
+            let mut by_kind = BTreeMap::<(Kind, usize, usize, u32), Vec<usize>>::new();
             for &i in &selected {
                 let lane = &nodes[i];
                 by_kind
@@ -678,18 +771,17 @@ impl RegionProgram {
                         targets.push(slot);
                     }
                 }
-                // For variable-size random access, this instruction word is
-                // the list size rather than an offset into coefficients.
+                // Immediate shape parameters are distinct from coefficient offsets.
                 let coefficient_offset = match kind {
-                    7 => input_len - 1,
-                    8 => (output_len << 8) | parameter as usize,
-                    9 => (output_len << 8) | parameter as usize,
-                    10 => parameter as usize,
-                    11 | 12 => parameter as usize,
-                    19 => output_len,
+                    Kind::RandomAccess => input_len - 1,
+                    Kind::BaseSplit => (output_len << 8) | parameter as usize,
+                    Kind::WireSplit => (output_len << 8) | parameter as usize,
+                    Kind::LowHigh => parameter as usize,
+                    Kind::Reducing | Kind::ReducingExtension => parameter as usize,
+                    Kind::LtMask => output_len,
                     _ => coefficients.len(),
                 };
-                if kind == 17 {
+                if kind == Kind::RandomValue {
                     for _ in &indices {
                         coefficients.push(random_count as u64);
                         random_count = random_count
@@ -710,7 +802,7 @@ impl RegionProgram {
                     kind,
                     count: u32::try_from(count)?,
                     targets_offset: u32::try_from(target_offset)?,
-                    coefficients_offset: u32::try_from(coefficient_offset)?,
+                    argument: kind.argument(u32::try_from(coefficient_offset)?),
                 });
             }
             groups.push(layer_groups);

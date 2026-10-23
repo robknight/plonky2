@@ -22,7 +22,7 @@ use core::hash::{Hash, Hasher};
 use anyhow::{ensure, Context, Result};
 use plonky2_maybe_rayon::*;
 
-use super::{Group, RegionProgram};
+use super::{Group, Kind, RegionProgram};
 use crate::field::extension::Extendable;
 use crate::hash::hash_types::RichField;
 use crate::iop::generator::WitnessGeneratorRef;
@@ -233,10 +233,10 @@ pub(crate) fn encode(program: &RegionProgram, key: &PlanKey) -> Vec<u8> {
     for layer in &program.groups {
         w.usize(layer.len());
         for group in layer {
-            w.usize(group.kind);
+            w.usize(group.kind.code());
             w.u32(group.count);
             w.u32(group.targets_offset);
-            w.u32(group.coefficients_offset);
+            w.u32(group.argument.word());
         }
     }
     w.deltas(program.targets.iter().map(|&t| t as u64));
@@ -291,11 +291,12 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(PlanKey, RegionProgram)> {
         .map(|_| {
             (0..r.len(20)?)
                 .map(|_| {
+                    let kind = Kind::from_code(r.usize()?)?;
                     Ok(Group {
-                        kind: r.usize()?,
+                        kind,
                         count: r.u32()?,
                         targets_offset: r.u32()?,
-                        coefficients_offset: r.u32()?,
+                        argument: kind.argument(r.u32()?),
                     })
                 })
                 .collect::<Result<Vec<_>>>()
@@ -319,9 +320,6 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(PlanKey, RegionProgram)> {
         roots.len() == root_slots.len() && representatives.len() as u64 <= state_slots as u64,
         "plan slot layout is inconsistent"
     );
-    for group in groups.iter().flatten() {
-        ensure!(group.kind < 26, "plan has an unknown operation kind");
-    }
     for &slot in &targets {
         ensure!(slot < state_slots, "plan target slot out of range");
     }
@@ -342,11 +340,11 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(PlanKey, RegionProgram)> {
     let mut random_seen = vec![false; random_count as usize];
     for group in groups.iter().flatten() {
         ensure!(group.count > 0, "plan group is empty");
-        if group.kind != 17 {
+        if group.kind != Kind::RandomValue {
             continue;
         }
         for k in 0..group.count as u64 {
-            let index = (group.coefficients_offset as u64)
+            let index = (group.coefficients_offset()? as u64)
                 .checked_add(k)
                 .and_then(|i| coefficients.get(i as usize).copied())
                 .ok_or_else(|| anyhow::anyhow!("plan random coefficient out of range"))?;

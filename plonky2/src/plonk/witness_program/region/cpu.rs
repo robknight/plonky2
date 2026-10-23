@@ -16,10 +16,10 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{ensure, Result};
 use plonky2_maybe_rayon::*;
 
-use super::RegionProgram;
+use super::{Kind, RegionProgram};
 use crate::field::extension::quintic::QuinticExtension;
 use crate::field::extension::Extendable;
 use crate::field::goldilocks_field::GoldilocksField as G;
@@ -41,11 +41,14 @@ impl RegionProgram {
     pub fn random_slots(&self) -> Vec<u32> {
         let mut out = vec![u32::MAX; self.random_count as usize];
         for group in self.groups.iter().flatten() {
-            if group.kind != 17 {
+            if group.kind != Kind::RandomValue {
                 continue;
             }
             for k in 0..group.count {
-                let index = self.coefficients[(group.coefficients_offset + k) as usize] as usize;
+                let index = self.coefficients[(group
+                    .coefficients_offset()
+                    .expect("random group coefficient storage")
+                    + k) as usize] as usize;
                 out[index] = self.targets[(group.targets_offset + k) as usize];
             }
         }
@@ -163,13 +166,7 @@ impl RegionProgram {
             let chunks = group.count.div_ceil(chunk);
             (0..chunks).into_par_iter().try_for_each(|c| {
                 for k in c * chunk..((c + 1) * chunk).min(group.count) {
-                    executor.step(
-                        group.kind,
-                        k,
-                        group.count,
-                        group.targets_offset,
-                        group.coefficients_offset,
-                    )?;
+                    executor.step(group, k)?;
                 }
                 Ok::<(), anyhow::Error>(())
             })
@@ -179,13 +176,13 @@ impl RegionProgram {
         {
             // Diagnostic: groups run one at a time so each kind's wall time
             // is attributable; lanes stay parallel.
-            let mut by_kind = vec![(Duration::ZERO, 0u64, 0u64); 26];
+            let mut by_kind = vec![(Duration::ZERO, 0u64, 0u64); Kind::COUNT];
             let started = Instant::now();
             for layer in &self.groups {
                 for group in layer {
                     let group_started = Instant::now();
                     run_group(group)?;
-                    let entry = &mut by_kind[group.kind];
+                    let entry = &mut by_kind[group.kind.code()];
                     entry.0 += group_started.elapsed();
                     entry.1 += 1;
                     entry.2 += group.count as u64;
@@ -254,10 +251,15 @@ impl Drop for Executor<'_> {
 
 /// Lanes per Rayon task. Expensive kinds split to single lanes; cheap
 /// kinds are batched so task overhead stays below the arithmetic.
-fn lane_chunk(kind: usize) -> u32 {
+fn lane_chunk(kind: Kind) -> u32 {
     match kind {
-        0 | 15 | 16 | 22 | 23 | 24 => 1,
-        13 | 20 | 21 | 25 => 16,
+        Kind::Poseidon
+        | Kind::EcAddXu
+        | Kind::PoseidonMds
+        | Kind::EcAddHomogOffset
+        | Kind::EcScalarMul
+        | Kind::CosetInterpolation => 1,
+        Kind::TableLookup | Kind::QuinticMultiply | Kind::QuinticQuotient | Kind::Comparison => 16,
         _ => 512,
     }
 }
@@ -464,10 +466,14 @@ impl Executor<'_> {
         Ok(())
     }
 
-    fn step(&self, kind: usize, k: u32, count: u32, offset: u32, co: u32) -> Result<()> {
+    fn step(&self, group: &super::Group, k: u32) -> Result<()> {
+        let kind = group.kind;
+        let count = group.count;
+        let offset = group.targets_offset;
         match kind {
-            0 => self.step_poseidon(k, count, offset),
-            1 => {
+            Kind::Poseidon => self.step_poseidon(k, count, offset),
+            Kind::Arithmetic => {
+                let co = group.coefficients_offset()?;
                 let x = self.input(offset, 0, count, k)?;
                 let y = self.input(offset, 1, count, k)?;
                 let z = self.input(offset, 2, count, k)?;
@@ -475,15 +481,16 @@ impl Executor<'_> {
                 let c1 = field(self.coefficient(co, 1, count, k)?);
                 self.output(offset, 3, count, k, x * y * c0 + z * c1)
             }
-            2 => {
+            Kind::Copy => {
                 let x = self.input(offset, 0, count, k)?;
                 self.output(offset, 1, count, k, x)
             }
-            3 => {
+            Kind::Constant => {
+                let co = group.coefficients_offset()?;
                 let value = field(self.coefficient(co, 0, count, k)?);
                 self.output(offset, 0, count, k, value)
             }
-            4 => {
+            Kind::Equality => {
                 let x = canonical(self.input(offset, 0, count, k)?);
                 let y = canonical(self.input(offset, 1, count, k)?);
                 let same = x == y;
@@ -492,7 +499,8 @@ impl Executor<'_> {
                 self.output(offset, 2, count, k, flag)?;
                 self.output(offset, 3, count, k, inverse)
             }
-            5 => {
+            Kind::ExtensionArithmetic => {
+                let co = group.coefficients_offset()?;
                 let a = [
                     self.input(offset, 0, count, k)?,
                     self.input(offset, 1, count, k)?,
@@ -511,7 +519,8 @@ impl Executor<'_> {
                 self.output(offset, 6, count, k, product[0] * c0 + z[0] * c1)?;
                 self.output(offset, 7, count, k, product[1] * c0 + z[1] * c1)
             }
-            6 => {
+            Kind::ExtensionMultiply => {
+                let co = group.coefficients_offset()?;
                 let a = [
                     self.input(offset, 0, count, k)?,
                     self.input(offset, 1, count, k)?,
@@ -525,8 +534,8 @@ impl Executor<'_> {
                 self.output(offset, 4, count, k, product[0] * c)?;
                 self.output(offset, 5, count, k, product[1] * c)
             }
-            7 => {
-                // The coefficient word is the list size.
+            Kind::RandomAccess => {
+                let co = group.parameter()?;
                 let vec_size = co;
                 let access = self.input(offset, 0, count, k)?.to_canonical_u64();
                 ensure!(
@@ -548,7 +557,8 @@ impl Executor<'_> {
                 }
                 Ok(())
             }
-            8 => {
+            Kind::BaseSplit => {
+                let co = group.parameter()?;
                 let limb_bits = co & 255;
                 let limbs = co >> 8;
                 let mask = (1u64 << limb_bits) - 1;
@@ -561,7 +571,8 @@ impl Executor<'_> {
                 ensure!(word == 0, "invalid arithmetic: base split overflow");
                 Ok(())
             }
-            9 => {
+            Kind::WireSplit => {
+                let co = group.parameter()?;
                 let width = co & 255;
                 let chunks = co >> 8;
                 let mut word = self.input(offset, 0, count, k)?.to_canonical_u64();
@@ -582,7 +593,8 @@ impl Executor<'_> {
                 ensure!(word == 0, "invalid arithmetic: wire split overflow");
                 Ok(())
             }
-            10 => {
+            Kind::LowHigh => {
+                let co = group.parameter()?;
                 let width = co;
                 let word = self.input(offset, 0, count, k)?.to_canonical_u64();
                 let (low, high) = if width == 0 {
@@ -595,8 +607,9 @@ impl Executor<'_> {
                 self.output(offset, 1, count, k, G::from_canonical_u64(low))?;
                 self.output(offset, 2, count, k, G::from_canonical_u64(high))
             }
-            11 | 12 => {
-                let extension_coeffs = kind == 12;
+            Kind::Reducing | Kind::ReducingExtension => {
+                let co = group.parameter()?;
+                let extension_coeffs = kind == Kind::ReducingExtension;
                 let num_coeffs = co;
                 let alpha = [
                     self.input(offset, 0, count, k)?,
@@ -631,7 +644,8 @@ impl Executor<'_> {
                 }
                 Ok(())
             }
-            13 => {
+            Kind::TableLookup => {
+                let co = group.coefficients_offset()?;
                 let metadata = co;
                 let low = self.input(offset, 0, count, k)?;
                 let high = self.input(offset, 1, count, k)?;
@@ -656,7 +670,7 @@ impl Executor<'_> {
                 }
                 Ok(())
             }
-            14 => {
+            Kind::ExtensionQuotient => {
                 let n0 = self.input(offset, 0, count, k)?;
                 let n1 = self.input(offset, 1, count, k)?;
                 let d0 = self.input(offset, 2, count, k)?;
@@ -669,7 +683,8 @@ impl Executor<'_> {
                 self.output(offset, 4, count, k, q0)?;
                 self.output(offset, 5, count, k, q1)
             }
-            15 => {
+            Kind::EcAddXu => {
+                let co = group.coefficients_offset()?;
                 let yx = self.q_input(offset, 6, count, k)?;
                 let yu = self.q_input(offset, 11, count, k)?;
                 let mut px = self.q_input(offset, 16, count, k)?;
@@ -698,7 +713,7 @@ impl Executor<'_> {
                 }
                 Ok(())
             }
-            16 => {
+            Kind::PoseidonMds => {
                 let mut first = [G::ZERO; SPONGE_WIDTH];
                 let mut second = [G::ZERO; SPONGE_WIDTH];
                 for i in 0..SPONGE_WIDTH as u32 {
@@ -713,7 +728,8 @@ impl Executor<'_> {
                 }
                 Ok(())
             }
-            17 => {
+            Kind::RandomValue => {
+                let co = group.coefficients_offset()?;
                 let index = self.coefficient(co, 0, count, k)?;
                 let value = *self
                     .random
@@ -722,7 +738,7 @@ impl Executor<'_> {
                 ensure!(value < G::ORDER, "random value {value} is not canonical");
                 self.output(offset, 0, count, k, G::from_canonical_u64(value))
             }
-            18 => {
+            Kind::ConditionalZero => {
                 let denominator = canonical(self.input(offset, 0, count, k)?);
                 let numerator = self.input(offset, 1, count, k)?;
                 let quotient = if denominator != G::ZERO {
@@ -732,7 +748,8 @@ impl Executor<'_> {
                 };
                 self.output(offset, 2, count, k, quotient)
             }
-            19 => {
+            Kind::LtMask => {
+                let co = group.parameter()?;
                 let length = co;
                 let n = self.input(offset, 0, count, k)?.to_canonical_u64();
                 for j in 0..length {
@@ -741,18 +758,19 @@ impl Executor<'_> {
                 }
                 Ok(())
             }
-            20 => {
+            Kind::QuinticMultiply => {
                 let lhs = self.q_input(offset, 0, count, k)?;
                 let rhs = self.q_input(offset, 5, count, k)?;
                 self.q_output(offset, 10, count, k, lhs * rhs)
             }
-            21 => {
+            Kind::QuinticQuotient => {
                 let numerator = self.q_input(offset, 0, count, k)?;
                 let denominator = self.q_input(offset, 5, count, k)?;
                 let quotient = numerator * q_inverse(denominator)?;
                 self.q_output(offset, 10, count, k, quotient)
             }
-            22 => {
+            Kind::EcAddHomogOffset => {
+                let co = group.coefficients_offset()?;
                 let b1 = field(self.coefficient(co, 0, count, k)?);
                 let mut h = q_add_homog(
                     self.q_input(offset, 0, count, k)?,
@@ -768,7 +786,8 @@ impl Executor<'_> {
                 }
                 Ok(())
             }
-            23 => {
+            Kind::EcScalarMul => {
+                let co = group.coefficients_offset()?;
                 let px = self.q_input(offset, 0, count, k)?;
                 let pu = self.q_input(offset, 5, count, k)?;
                 let words = self.coefficient(co, 0, count, k)? as u32;
@@ -785,7 +804,8 @@ impl Executor<'_> {
                 self.q_output(offset, 10, count, k, result[0])?;
                 self.q_output(offset, 15, count, k, result[1])
             }
-            24 => {
+            Kind::CosetInterpolation => {
+                let co = group.coefficients_offset()?;
                 let degree = self.coefficient(co, 0, count, k)? as u32;
                 let n = self.coefficient(co, 1, count, k)? as u32;
                 let shift = self.input(offset, 0, count, k)?;
@@ -828,7 +848,8 @@ impl Executor<'_> {
                 self.output(offset, final_out, count, k, e[0])?;
                 self.output(offset, final_out + 1, count, k, e[1])
             }
-            25 => {
+            Kind::Comparison => {
+                let co = group.coefficients_offset()?;
                 let n = self.coefficient(co, 0, count, k)? as u32;
                 let width = self.coefficient(co, 1, count, k)? as u32;
                 ensure!(
@@ -884,7 +905,6 @@ impl Executor<'_> {
                 }
                 Ok(())
             }
-            _ => bail!("unknown operation kind {kind}"),
         }
     }
 
@@ -1638,7 +1658,7 @@ pub(crate) mod tests {
             .groups
             .iter()
             .flatten()
-            .find(|g| g.kind == 17)
+            .find(|g| g.kind == Kind::RandomValue)
             .cloned()
             .expect("blinded circuit has random writers");
         tampered.targets[group.targets_offset as usize] = tampered.state_slots;
@@ -1698,11 +1718,17 @@ pub(crate) mod tests {
             .groups
             .iter()
             .flatten()
-            .find(|g| g.kind == 17 && g.count >= 2)
+            .find(|g| g.kind == Kind::RandomValue && g.count >= 2)
             .cloned()
             .expect("a random group with two lanes");
-        let first = duplicate.coefficients[group.coefficients_offset as usize];
-        duplicate.coefficients[group.coefficients_offset as usize + 1] = first;
+        let first = duplicate.coefficients[group
+            .coefficients_offset()
+            .expect("random group coefficient storage")
+            as usize];
+        duplicate.coefficients[group
+            .coefficients_offset()
+            .expect("random group coefficient storage") as usize
+            + 1] = first;
         let error = plan_bytes::decode(&plan_bytes::encode(&duplicate, &key))
             .unwrap_err()
             .to_string();
