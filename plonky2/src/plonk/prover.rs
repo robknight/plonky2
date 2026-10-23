@@ -300,6 +300,13 @@ where
         }
     };
 
+    // CPU quotient evaluation reads Merkle rows, not the column-major LDE.
+    // Release that duplicate before constructing the permutation commitment.
+    #[cfg(feature = "gpu")]
+    if gpu_plan.prepared.is_none() {
+        drop(wires_commitment.batch.device.take());
+    }
+
     let mut challenger = Challenger::<F, C::Hasher>::new();
 
     // Observe the FRI config
@@ -426,6 +433,16 @@ where
         }
     };
 
+    #[cfg(feature = "gpu")]
+    if gpu_plan.prepared.is_none() {
+        drop(
+            partial_products_zs_and_lookup_commitment
+                .batch
+                .device
+                .take(),
+        );
+    }
+
     challenger.observe_cap::<C::Hasher>(
         &partial_products_zs_and_lookup_commitment
             .batch
@@ -493,6 +510,10 @@ where
         }
     };
 
+    // The quotient commitment is opened from its coefficients and queried
+    // through its Merkle leaves; its LDE has no subsequent computation.
+    #[cfg(feature = "gpu")]
+    drop(quotient_polys_commitment.batch.device.take());
     challenger.observe_cap::<C::Hasher>(&quotient_polys_commitment.batch.merkle_tree.cap);
 
     let zeta = challenger.get_extension_challenge::<D>();
