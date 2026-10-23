@@ -48,6 +48,47 @@ pub(crate) fn audit_coefficient_transfer<T>(
     result
 }
 
+/// The device copy of a batch's coefficients (column-major, one polynomial
+/// after another): the one its GPU commitment kept, or an upload of its
+/// polynomials, which stays cached in the batch within the retained-bytes
+/// limit (the circuit's fixed commitment is the batch that gets here).
+pub(crate) fn device_coefficients<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    ctx: &GpuContext,
+    batch: &PolynomialBatch<F, C, D>,
+    stage: &str,
+) -> DeviceBuffer {
+    if let Some(buffer) = batch.device_coeffs.get() {
+        if crate::gpu::lde::coefficient_audit_enabled() {
+            eprintln!(
+                "GPU_COEFFICIENT_CACHE hit=true columns={} len={}",
+                batch.polynomials.len(),
+                1usize << batch.degree_log
+            );
+        }
+        return buffer;
+    }
+    let buffer = crate::gpu::lde::audit_coefficient_transfer(
+        "upload",
+        stage,
+        batch.polynomials.len(),
+        1usize << batch.degree_log,
+        || {
+            let columns = batch
+                .polynomials
+                .iter()
+                .map(|p| p.coeffs.as_slice())
+                .collect::<Vec<_>>();
+            upload_columns(ctx, "coeffs", &columns)
+        },
+    );
+    batch.device_coeffs.set_if_within_limit(ctx, buffer.clone());
+    buffer
+}
+
 /// One batched NTT over `columns` columns of `2^log_n` elements.
 pub(crate) struct FftJob<'a> {
     pub log_n: u32,

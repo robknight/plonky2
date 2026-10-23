@@ -1550,20 +1550,7 @@ fn device_lde<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D:
     let degree = 1usize << batch.degree_log;
     let n = degree << batch.rate_bits;
     let columns = batch.polynomials.len();
-    let coeffs = crate::gpu::lde::audit_coefficient_transfer(
-        "upload",
-        "quotient_lde",
-        columns,
-        degree,
-        || {
-            let words = batch
-                .polynomials
-                .par_iter()
-                .flat_map_iter(|p| p.coeffs.iter().map(|x| x.to_noncanonical_u64()))
-                .collect::<Vec<_>>();
-            ctx.upload("coeffs", &words)
-        },
-    );
+    let coeffs = crate::gpu::lde::device_coefficients(ctx, batch, "quotient_lde");
     let lde = ctx.storage("lde", (columns * n * 8) as u64);
     let mut encoder = ctx.encoder("lde");
     fft(

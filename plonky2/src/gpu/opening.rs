@@ -23,7 +23,7 @@ use crate::fri::prover::{fri_proof_of_work, fri_prover_query_rounds};
 use crate::fri::structure::FriInstanceInfo;
 use crate::fri::FriParams;
 use crate::gpu::fri::{commit_phase_fits, committed_trees, read_extension};
-use crate::gpu::lde::{fft, upload_columns, FftJob};
+use crate::gpu::lde::{device_coefficients, fft, FftJob};
 use crate::gpu::merkle::supported;
 use crate::gpu::shader::{fft_plan, COMBINE_BLOCK, HASH_WORKGROUP};
 use crate::gpu::{context, field_supported, DeviceBuffer, GpuContext};
@@ -37,42 +37,6 @@ use crate::util::timing::TimingTree;
 
 /// The kernels take at most this many oracles, batches and points.
 const MAX_ORACLES: usize = 4;
-
-/// The device copy of a batch's coefficients (column-major, one polynomial
-/// after another): the one its GPU commitment kept, or an upload of its
-/// polynomials, which stays cached in the batch within the retained-bytes
-/// limit (the circuit's fixed commitment is the batch that gets here).
-fn device_coeffs<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
-    ctx: &GpuContext,
-    batch: &PolynomialBatch<F, C, D>,
-) -> DeviceBuffer {
-    if let Some(buffer) = batch.device_coeffs.get() {
-        if crate::gpu::lde::coefficient_audit_enabled() {
-            eprintln!(
-                "GPU_COEFFICIENT_CACHE hit=true columns={} len={}",
-                batch.polynomials.len(),
-                1usize << batch.degree_log
-            );
-        }
-        return buffer;
-    }
-    let buffer = crate::gpu::lde::audit_coefficient_transfer(
-        "upload",
-        "opening",
-        batch.polynomials.len(),
-        1usize << batch.degree_log,
-        || {
-            let columns = batch
-                .polynomials
-                .iter()
-                .map(|p| p.coeffs.as_slice())
-                .collect::<Vec<_>>();
-            upload_columns(ctx, "coeffs", &columns)
-        },
-    );
-    batch.device_coeffs.set_if_within_limit(ctx, buffer.clone());
-    buffer
-}
 
 /// A polynomial as `(oracle, column)`, packed as the kernels' `vec2<u32>`,
 /// with the index of the point it is evaluated at in the high half of the
@@ -192,7 +156,7 @@ pub(crate) fn try_opening_set<
     }
     let coeffs = batches
         .iter()
-        .map(|b| device_coeffs(ctx, b))
+        .map(|b| device_coefficients(ctx, b, "opening"))
         .collect::<Vec<_>>();
     // Every polynomial at zeta, then the Z's at g * zeta, in one dispatch.
     let num_zs = zs_partial_products_lookup_commitment.polynomials.len();
@@ -328,7 +292,7 @@ pub(crate) fn try_prove_openings<
         let params = ctx.uniform("combine params", &params);
         let coeff_buffers = oracles
             .iter()
-            .map(|o| device_coeffs(ctx, o))
+            .map(|o| device_coefficients(ctx, o, "opening"))
             .collect::<Vec<_>>();
         let terms = ctx.upload("combination terms", &terms);
         let alphas = ctx.upload("alpha powers", &alphas);

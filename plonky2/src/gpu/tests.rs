@@ -2564,3 +2564,39 @@ fn software_gpu_proofs_verify() {
     data.install_witness_program(program).unwrap();
     data.verify(data.prove(pw).unwrap()).unwrap();
 }
+
+#[test]
+fn quotient_and_openings_share_the_fixed_coefficient_upload() {
+    use crate::plonk::config::PoseidonGoldilocksConfig as C;
+    let config = GpuConfig {
+        allow_software: true,
+        ..Default::default()
+    };
+    let Ok(ctx) = GpuContext::with_config(&config) else {
+        eprintln!("no compute adapter; skipping");
+        return;
+    };
+    let batch = PolynomialBatch::<F, C, 2>::from_coeffs_cpu(
+        vec![PolynomialCoeffs::new(vec![F::ONE; 256])],
+        2,
+        false,
+        2,
+        &mut TimingTree::default(),
+        None,
+    );
+    let first = lde::device_coefficients(&ctx, &batch, "quotient_lde");
+    let bytes = ctx.retained.bytes();
+    assert_eq!(bytes, first.size());
+    let cloned = batch.clone();
+    assert_eq!(
+        ctx.retained.bytes(),
+        bytes,
+        "clones share the allocation reservation"
+    );
+    let second = lde::device_coefficients(&ctx, &cloned, "opening");
+    assert_eq!(*first, *second);
+    drop(batch);
+    assert_eq!(ctx.retained.bytes(), bytes);
+    drop(cloned);
+    assert_eq!(ctx.retained.bytes(), 0);
+}
