@@ -2626,12 +2626,13 @@ fn software_gpu_proofs_verify() {
     })
     .unwrap();
     assert!(context().is_some(), "a Vulkan adapter is required");
-    for blinded in [false, true] {
+    for (blinded, routed) in [(false, 80), (true, 80), (false, 129)] {
         let mut config = if blinded {
             CircuitConfig::standard_recursion_zk_config()
         } else {
             CircuitConfig::standard_recursion_config()
         };
+        config.num_routed_wires = routed;
         config.security_bits = 1;
         config.fri_config.num_query_rounds = 2;
         config.fri_config.proof_of_work_bits = 0;
@@ -2643,6 +2644,10 @@ fn software_gpu_proofs_verify() {
         }
         builder.register_public_inputs(&state);
         let data = builder.build::<C>();
+        assert_eq!(
+            permutation::supported_circuit(&data.prover_only, &data.common),
+            routed <= 128
+        );
         let plan = policy::ExecutionPlan::new(&data.common, &data.prover_only);
         assert_eq!(plan.path, policy::ExecutionPath::Resident);
         let mut pw = PartialWitness::new();

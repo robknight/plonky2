@@ -1203,7 +1203,7 @@ pub(crate) fn generate_wires_with<
         .collect::<Result<Vec<_>>>()?;
     // A device destination exists only with the `gpu` feature.
     #[cfg(feature = "gpu")]
-    let ctx = if allow_device {
+    let ctx = if allow_device && crate::gpu::permutation::supported_circuit(prover, common) {
         crate::gpu::lde::applicable::<F, C, D>(
             num_wires,
             degree,

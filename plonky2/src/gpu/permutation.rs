@@ -50,6 +50,26 @@ fn device_sigmas<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const
     buffer
 }
 
+/// Circuit-only eligibility, checked before retaining or uploading wire values.
+pub(crate) fn supported_circuit<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    prover: &ProverOnlyCircuitData<F, C, D>,
+    common: &CommonCircuitData<F, D>,
+) -> bool {
+    let routed = common.config.num_routed_wires;
+    supported::<F, C::Hasher>()
+        && common.luts.is_empty()
+        && common.num_lookup_polys == 0
+        && (1..=MAX_ROUTED).contains(&routed)
+        && common.quotient_degree_factor > 0
+        && routed.div_ceil(common.quotient_degree_factor) == common.num_partial_products + 1
+        && common.degree() % PERMUTATION_BLOCK as usize == 0
+        && prover.sigmas.len() == common.degree()
+}
+
 /// The commitment to the Z's and partial products, computed on the device
 /// from the wires commitment's values, or `None` if the GPU does not take
 /// it (lookups, no device values, or limits).
@@ -67,12 +87,7 @@ pub(crate) fn try_partial_products_commitment<
     plan: Option<&crate::gpu::policy::ExecutionPlan>,
 ) -> Option<ProverPolynomialBatch<F, C, D>> {
     let config = &common_data.config;
-    if !supported::<F, C::Hasher>()
-        || !common_data.luts.is_empty()
-        || common_data.num_lookup_polys != 0
-        || config.num_routed_wires > MAX_ROUTED
-        || config.num_routed_wires == 0
-    {
+    if !supported_circuit(prover_data, common_data) {
         return None;
     }
     let degree = common_data.degree();
@@ -80,10 +95,7 @@ pub(crate) fn try_partial_products_commitment<
     let num_prods = common_data.num_partial_products;
     let max_degree = common_data.quotient_degree_factor;
     let num_chunks = config.num_routed_wires.div_ceil(max_degree);
-    if num_chunks != num_prods + 1
-        || degree % PERMUTATION_BLOCK as usize != 0
-        || prover_data.sigmas.len() != degree
-        || wires_commitment.batch().degree_log != crate::util::log2_strict(degree)
+    if wires_commitment.batch().degree_log != crate::util::log2_strict(degree)
         || betas.len() != num_challenges
         || gammas.len() != num_challenges
     {

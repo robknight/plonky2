@@ -292,6 +292,8 @@ where
     // fallback so it never depends on the global context mid-proof.
     #[cfg(feature = "gpu")]
     let resident_ctx = resident.as_ref().map(|resident| resident.ctx.clone());
+    #[cfg(feature = "gpu")]
+    let retain_values = crate::gpu::permutation::supported_circuit(prover_data, common_data);
     let mut wires_commitment = {
         #[cfg(feature = "gpu-profiling")]
         let _capture = crate::gpu::capture::Capture::wires();
@@ -310,7 +312,7 @@ where
                     config.fri_config.cap_height,
                     timing,
                     gpu_plan.retain_leaves(),
-                    true
+                    retain_values
                 )
             )
         });
@@ -331,7 +333,7 @@ where
                     #[cfg(feature = "gpu")]
                     Some(&gpu_plan),
                     #[cfg(feature = "gpu")]
-                    true
+                    retain_values
                 )
             ),
         }
