@@ -285,13 +285,25 @@ pub(crate) fn fri_prover_query_rounds<
         .map(|rand| rand.to_canonical_u64() as usize % n)
         .collect::<Vec<_>>();
     #[cfg(feature = "gpu")]
-    for tree in initial_merkle_trees {
-        tree.leaves.prepare_queries(&indices);
-        tree.digests.prepare_paths(
-            &indices,
-            tree.leaves.len(),
-            crate::util::log2_strict(tree.cap.len()),
-        );
+    {
+        let prepare = |tree: &MerkleTree<F, C::Hasher>, indices: &[usize]| {
+            tree.leaves.prepare_queries(indices);
+            tree.digests.prepare_paths(
+                indices,
+                tree.leaves.len(),
+                crate::util::log2_strict(tree.cap.len()),
+            );
+        };
+        for tree in initial_merkle_trees {
+            prepare(tree, &indices);
+        }
+        let mut layer_indices = indices.clone();
+        for (tree, &arity) in trees.iter().zip(&fri_params.reduction_arity_bits) {
+            for index in &mut layer_indices {
+                *index >>= arity;
+            }
+            prepare(tree, &layer_indices);
+        }
     }
     indices
         .into_par_iter()

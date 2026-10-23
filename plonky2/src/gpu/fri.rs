@@ -5,7 +5,7 @@
 //! values and coefficients come from the host, or from the device when the
 //! opening phase combined the codeword there (see [`super::opening`]).
 
-use plonky2_maybe_rayon::*;
+use std::sync::Arc;
 
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::goldilocks_field::GoldilocksField;
@@ -18,10 +18,10 @@ use crate::gpu::merkle::{build_tree, supported, LeafSource};
 use crate::gpu::shader::HASH_WORKGROUP;
 use crate::gpu::{context, DeviceBuffer, GpuContext};
 use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
-use crate::hash::merkle_tree::{MerkleCap, MerkleLeaves, MerkleTree};
+use crate::hash::merkle_tree::{MerkleCap, MerkleDigests, MerkleLeaves, MerkleTree};
 use crate::iop::challenger::Challenger;
 use crate::plonk::config::GenericConfig;
-use crate::util::{log2_strict, reverse_bits};
+use crate::util::log2_strict;
 
 /// Uploads extension elements as `D` columns of their base field components.
 fn upload_extension<F: RichField + Extendable<D>, const D: usize>(
@@ -57,29 +57,6 @@ pub(crate) fn read_extension<F: RichField + Extendable<D>, const D: usize>(
         .collect()
 }
 
-/// The leaves of the layer's tree: leaf `i` is the flattening of the
-/// values at the bit-reversed positions `i * arity + j`.
-fn layer_leaves<F: RichField + Extendable<D>, const D: usize>(
-    values: &[F::Extension],
-    arity_bits: usize,
-) -> MerkleLeaves<F> {
-    let n = values.len();
-    let log_n = log2_strict(n);
-    let arity = 1 << arity_bits;
-    let num_leaves = n >> arity_bits;
-    let leaf_len = D * arity;
-    let mut flat = vec![F::ZERO; num_leaves * leaf_len];
-    flat.par_chunks_exact_mut(leaf_len)
-        .enumerate()
-        .for_each(|(i, leaf)| {
-            for j in 0..arity {
-                let element = values[reverse_bits(i * arity + j, log_n)].to_basefield_array();
-                leaf[j * D..(j + 1) * D].copy_from_slice(&element);
-            }
-        });
-    MerkleLeaves::new(flat, leaf_len, num_leaves)
-}
-
 /// `fri_committed_trees` on the device, or `None` if the GPU does not take
 /// this instance. The challenger is only touched once the GPU has been chosen.
 pub(crate) fn try_committed_trees<
@@ -98,7 +75,7 @@ pub(crate) fn try_committed_trees<
         return None;
     }
     let ctx = context()?;
-    let ctx = &*ctx;
+    let ctx = &ctx;
     let n = values.len();
     if n != coeffs.len() || !n.is_power_of_two() {
         return None;
@@ -113,7 +90,7 @@ pub(crate) fn try_committed_trees<
         ctx,
         vals,
         coeffs_buffer,
-        values.values.clone(),
+        n,
         challenger,
         fri_params,
         final_poly_coeff_len,
@@ -126,33 +103,44 @@ pub(crate) fn commit_phase_fits(ctx: &GpuContext, log_n: u32, fri_params: &FriPa
     let n = 1u64 << log_n;
     log_n >= crate::gpu::MIN_LOG_LEAVES
         && n.div_ceil(HASH_WORKGROUP as u64) <= ctx.max_workgroups as u64
+        && ctx.fits(2 * n * 8)
         && !fri_params.reduction_arity_bits.contains(&0)
         && fri_params.reduction_arity_bits.iter().sum::<usize>() <= log_n as usize
+        && {
+            let mut bits = log_n as usize;
+            fri_params.reduction_arity_bits.iter().all(|&arity| {
+                bits -= arity;
+                let cap = fri_params.config.cap_height;
+                cap <= bits
+                    && ctx.fits(2 * ((1u64 << bits) - (1u64 << cap)) * 32)
+                    && ctx.fits((1u64 << cap) * 32)
+            })
+        }
 }
 
 /// The commit phase from the device copies of the first layer: `vals` and
-/// `coeffs_buffer` hold `D` columns of `host_values.len()` components, and
-/// `host_values` is the same codeword on the host (for the layer's leaves).
+/// `coeffs_buffer` hold `D` columns of `n` components. Leaves and digests stay
+/// on the device until the query phase gathers their sparse proof data.
 pub(crate) fn committed_trees<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
     const D: usize,
 >(
-    ctx: &GpuContext,
+    ctx: &Arc<GpuContext>,
     mut vals: DeviceBuffer,
     mut coeffs_buffer: DeviceBuffer,
-    mut host_values: Vec<F::Extension>,
+    mut n: usize,
     challenger: &mut Challenger<F, C::Hasher>,
     fri_params: &FriParams,
     final_poly_coeff_len: Option<usize>,
     max_num_query_steps: Option<usize>,
 ) -> FriCommitedTrees<F, C, D> {
     let mut trees = Vec::with_capacity(fri_params.reduction_arity_bits.len());
-    let mut n = host_values.len();
     let mut log_n = log2_strict(n) as u32;
     let mut shift = F::MULTIPLICATIVE_GROUP_GENERATOR;
-    for &arity_bits in &fri_params.reduction_arity_bits {
+    for (layer, &arity_bits) in fri_params.reduction_arity_bits.iter().enumerate() {
         let arity = 1usize << arity_bits;
+        let rows = ctx.storage("fri leaves", (D * n * 8) as u64);
         let tree = build_tree(
             ctx,
             &vals,
@@ -163,13 +151,25 @@ pub(crate) fn committed_trees<
             },
             log_n - arity_bits as u32,
             fri_params.config.cap_height as u32,
-            None,
+            Some(&rows),
         );
-        let leaves = layer_leaves::<F, D>(&host_values, arity_bits);
-        let (digests, cap) = tree.read::<F, C::Hasher>(ctx);
+        let cap = tree.read_cap::<F, C::Hasher>(ctx, None);
+        let leaves = MerkleLeaves::from_device(
+            ctx.clone(),
+            rows,
+            D * arity,
+            n >> arity_bits,
+            tree.leaves_done,
+        );
+        let digests = MerkleDigests::from_device::<F, C::Hasher>(
+            ctx.clone(),
+            tree.digests,
+            tree.num_digests,
+            tree.done,
+        );
         let tree = MerkleTree {
             leaves,
-            digests: digests.into(),
+            digests,
             cap: MerkleCap(cap),
         };
         challenger.observe_cap(&tree.cap);
@@ -202,29 +202,31 @@ pub(crate) fn committed_trees<
         shift = shift.exp_u64(arity as u64);
         n = new_n;
         log_n -= arity_bits as u32;
-        let new_vals = ctx.storage("fri values", (D * n * 8) as u64);
-        fft(
-            ctx,
-            &mut encoder,
-            FftJob {
-                log_n,
-                columns: D as u32,
-                input: &folded,
-                in_len: n as u32,
-                in_stride: n as u32,
-                data: &new_vals,
-                output: None,
-                shift_in: Some(GoldilocksField::from_noncanonical_u64(
-                    shift.to_noncanonical_u64(),
-                )),
-                inverse: false,
-                shift_out: None,
-            },
-        );
+        // No subsequent layer consumes the last fold's evaluations.
+        if layer + 1 < fri_params.reduction_arity_bits.len() {
+            let new_vals = ctx.storage("fri values", (D * n * 8) as u64);
+            fft(
+                ctx,
+                &mut encoder,
+                FftJob {
+                    log_n,
+                    columns: D as u32,
+                    input: &folded,
+                    in_len: n as u32,
+                    in_stride: n as u32,
+                    data: &new_vals,
+                    output: None,
+                    shift_in: Some(GoldilocksField::from_noncanonical_u64(
+                        shift.to_noncanonical_u64(),
+                    )),
+                    inverse: false,
+                    shift_out: None,
+                },
+            );
+            vals = new_vals;
+        }
         ctx.submit(encoder);
         coeffs_buffer = folded;
-        vals = new_vals;
-        host_values = read_extension::<F, D>(ctx, &vals, n);
     }
 
     // When verifying this proof in a circuit with a different number of query steps,
@@ -312,4 +314,100 @@ pub(crate) fn try_opening_fft_from<F: RichField + Extendable<D>, const D: usize>
     );
     ctx.submit(encoder);
     Some(PolynomialValues::new(read_extension::<F, D>(ctx, &data, n)))
+}
+
+#[cfg(test)]
+mod resident_tests {
+    use super::*;
+    use crate::field::extension::quadratic::QuadraticExtension;
+    use crate::fri::prover::{fri_committed_trees_cpu, fri_prover_query_rounds};
+    use crate::fri::reduction_strategies::FriReductionStrategy;
+    use crate::fri::FriConfig;
+    use crate::gpu::GpuConfig;
+    use crate::hash::poseidon::PoseidonHash;
+    use crate::plonk::config::PoseidonGoldilocksConfig;
+
+    #[test]
+    fn resident_fri_layers_match_cpu_through_sparse_queries() {
+        type F = GoldilocksField;
+        type C = PoseidonGoldilocksConfig;
+        let config = GpuConfig {
+            allow_software: true,
+            ..GpuConfig::default()
+        };
+        let Ok(ctx) = GpuContext::with_config(&config) else {
+            eprintln!("no compute adapter; skipping");
+            return;
+        };
+        let ctx = Arc::new(ctx);
+        for arities in [vec![], vec![4, 4], vec![3, 3, 2]] {
+            let mut coeffs = vec![QuadraticExtension::<F>::ZERO; 1024];
+            for (i, c) in coeffs.iter_mut().take(256).enumerate() {
+                *c = QuadraticExtension([F::from_canonical_usize(i), F::ONE]);
+            }
+            let coeffs = PolynomialCoeffs::new(coeffs);
+            let values = coeffs.coset_fft(F::coset_shift().into());
+            let params = FriParams {
+                config: FriConfig {
+                    rate_bits: 2,
+                    cap_height: 2,
+                    proof_of_work_bits: 0,
+                    reduction_strategy: FriReductionStrategy::Fixed(arities.clone()),
+                    num_query_rounds: 7,
+                },
+                hiding: false,
+                degree_bits: 8,
+                reduction_arity_bits: arities,
+            };
+            assert!(commit_phase_fits(&ctx, 10, &params));
+            let mut cpu_challenger = Challenger::<F, PoseidonHash>::new();
+            let mut gpu_challenger = cpu_challenger.clone();
+            let vals = upload_extension::<F, 2>(&ctx, "test FRI values", &values.values);
+            let device_coeffs =
+                upload_extension::<F, 2>(&ctx, "test FRI coefficients", &coeffs.coeffs);
+            let (gpu_trees, gpu_final) = committed_trees::<F, C, 2>(
+                &ctx,
+                vals,
+                device_coeffs,
+                1024,
+                &mut gpu_challenger,
+                &params,
+                Some(256),
+                Some(4),
+            );
+            let (cpu_trees, cpu_final) = fri_committed_trees_cpu::<F, C, 2>(
+                coeffs,
+                values,
+                &mut cpu_challenger,
+                &params,
+                Some(256),
+                Some(4),
+            );
+            assert_eq!(gpu_final, cpu_final);
+            let gpu_queries = fri_prover_query_rounds::<F, C, 2>(
+                &[],
+                &gpu_trees,
+                &mut gpu_challenger,
+                1024,
+                &params,
+            );
+            let cpu_queries = fri_prover_query_rounds::<F, C, 2>(
+                &[],
+                &cpu_trees,
+                &mut cpu_challenger,
+                1024,
+                &params,
+            );
+            assert_eq!(gpu_queries, cpu_queries);
+            for (gpu, cpu) in gpu_trees.iter().zip(&cpu_trees) {
+                assert_eq!(gpu.cap, cpu.cap);
+                assert!(gpu.leaves.is_device_resident());
+                assert!(gpu.digests.is_device_resident());
+            }
+            assert_eq!(
+                gpu_challenger.get_n_challenges(4),
+                cpu_challenger.get_n_challenges(4)
+            );
+        }
+    }
 }

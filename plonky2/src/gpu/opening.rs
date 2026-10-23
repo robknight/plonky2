@@ -12,11 +12,8 @@
 //! batches' quotients, all in coefficient form on the degree of the batch;
 //! one coset FFT gives the codeword that the commit phase folds. The trees,
 //! the final polynomial and the challenger state are the ones the CPU
-//! produces. This module reads back the openings and first layer's values;
-//! [`super::fri`] also reads each layer's digests, cap and folded values, and
-//! the final coefficients.
-
-use plonky2_maybe_rayon::*;
+//! produces. Only the openings, caps, sparse query data and final coefficients
+//! are read back; the initial codeword and folded layers stay on the device.
 
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::types::Field;
@@ -256,7 +253,7 @@ pub(crate) fn try_prove_openings<
         return None;
     }
     let ctx = context()?;
-    let ctx = &*ctx;
+    let ctx = &ctx;
     let degree_log = oracles[0].degree_log;
     let rate_bits = fri_params.config.rate_bits;
     let degree = 1usize << degree_log;
@@ -290,7 +287,7 @@ pub(crate) fn try_prove_openings<
     }
 
     let alpha = challenger.get_extension_challenge::<D>();
-    let (values, coeffs, staging, done) = timed!(timing, "gpu: submit the initial polynomial", {
+    let (values, coeffs) = timed!(timing, "gpu: submit the initial polynomial", {
         // The terms batch by batch, each weighted by the power of alpha
         // `reduce_polys_base` gives the j-th polynomial of its batch; each
         // batch's quotient is scaled by alpha to the number of later terms,
@@ -341,7 +338,6 @@ pub(crate) fn try_prove_openings<
         );
         let coeffs = ctx.storage("initial polynomial", (D * n * 8) as u64);
         let values = ctx.storage("initial codeword", (D * n * 8) as u64);
-        let staging = ctx.storage("initial codeword copy", (D * n * 8) as u64);
         let mut buffers = vec![&params];
         buffers.extend(coeff_buffers.iter().map(|b| &**b));
         buffers.resize(1 + MAX_ORACLES, &ctx.dummy);
@@ -391,16 +387,9 @@ pub(crate) fn try_prove_openings<
                 shift_out: None,
             },
         );
-        // The host reads the codeword from a copy, which no later submission binds.
-        encoder.copy_buffer_to_buffer(&values, 0, &staging, 0, (D * n * 8) as u64);
-        let done = ctx.submit_async(encoder);
-        (values, coeffs, staging, done)
+        ctx.submit_async(encoder);
+        (values, coeffs)
     });
-    let host_values = timed!(
-        timing,
-        "gpu: initial polynomial and codeword readback",
-        read_extension_after::<F, D>(ctx, &staging, n, &done)
-    );
     let (trees, final_coeffs) = timed!(
         timing,
         "fold codewords in the commitment phase",
@@ -408,7 +397,7 @@ pub(crate) fn try_prove_openings<
             ctx,
             values,
             coeffs,
-            host_values,
+            n,
             challenger,
             fri_params,
             final_poly_coeff_len,
@@ -437,27 +426,5 @@ pub(crate) fn try_prove_openings<
         query_round_proofs,
         final_poly: final_coeffs,
         pow_witness,
-    })
-}
-
-/// `read_extension` once submission `done` has executed.
-fn read_extension_after<F: RichField + Extendable<D>, const D: usize>(
-    ctx: &GpuContext,
-    buffer: &wgpu::Buffer,
-    n: usize,
-    done: &wgpu::SubmissionIndex,
-) -> Vec<F::Extension> {
-    ctx.read_after(buffer, (D * n * 8) as u64, Some(done), |bytes| {
-        let words = bytes.as_chunks::<8>().0;
-        (0..n)
-            .into_par_iter()
-            .map(|i| {
-                let mut components = [F::ZERO; D];
-                for (d, component) in components.iter_mut().enumerate() {
-                    *component = F::from_noncanonical_u64(u64::from_le_bytes(words[d * n + i]));
-                }
-                F::Extension::from_basefield_array(components)
-            })
-            .collect()
     })
 }
