@@ -28,6 +28,7 @@ use crate::hash::hash_types::RichField;
 use crate::hash::poseidon::{self, Poseidon, SPONGE_WIDTH};
 use crate::iop::generator::WitnessOperation as Op;
 use crate::iop::target::Target;
+pub(crate) use crate::iop::witness::ProverWires as Wires;
 use crate::iop::witness::{MatrixWitness, PartialWitness, PartitionWitness, Witness};
 use crate::plonk::circuit_data::{CommonCircuitData, ProverOnlyCircuitData};
 use crate::plonk::config::GenericConfig;
@@ -1044,23 +1045,6 @@ impl CpuExecutorReport {
     }
 }
 
-/// Where the executor delivered the wire matrix.
-pub(crate) enum Wires<F: Field> {
-    Host(MatrixWitness<F>),
-    #[cfg(feature = "gpu")]
-    Resident(crate::gpu::resident_witness::ResidentWitness),
-}
-
-impl<F: Field> std::fmt::Debug for Wires<F> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Host(witness) => write!(f, "Wires::Host({} columns)", witness.wire_values.len()),
-            #[cfg(feature = "gpu")]
-            Self::Resident(_) => write!(f, "Wires::Resident"),
-        }
-    }
-}
-
 #[cfg(test)]
 thread_local! {
     /// Executor runs on this thread, so tests can tell which path a proof took.
@@ -1623,10 +1607,8 @@ pub(crate) mod tests {
                 &data.prover_only,
                 &data.common,
                 public_inputs,
-                Some(witness),
+                Wires::Host(witness),
                 &mut TimingTree::default(),
-                #[cfg(feature = "gpu")]
-                None,
             )
             .unwrap();
             data.verify(proof).unwrap();

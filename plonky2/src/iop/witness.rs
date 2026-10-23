@@ -285,6 +285,27 @@ pub struct MatrixWitness<F: Field> {
     pub(crate) wire_values: Vec<Vec<F>>,
 }
 
+/// Where the executor delivered the wire matrix.
+pub(crate) enum ProverWires<F: Field> {
+    Host(MatrixWitness<F>),
+    #[cfg(feature = "gpu")]
+    Resident(crate::gpu::resident_witness::ResidentWitness),
+}
+
+impl<F: Field> core::fmt::Debug for ProverWires<F> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Host(witness) => write!(
+                f,
+                "ProverWires::Host({} columns)",
+                witness.wire_values.len()
+            ),
+            #[cfg(feature = "gpu")]
+            Self::Resident(_) => write!(f, "ProverWires::Resident"),
+        }
+    }
+}
+
 impl<F: Field> MatrixWitness<F> {
     pub fn get_wire(&self, gate: usize, input: usize) -> F {
         self.wire_values[input][gate]

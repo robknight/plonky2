@@ -24,7 +24,9 @@ use crate::hash::hash_types::RichField;
 use crate::iop::challenger::Challenger;
 use crate::iop::generator::generate_partial_witness;
 use crate::iop::target::Target;
-use crate::iop::witness::{MatrixWitness, PartialWitness, PartitionWitness, Witness, WitnessWrite};
+use crate::iop::witness::{
+    MatrixWitness, PartialWitness, PartitionWitness, ProverWires, Witness, WitnessWrite,
+};
 use crate::plonk::circuit_builder::NUM_COINS_LOOKUP;
 use crate::plonk::circuit_data::{CommonCircuitData, ProverOnlyCircuitData};
 use crate::plonk::config::{GenericConfig, Hasher};
@@ -129,7 +131,7 @@ where
         .witness_program
         .has_all(prover_data.generators.len())
     {
-        use crate::plonk::witness_program::region::cpu::{self, Wires};
+        use crate::plonk::witness_program::region::cpu;
         // Same label as the worklist, so timing trees compare across paths.
         match timed!(
             timing,
@@ -139,24 +141,7 @@ where
             Ok(None) => {}
             Ok(Some((public_inputs, wires, report))) => {
                 report.log();
-                #[cfg(feature = "gpu")]
-                let (witness, resident) = match wires {
-                    Wires::Host(witness) => (Some(witness), None),
-                    Wires::Resident(resident) => (None, Some(resident)),
-                };
-                #[cfg(not(feature = "gpu"))]
-                let Wires::Host(witness) = wires;
-                #[cfg(not(feature = "gpu"))]
-                let witness = Some(witness);
-                return prove_from_wires(
-                    prover_data,
-                    common_data,
-                    public_inputs,
-                    witness,
-                    timing,
-                    #[cfg(feature = "gpu")]
-                    resident,
-                );
+                return prove_from_wires(prover_data, common_data, public_inputs, wires, timing);
             }
             // An installed program that cannot run these inputs; the worklist
             // is correct for any inputs.
@@ -209,10 +194,8 @@ where
         prover_data,
         common_data,
         public_inputs,
-        Some(witness),
+        ProverWires::Host(witness),
         timing,
-        #[cfg(feature = "gpu")]
-        None,
     )
 }
 
@@ -227,9 +210,8 @@ pub(crate) fn prove_from_wires<
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     common_data: &CommonCircuitData<F, D>,
     public_inputs: Vec<F>,
-    witness: Option<MatrixWitness<F>>,
+    wires: ProverWires<F>,
     timing: &mut TimingTree,
-    #[cfg(feature = "gpu")] resident: Option<crate::gpu::resident_witness::ResidentWitness>,
 ) -> Result<ProofWithPublicInputs<F, C, D>>
 where
     C::Hasher: Hasher<F>,
@@ -266,45 +248,45 @@ where
         C::InnerHasher::hash_no_pad(&public_inputs)
     );
     #[cfg(feature = "gpu")]
-    let resident_mode = resident.is_some();
-    #[cfg(not(feature = "gpu"))]
-    let resident_mode = false;
-    #[cfg(not(feature = "gpu"))]
-    debug_assert!(witness.is_some());
-    #[cfg(feature = "gpu")]
-    let mut witness = witness;
-    let wires_values = if resident_mode {
-        None
-    } else {
-        Some(timed!(
-            timing,
-            "compute wire polynomials",
-            witness
-                .as_ref()
-                .unwrap()
-                .wire_values
-                .par_iter()
-                .map(|column| PolynomialValues::new(column.clone()))
-                .collect::<Vec<_>>()
-        ))
-    };
-    // The device that holds resident wires, kept for the CPU permutation
-    // fallback so it never depends on the global context mid-proof.
-    #[cfg(feature = "gpu")]
-    let resident_ctx = resident.as_ref().map(|resident| resident.ctx.clone());
-    #[cfg(feature = "gpu")]
     let retain_values = crate::gpu::permutation::supported_circuit(prover_data, common_data);
     let mut wires_commitment = {
         #[cfg(feature = "gpu-profiling")]
         let _capture = crate::gpu::capture::Capture::wires();
-        #[cfg(feature = "gpu")]
-        let resident_commitment = resident.map(|resident| {
-            timed!(
+        match &wires {
+            ProverWires::Host(witness) => {
+                let values = timed!(
+                    timing,
+                    "compute wire polynomials",
+                    witness
+                        .wire_values
+                        .par_iter()
+                        .map(|column| PolynomialValues::new(column.clone()))
+                        .collect()
+                );
+                timed!(
+                    timing,
+                    "compute wires commitment",
+                    PolynomialBatch::<F, C, D>::from_values_with_plan(
+                        values,
+                        config.fri_config.rate_bits,
+                        config.zero_knowledge && PlonkOracle::WIRES.blinding,
+                        config.fri_config.cap_height,
+                        timing,
+                        prover_data.fft_root_table.as_ref(),
+                        #[cfg(feature = "gpu")]
+                        Some(&gpu_plan),
+                        #[cfg(feature = "gpu")]
+                        retain_values,
+                    )
+                )
+            }
+            #[cfg(feature = "gpu")]
+            ProverWires::Resident(resident) => timed!(
                 timing,
                 "compute resident wires commitment",
                 crate::gpu::lde::from_device_values::<F, C, D>(
                     &resident.ctx,
-                    resident.wire_values,
+                    resident.wire_values.clone(),
                     config.num_wires,
                     degree,
                     config.fri_config.rate_bits,
@@ -312,28 +294,7 @@ where
                     config.fri_config.cap_height,
                     timing,
                     gpu_plan.retain_leaves(),
-                    retain_values
-                )
-            )
-        });
-        #[cfg(not(feature = "gpu"))]
-        let resident_commitment: Option<ProverPolynomialBatch<F, C, D>> = None;
-        match resident_commitment {
-            Some(commitment) => commitment,
-            None => timed!(
-                timing,
-                "compute wires commitment",
-                PolynomialBatch::<F, C, D>::from_values_with_plan(
-                    wires_values.unwrap(),
-                    config.fri_config.rate_bits,
-                    config.zero_knowledge && PlonkOracle::WIRES.blinding,
-                    config.fri_config.cap_height,
-                    timing,
-                    prover_data.fft_root_table.as_ref(),
-                    #[cfg(feature = "gpu")]
-                    Some(&gpu_plan),
-                    #[cfg(feature = "gpu")]
-                    retain_values
+                    retain_values,
                 )
             ),
         }
@@ -392,29 +353,30 @@ where
     #[cfg(not(feature = "gpu"))]
     let gpu_commitment: Option<ProverPolynomialBatch<F, C, D>> = None;
     let mut partial_products_zs_and_lookup_commitment = match gpu_commitment {
-        Some(commitment) => commitment,
+        Some(commitment) => {
+            timed!(timing, "release witness", drop(wires));
+            commitment
+        }
         None => {
-            #[cfg(feature = "gpu")]
-            if witness.is_none() {
-                let ctx = resident_ctx
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("GPU witness context unavailable"))?;
-                let values = wires_commitment.batch.device_values.take().ok_or_else(|| {
-                    anyhow::anyhow!("GPU witness values unavailable for CPU permutation fallback")
-                })?;
-                witness = Some(MatrixWitness {
-                    wire_values: crate::gpu::lde::read_columns::<F>(
-                        &ctx,
-                        &values,
-                        config.num_wires,
-                        degree,
-                    ),
-                });
-                eprintln!("GPU_WITNESS_RESIDENT fallback_materialization=true");
-            }
-            let witness = witness
-                .as_ref()
-                .expect("CPU permutation requires host wires");
+            let witness = match wires {
+                ProverWires::Host(witness) => witness,
+                #[cfg(feature = "gpu")]
+                ProverWires::Resident(resident) => {
+                    // Read through the original context even if GPU routing
+                    // was disabled after the witness was uploaded.
+                    let witness = MatrixWitness {
+                        wire_values: crate::gpu::lde::read_columns::<F>(
+                            &resident.ctx,
+                            &resident.wire_values,
+                            config.num_wires,
+                            degree,
+                        ),
+                    };
+                    drop(wires_commitment.batch.device_values.take());
+                    log::debug!("gpu: materialized wire values for CPU permutation fallback");
+                    witness
+                }
+            };
             let mut partial_products_and_zs = timed!(
                 timing,
                 "compute partial products",
@@ -437,6 +399,7 @@ where
             // All lookup polys: RE and partial SLDCs.
             let lookup_polys =
                 compute_all_lookup_polys(&witness, &deltas, prover_data, common_data, has_lookup);
+            timed!(timing, "release witness", drop(witness));
 
             let zs_partial_products_lookups = if has_lookup {
                 [zs_partial_products, lookup_polys].concat()
@@ -604,7 +567,6 @@ where
         );
         drop(challenger);
         timed!(timing, "release wires commitment", drop(wires_commitment));
-        timed!(timing, "release witness", drop(witness));
     });
     // Diagnostic: log this proof's device pass timeline, after its timing.
     #[cfg(feature = "gpu-profiling")]

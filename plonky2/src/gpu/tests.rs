@@ -831,11 +831,22 @@ pub(crate) fn hash_chain_circuit(
     crate::plonk::circuit_data::CircuitData<F, crate::plonk::config::PoseidonGoldilocksConfig, 2>,
     crate::iop::witness::PartialWitness<F>,
 ) {
+    hash_chain_circuit_with_config(
+        rows,
+        crate::plonk::circuit_data::CircuitConfig::standard_recursion_zk_config(),
+    )
+}
+
+fn hash_chain_circuit_with_config(
+    rows: usize,
+    config: crate::plonk::circuit_data::CircuitConfig,
+) -> (
+    crate::plonk::circuit_data::CircuitData<F, crate::plonk::config::PoseidonGoldilocksConfig, 2>,
+    crate::iop::witness::PartialWitness<F>,
+) {
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_builder::CircuitBuilder;
-    use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::PoseidonGoldilocksConfig;
-    let config = CircuitConfig::standard_recursion_zk_config();
     let mut builder = CircuitBuilder::<F, 2>::new(config);
     let input = builder.add_virtual_target();
     let mut state = vec![input; 4];
@@ -2627,6 +2638,49 @@ fn software_gpu_proofs_verify() {
 #[ignore = "run alone with --ignored to exercise uncached Vulkan proofs"]
 fn software_gpu_proofs_without_retained_buffers() {
     software_gpu_proofs(Some(0));
+}
+
+#[test]
+#[ignore = "run alone with --ignored to exercise uploaded wires after disabling GPU routing"]
+fn software_gpu_resident_witness_cpu_fallback() {
+    use crate::iop::witness::ProverWires;
+    use crate::plonk::witness_program::region::cpu;
+    configure(GpuConfig {
+        backend: Some(Backend::Vulkan),
+        allow_software: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut config = crate::plonk::circuit_data::CircuitConfig::standard_recursion_zk_config();
+    config.security_bits = 1;
+    config.fri_config.num_query_rounds = 2;
+    config.fri_config.proof_of_work_bits = 0;
+    let (data, inputs) = hash_chain_circuit_with_config(128, config);
+    data.install_witness_program(data.compile_witness_program_like(&inputs).unwrap())
+        .unwrap();
+    let (public_inputs, wires, _) =
+        cpu::generate_wires(&inputs, &data.prover_only, &data.common, true)
+            .unwrap()
+            .unwrap();
+    assert!(
+        matches!(&wires, ProverWires::Resident(_)),
+        "fixture must upload wires"
+    );
+    let reads = COEFFICIENT_READBACKS.with(|reads| reads.get());
+    set_enabled(false);
+    let proof = crate::plonk::prover::prove_from_wires(
+        &data.prover_only,
+        &data.common,
+        public_inputs,
+        wires,
+        &mut TimingTree::default(),
+    )
+    .unwrap();
+    data.verify(proof).unwrap();
+    assert!(
+        COEFFICIENT_READBACKS.with(|reads| reads.get()) > reads,
+        "CPU openings materialize resident coefficients on demand"
+    );
 }
 
 fn software_gpu_proofs(retained_bytes: Option<u64>) {
