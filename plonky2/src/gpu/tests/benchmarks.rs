@@ -2,6 +2,80 @@
 
 use super::*;
 
+/// Alternate warmed tile plans on identical buffers. Run alone so timings
+/// include no concurrent proofs or shader compilation from other tests.
+#[test]
+#[ignore]
+fn bench_fft_tile_plans() {
+    use std::time::Instant;
+
+    use crate::gpu::lde::{fft_groups_with_tile, FftJob};
+    let ctx = ctx().expect("benchmark requires a GPU");
+    assert!(ctx.device.limits().max_compute_workgroup_storage_size >= 16384);
+    let source = shader::fft_module_with_tile(ctx.flavor, 11)
+        .replace("@workgroup_size(256)", "@workgroup_size(512)")
+        .replace("+= 256u", "+= 512u");
+    let module = module(&ctx.device, "fft tile 2048 workgroup 512", &source);
+    let large_512 = pipeline(&ctx.device, &ctx.fft_layout, &module, "fft_group");
+    let mut rng = StdRng::seed_from_u64(0x54494c45);
+    for (log_n, columns) in [
+        (16u32, 135usize),
+        (17, 135),
+        (18, 135),
+        (19, 135),
+        (19, 20),
+        (19, 2),
+    ] {
+        let n = 1usize << log_n;
+        let degree = n / 8;
+        let input = random_columns(&mut rng, columns, degree);
+        let slices = input.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let input = lde::upload_columns(&ctx, "fft plan input", &slices);
+        let data = ctx.storage("fft plan data", (columns * n * 8) as u64);
+        let run = |variant| {
+            let bits = if variant == 0 { 10 } else { 11 };
+            let mut encoder = ctx.encoder("fft plan benchmark");
+            fft_groups_with_tile(
+                &ctx,
+                &mut encoder,
+                FftJob {
+                    log_n,
+                    columns: columns as u32,
+                    input: &input,
+                    in_len: degree as u32,
+                    in_stride: degree as u32,
+                    data: &data,
+                    output: None,
+                    shift_in: Some(F::coset_shift()),
+                    inverse: false,
+                    shift_out: None,
+                },
+                bits,
+                None,
+                (variant == 2).then_some(&large_512),
+            );
+            let start = Instant::now();
+            ctx.submit(encoder);
+            start.elapsed().as_secs_f64() * 1000.0
+        };
+        for variant in 0..3 {
+            for _ in 0..3 {
+                run(variant);
+            }
+        }
+        let mut samples = [Vec::new(), Vec::new(), Vec::new()];
+        for round in 0..12 {
+            for i in if round % 2 == 0 { [0, 1, 2] } else { [2, 1, 0] } {
+                samples[i].push(run(i));
+            }
+        }
+        for (i, sample) in samples.iter_mut().enumerate() {
+            sample.sort_by(f64::total_cmp);
+            println!("FFT_TILE log_n={log_n} columns={columns} bits={} workgroup={} median_ms={:.6} samples={sample:?}", if i == 0 {10} else {11}, if i == 2 {512} else {256}, (sample[5] + sample[6]) / 2.0);
+        }
+    }
+}
+
 /// Full digest readback versus caps and 28 gathered authentication paths.
 /// Paths are checked outside timing against the full tree on every iteration.
 #[test]

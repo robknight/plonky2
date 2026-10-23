@@ -328,6 +328,8 @@ pub struct GpuContext {
     pub(crate) permute: wgpu::ComputePipeline,
     fft_layout: wgpu::BindGroupLayout,
     pub(crate) fft: wgpu::ComputePipeline,
+    #[cfg(test)]
+    fft_large: OnceLock<wgpu::ComputePipeline>,
     fold_layout: wgpu::BindGroupLayout,
     pub(crate) fold: wgpu::ComputePipeline,
     /// The proof-of-work search, compiled on first use.
@@ -853,6 +855,8 @@ impl GpuContext {
             permute,
             fft_layout,
             fft,
+            #[cfg(test)]
+            fft_large: OnceLock::new(),
             fold_layout,
             fold,
             pow_kernel: OnceLock::new(),

@@ -4,6 +4,7 @@
 
 mod arithmetic_grid;
 mod column_leaves;
+mod fft_tiles;
 mod inversion;
 mod permutation_products;
 mod residency_matrix;
@@ -185,6 +186,7 @@ fn shaders_validate() {
             ("hash", shader::hash_module(flavor)),
             ("pow", shader::pow_module(flavor)),
             ("fft", shader::fft_module(flavor)),
+            ("large fft", shader::fft_module_with_tile(flavor, 11)),
             ("leaf gather", shader::leaf_gather_module().to_owned()),
             ("fold", shader::fold_module(flavor)),
             ("open", shader::open_module(flavor)),
@@ -207,17 +209,19 @@ fn shaders_validate() {
 
 #[test]
 fn fft_plan_covers_all_stages() {
-    for log_n in 0..=26 {
-        let plan = shader::fft_plan(log_n);
-        let mut next = 0;
-        for (i, &(s0, stages, low)) in plan.iter().enumerate() {
-            assert_eq!(s0, next);
-            assert!(stages + low <= shader::FFT_TILE_BITS);
-            assert!(low <= s0);
-            assert!(i == 0 || stages > 0);
-            next += stages;
+    for bits in [10, 11] {
+        for log_n in 0..=26 {
+            let plan = shader::fft_plan_with_tile(log_n, bits);
+            let mut next = 0;
+            for (i, &(s0, stages, low)) in plan.iter().enumerate() {
+                assert_eq!(s0, next);
+                assert!(stages + low <= bits);
+                assert!(low <= s0);
+                assert!(i == 0 || stages > 0);
+                next += stages;
+            }
+            assert_eq!(next, log_n);
         }
-        assert_eq!(next, log_n);
     }
 }
 

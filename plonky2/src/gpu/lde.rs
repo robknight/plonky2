@@ -116,6 +116,22 @@ pub(crate) struct FftJob<'a> {
     pub shift_out: Option<GoldilocksField>,
 }
 
+#[cfg(test)]
+impl GpuContext {
+    fn fft_kernel(&self, tile_bits: u32) -> &wgpu::ComputePipeline {
+        if tile_bits == super::shader::FFT_TILE_BITS {
+            &self.fft
+        } else {
+            assert!(self.device.limits().max_compute_workgroup_storage_size >= (8 << tile_bits));
+            self.fft_large.get_or_init(|| {
+                let source = super::shader::fft_module_with_tile(self.flavor, tile_bits);
+                let module = super::module(&self.device, "large-tile fft", &source);
+                super::pipeline(&self.device, &self.fft_layout, &module, "fft_group")
+            })
+        }
+    }
+}
+
 /// Records the groups of `job` into `encoder`.
 pub(crate) fn fft(ctx: &GpuContext, encoder: &mut wgpu::CommandEncoder, job: FftJob<'_>) {
     fft_groups(
@@ -135,12 +151,46 @@ pub(crate) fn fft_groups(
     job: FftJob<'_>,
     #[cfg(test)] only: Option<usize>,
 ) {
+    let plan = fft_plan(job.log_n);
+    record_fft(
+        ctx,
+        encoder,
+        job,
+        plan,
+        &ctx.fft,
+        #[cfg(test)]
+        only,
+    );
+}
+
+/// Profiling/test entry point; production retains the measured 1024-element plan.
+#[cfg(test)]
+pub(crate) fn fft_groups_with_tile(
+    ctx: &GpuContext,
+    encoder: &mut wgpu::CommandEncoder,
+    job: FftJob<'_>,
+    tile_bits: u32,
+    only: Option<usize>,
+    kernel: Option<&wgpu::ComputePipeline>,
+) {
+    let plan = super::shader::fft_plan_with_tile(job.log_n, tile_bits);
+    let kernel = kernel.unwrap_or_else(|| ctx.fft_kernel(tile_bits));
+    record_fft(ctx, encoder, job, plan, kernel, only);
+}
+
+fn record_fft(
+    ctx: &GpuContext,
+    encoder: &mut wgpu::CommandEncoder,
+    job: FftJob<'_>,
+    plan: Vec<(u32, u32, u32)>,
+    kernel: &wgpu::ComputePipeline,
+    #[cfg(test)] only: Option<usize>,
+) {
     assert!(
         job.shift_in.is_none() || job.shift_out.is_none(),
         "a coset shift on both load and store"
     );
     let n = 1u64 << job.log_n;
-    let plan = fft_plan(job.log_n);
     let twiddles = ctx.twiddles(job.log_n);
     let shift_pows = match (job.shift_in, job.shift_out) {
         (Some(shift), _) => ctx.shift_pows(shift, job.in_len),
@@ -212,7 +262,7 @@ pub(crate) fn fft_groups(
         if job.inverse { " inverse" } else { "" }
     );
     let mut pass = ctx.begin_pass(encoder, &label, None);
-    pass.set_pipeline(&ctx.fft);
+    pass.set_pipeline(kernel);
     for (bindings, workgroups) in &bindings {
         pass.set_bind_group(0, bindings, &[]);
         pass.dispatch_workgroups(*workgroups, job.columns, 1);

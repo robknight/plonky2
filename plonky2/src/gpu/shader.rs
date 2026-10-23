@@ -997,6 +997,15 @@ pub fn fft_module(flavor: Flavor) -> String {
     out
 }
 
+#[cfg(test)]
+pub(crate) fn fft_module_with_tile(flavor: Flavor, tile_bits: u32) -> String {
+    assert!((FFT_TILE_BITS..=11).contains(&tile_bits));
+    fft_module(flavor).replace(
+        &format!("const FFT_TILE_SIZE: u32 = {}u;", 1u32 << FFT_TILE_BITS),
+        &format!("const FFT_TILE_SIZE: u32 = {}u;", 1u32 << tile_bits),
+    )
+}
+
 const FOLD_KERNEL: &str = r#"
 struct FoldParams {
     // Output coefficients.
@@ -1040,7 +1049,11 @@ pub fn fold_module(flavor: Flavor) -> String {
 
 /// The radix-2 stage groups of an NTT of `2^log_n` elements: `(s0, stages, low_bits)`.
 pub fn fft_plan(log_n: u32) -> Vec<(u32, u32, u32)> {
-    let bits = FFT_TILE_BITS;
+    fft_plan_with_tile(log_n, FFT_TILE_BITS)
+}
+
+pub(crate) fn fft_plan_with_tile(log_n: u32, bits: u32) -> Vec<(u32, u32, u32)> {
+    assert!((FFT_TILE_BITS..=11).contains(&bits));
     let first = log_n.min(bits);
     let mut plan = vec![(0, first, 0)];
     let mut s0 = first;
