@@ -1740,6 +1740,7 @@ fn hybrid_proof_plan_keeps_leaves_and_prepares_quotient_rows() {
             &mut TimingTree::default(),
             None,
             plan,
+            false,
         )
     };
     let in_proof = commit(Some(&plan));
@@ -1794,6 +1795,7 @@ fn proof_commitments_prepare_query_paths_without_digest_download() {
             &mut TimingTree::default(),
             None,
             plan,
+            false,
         )
     };
     let in_proof = commit(Some(&plan));
@@ -2239,6 +2241,7 @@ fn memory_policy_proof_and_shutdown(unified: bool) {
             &mut TimingTree::default(),
             None,
             Some(&plan),
+            false,
         );
         assert!(!batch.merkle_tree.leaves.is_device_resident());
         drop(batch);
@@ -2490,4 +2493,37 @@ fn exit_shutdown_runs_at_process_exit() {
         stderr.contains("plonky2 gpu: shut down at process exit"),
         "no exit shutdown in: {stderr}"
     );
+}
+
+#[test]
+fn subgroup_values_are_retained_only_for_permutation() {
+    use crate::plonk::config::PoseidonGoldilocksConfig as C;
+    let config = GpuConfig {
+        allow_software: true,
+        ..GpuConfig::default()
+    };
+    let Ok(ctx) = GpuContext::with_config(&config) else {
+        eprintln!("no compute adapter; skipping");
+        return;
+    };
+    let ctx = Arc::new(ctx);
+    for retain_values in [false, true] {
+        let batch = lde::from_values_with_residency::<F, C, 2>(
+            &ctx,
+            vec![PolynomialValues::new(vec![F::ONE; 256])],
+            2,
+            false,
+            2,
+            &mut TimingTree::default(),
+            false,
+            retain_values,
+        );
+        assert_eq!(batch.device_values.get().is_some(), retain_values);
+        assert_eq!(
+            ctx.retained.bytes(),
+            0,
+            "proof buffers are not persistent caches"
+        );
+        assert!(batch.polynomials[0].coeffs[0] == F::ONE);
+    }
 }

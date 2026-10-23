@@ -90,7 +90,7 @@ pub(crate) fn try_partial_products_commitment<
     {
         return None;
     }
-    let wires = wires_commitment.device_values.get()?;
+    let wires = wires_commitment.device_values.take()?;
     let num_blocks = degree / PERMUTATION_BLOCK as usize;
     let num_columns = num_challenges * (1 + num_prods);
     let out = timed!(timing, "gpu: partial products and Z's", {
@@ -174,5 +174,6 @@ pub(crate) fn try_partial_products_commitment<
             || ctx.options.retain_leaves(ctx.mappable),
             |p| p.retain_leaves(),
         ),
+        false,
     ))
 }

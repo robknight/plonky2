@@ -365,6 +365,7 @@ pub(crate) fn from_values<
         cap_height,
         timing,
         ctx.options.retain_leaves(ctx.mappable),
+        false,
     )
 }
 
@@ -380,6 +381,7 @@ pub(crate) fn from_values_with_residency<
     cap_height: usize,
     timing: &mut TimingTree,
     retain_leaves: bool,
+    retain_values: bool,
 ) -> PolynomialBatch<F, C, D> {
     let degree = values[0].len();
     let num_polys = values.len();
@@ -401,6 +403,7 @@ pub(crate) fn from_values_with_residency<
         cap_height,
         timing,
         retain_leaves,
+        retain_values,
     )
 }
 
@@ -421,6 +424,7 @@ pub(crate) fn from_device_values<
     cap_height: usize,
     timing: &mut TimingTree,
     retain_leaves: bool,
+    retain_values: bool,
 ) -> PolynomialBatch<F, C, D> {
     let log_d = log2_strict(degree) as u32;
     let (coeffs, work) = timed!(timing, "gpu: allocate IFFT buffers", {
@@ -473,7 +477,11 @@ pub(crate) fn from_device_values<
     // Queue order keeps the scratch buffer intact for the IFFT even if the
     // pool hands it out again; releasing it here lowers peak memory.
     timed!(timing, "gpu: release IFFT work", drop(work));
-    device_values.set(vals);
+    if retain_values {
+        device_values.set(vals);
+    } else {
+        drop(vals);
+    }
     commit(
         ctx,
         HostCoefficients::Staged {

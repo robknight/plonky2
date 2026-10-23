@@ -304,7 +304,8 @@ where
                     config.zero_knowledge && PlonkOracle::WIRES.blinding,
                     config.fri_config.cap_height,
                     timing,
-                    gpu_plan.retain_leaves()
+                    gpu_plan.retain_leaves(),
+                    true
                 )
             )
         });
@@ -323,7 +324,9 @@ where
                     timing,
                     prover_data.fft_root_table.as_ref(),
                     #[cfg(feature = "gpu")]
-                    Some(&gpu_plan)
+                    Some(&gpu_plan),
+                    #[cfg(feature = "gpu")]
+                    true
                 )
             ),
         }
@@ -389,7 +392,7 @@ where
                 let ctx = resident_ctx
                     .clone()
                     .ok_or_else(|| anyhow::anyhow!("GPU witness context unavailable"))?;
-                let values = wires_commitment.device_values.get().ok_or_else(|| {
+                let values = wires_commitment.device_values.take().ok_or_else(|| {
                     anyhow::anyhow!("GPU witness values unavailable for CPU permutation fallback")
                 })?;
                 witness = Some(MatrixWitness {
@@ -446,6 +449,8 @@ where
                     prover_data.fft_root_table.as_ref(),
                     #[cfg(feature = "gpu")]
                     Some(&gpu_plan),
+                    #[cfg(feature = "gpu")]
+                    false,
                 )
             )
         }
@@ -1161,13 +1166,15 @@ mod gpu_tests {
             .map(|column| PolynomialValues::new(column.clone()))
             .collect();
         let mut timing = TimingTree::default();
-        let wires_commitment = PolynomialBatch::<F, C, 2>::from_values(
+        let wires_commitment = PolynomialBatch::<F, C, 2>::from_values_with_plan(
             wires_values,
             config.fri_config.rate_bits,
             config.zero_knowledge && PlonkOracle::WIRES.blinding,
             config.fri_config.cap_height,
             &mut timing,
             prover_data.fft_root_table.as_ref(),
+            None,
+            true,
         );
         let mut challenger = Challenger::<F, <C as GenericConfig<2>>::Hasher>::new();
         common_data.fri_params.observe(&mut challenger);
@@ -1417,6 +1424,8 @@ mod gpu_tests {
             None,
         )
         .expect("the GPU takes the partial products");
+        assert!(wires_commitment.device_values.get().is_none());
+        assert!(gpu.device_values.get().is_none());
         assert_eq!(gpu.polynomials.len(), zs_commitment.polynomials.len());
         for (k, (g, e)) in gpu
             .polynomials

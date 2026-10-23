@@ -116,6 +116,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             fft_root_table,
             #[cfg(feature = "gpu")]
             None,
+            #[cfg(feature = "gpu")]
+            false,
         )
     }
 
@@ -127,6 +129,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         timing: &mut TimingTree,
         fft_root_table: Option<&FftRootTable<F>>,
         #[cfg(feature = "gpu")] plan: Option<&crate::gpu::policy::ExecutionPlan>,
+        #[cfg(feature = "gpu")] retain_values: bool,
     ) -> Self {
         #[cfg(feature = "gpu")]
         if let Some(ctx) = crate::gpu::lde::applicable::<F, C, D>(
@@ -146,11 +149,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     || ctx.options.retain_leaves(ctx.mappable),
                     |p| p.retain_leaves(),
                 ),
+                retain_values,
             );
             if plan.is_none() {
                 batch.device.retain_within_limit(&ctx);
                 batch.device_coeffs.retain_within_limit(&ctx);
-                batch.device_values.retain_within_limit(&ctx);
             }
             return batch;
         }
@@ -245,7 +248,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             if plan.is_none() {
                 batch.device.retain_within_limit(&ctx);
                 batch.device_coeffs.retain_within_limit(&ctx);
-                batch.device_values.retain_within_limit(&ctx);
             }
             return batch;
         }

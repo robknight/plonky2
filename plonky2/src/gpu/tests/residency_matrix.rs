@@ -81,6 +81,7 @@ fn unified_residency_matrix() {
         data.common.config.fri_config.cap_height,
         &mut TimingTree::default(),
         resident,
+        false,
     );
     assert_eq!(probe.merkle_tree.leaves.is_device_resident(), resident);
     drop(probe);
