@@ -355,31 +355,42 @@ fn merge_replay<F: RichField>(
         let num_wires = witness.num_wires;
         let degree = witness.degree;
         let map = witness.representative_map;
-        let values: Vec<Vec<_>> = generator_pool().install(|| {
-            results
-                .into_par_iter()
-                .map(|(_, values)| {
-                    values
-                        .into_iter()
-                        .map(|(t, v)| (map[t.index(num_wires, degree)], v))
-                        .collect()
-                })
-                .collect()
-        });
         let chunk_size = witness
             .values
             .len()
             .div_ceil(generator_pool().current_num_threads())
             .max(1);
+        let parts = witness.values.len().div_ceil(chunk_size);
+        // Assign each update to its owner once. Per-task buckets keep this
+        // scatter parallel; merging buckets never scans unrelated updates.
+        let buckets = generator_pool().install(|| {
+            results
+                .into_par_iter()
+                .fold(
+                    || vec![Vec::new(); parts],
+                    |mut buckets, (_, values)| {
+                        for (target, value) in values {
+                            let rep = map[target.index(num_wires, degree)];
+                            buckets[rep / chunk_size].push((rep, value));
+                        }
+                        buckets
+                    },
+                )
+                .reduce(
+                    || vec![Vec::new(); parts],
+                    |mut left, right| {
+                        for (dest, mut source) in left.iter_mut().zip(right) {
+                            dest.append(&mut source);
+                        }
+                        left
+                    },
+                )
+        });
         return generator_pool().install(|| {
-            let merge = |(part, chunk): (usize, &mut [Option<F>])| -> Result<u32> {
+            let merge = |(part, (chunk, updates)): (usize, (&mut [Option<F>], Vec<(usize, F)>))| -> Result<u32> {
                 let base = part * chunk_size;
-                let end = base + chunk.len();
                 let mut count = 0;
-                for &(rep, value) in values.iter().flatten() {
-                    if rep < base || rep >= end {
-                        continue;
-                    }
+                for (rep, value) in updates {
                     let slot = &mut chunk[rep - base];
                     if let Some(old) = *slot {
                         if old != value {
@@ -394,7 +405,7 @@ fn merge_replay<F: RichField>(
                 }
                 Ok(count)
             };
-            witness.values.par_chunks_mut(chunk_size).enumerate().map(merge)
+            witness.values.par_chunks_mut(chunk_size).zip(buckets.into_par_iter()).enumerate().map(merge)
                 .try_reduce(|| 0, |a, b| Ok(a + b))
         });
     }
