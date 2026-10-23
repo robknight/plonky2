@@ -527,15 +527,19 @@ impl RegionProgram {
         // one flat list indexed by `watch_start`.
         let mut unavailable = vec![0u32; nodes.len()];
         let mut watch_start = vec![0u32; reps + 1];
-        let waits = |inputs: &[usize], position: usize| {
-            let r = inputs[position];
-            !inputs[..position].contains(&r) && entry.values[r].is_none() && produced[r]
+        // A lane stamp deduplicates dependencies in linear time, without
+        // scanning each operand's prefix or changing operand order.
+        let mut seen_input = vec![NONE; reps];
+        let waits = |r: usize, lane: u32, seen: &mut [u32]| {
+            let first = seen[r] != lane;
+            seen[r] = lane;
+            first && entry.values[r].is_none() && produced[r]
         };
         let mut watches = 0usize;
         for (i, lane) in nodes.iter().enumerate() {
             let inputs = &lane.inputs;
             for position in 0..inputs.len() {
-                if waits(inputs, position) {
+                if waits(inputs[position], i as u32, &mut seen_input) {
                     unavailable[i] += 1;
                     watch_start[inputs[position]] += 1;
                     watches += 1;
@@ -553,16 +557,18 @@ impl RegionProgram {
             watch_start[r] += watch_start[r - 1];
         }
         let mut watchers = vec![0u32; watches];
+        seen_input.fill(NONE);
         for (i, lane) in nodes.iter().enumerate().rev() {
             let inputs = &lane.inputs;
             for position in (0..inputs.len()).rev() {
-                if waits(inputs, position) {
+                if waits(inputs[position], i as u32, &mut seen_input) {
                     let r = inputs[position];
                     watch_start[r] -= 1;
                     watchers[watch_start[r] as usize] = i as u32;
                 }
             }
         }
+        drop(seen_input);
         let mut owners = vec![NONE; reps];
         let mut ready_owners = unavailable
             .iter()
