@@ -2527,3 +2527,40 @@ fn subgroup_values_are_retained_only_for_permutation() {
         assert!(batch.polynomials[0].coeffs[0] == F::ONE);
     }
 }
+
+/// Isolated because it configures the process-wide context to accept a software adapter.
+#[test]
+#[ignore = "run alone with --ignored to exercise the complete Vulkan prover on software"]
+fn software_gpu_proofs_verify() {
+    use crate::iop::witness::{PartialWitness, WitnessWrite};
+    use crate::plonk::circuit_builder::CircuitBuilder;
+    use crate::plonk::circuit_data::CircuitConfig;
+    use crate::plonk::config::PoseidonGoldilocksConfig as C;
+    configure(GpuConfig {
+        backend: Some(Backend::Vulkan),
+        allow_software: true,
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(context().is_some(), "a Vulkan adapter is required");
+    let mut config = CircuitConfig::standard_recursion_config();
+    config.security_bits = 1;
+    config.fri_config.num_query_rounds = 2;
+    config.fri_config.proof_of_work_bits = 0;
+    let mut builder = CircuitBuilder::<F, 2>::new(config);
+    let input = builder.add_virtual_target();
+    let mut state = vec![input; 4];
+    for _ in 0..128 {
+        state = builder.hash_n_to_hash_no_pad::<H>(state).elements.to_vec();
+    }
+    builder.register_public_inputs(&state);
+    let data = builder.build::<C>();
+    let plan = policy::ExecutionPlan::new(&data.common, &data.prover_only);
+    assert_eq!(plan.path, policy::ExecutionPath::Resident);
+    let mut pw = PartialWitness::new();
+    pw.set_target(input, F::from_canonical_u64(42)).unwrap();
+    data.verify(data.prove(pw.clone()).unwrap()).unwrap();
+    let program = data.compile_witness_program_like(&pw).unwrap();
+    data.install_witness_program(program).unwrap();
+    data.verify(data.prove(pw).unwrap()).unwrap();
+}

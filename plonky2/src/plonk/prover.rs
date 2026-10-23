@@ -478,35 +478,45 @@ where
         )
     );
 
-    let all_quotient_poly_chunks: Vec<PolynomialCoeffs<F>> = timed!(
-        timing,
-        "split up quotient polys",
-        quotient_polys
-            .into_par_iter()
-            .flat_map(|mut quotient_poly| {
-                quotient_poly.trim_to_len(quotient_degree).expect(
-                    "Quotient has failed, the vanishing polynomial is not divisible by Z_H",
-                );
-                // Split quotient into degree-n chunks.
-                quotient_poly.chunks(degree)
-            })
-            .collect()
-    );
-
-    let mut quotient_polys_commitment = timed!(
-        timing,
-        "commit to quotient polys",
-        PolynomialBatch::<F, C, D>::from_coeffs_with_plan(
-            all_quotient_poly_chunks,
-            config.fri_config.rate_bits,
-            config.zero_knowledge && PlonkOracle::QUOTIENT.blinding,
-            config.fri_config.cap_height,
+    let mut quotient_polys_commitment = match quotient_polys {
+        #[cfg(feature = "gpu")]
+        QuotientCoefficients::Device(quotient) => timed!(
             timing,
-            prover_data.fft_root_table.as_ref(),
-            #[cfg(feature = "gpu")]
-            Some(&gpu_plan),
-        )
-    );
+            "commit to quotient polys",
+            quotient.commit::<F, C, D>(common_data, timing, gpu_plan.retain_leaves())
+        ),
+        QuotientCoefficients::Host(polynomials) => {
+            let all_quotient_poly_chunks: Vec<PolynomialCoeffs<F>> = timed!(
+                timing,
+                "split up quotient polys",
+                polynomials
+                    .into_par_iter()
+                    .flat_map(|mut quotient_poly| {
+                        quotient_poly.trim_to_len(quotient_degree).expect(
+                            "Quotient has failed, the vanishing polynomial is not divisible by Z_H",
+                        );
+                        // Split quotient into degree-n chunks.
+                        quotient_poly.chunks(degree)
+                    })
+                    .collect()
+            );
+
+            timed!(
+                timing,
+                "commit to quotient polys",
+                PolynomialBatch::<F, C, D>::from_coeffs_with_plan(
+                    all_quotient_poly_chunks,
+                    config.fri_config.rate_bits,
+                    config.zero_knowledge && PlonkOracle::QUOTIENT.blinding,
+                    config.fri_config.cap_height,
+                    timing,
+                    prover_data.fft_root_table.as_ref(),
+                    #[cfg(feature = "gpu")]
+                    Some(&gpu_plan),
+                )
+            )
+        }
+    };
 
     challenger.observe_cap::<C::Hasher>(&quotient_polys_commitment.merkle_tree.cap);
 
@@ -837,6 +847,22 @@ fn compute_all_lookup_polys<
 
 const BATCH_SIZE: usize = 32;
 
+enum QuotientCoefficients<F: RichField> {
+    Host(Vec<PolynomialCoeffs<F>>),
+    #[cfg(feature = "gpu")]
+    Device(crate::gpu::quotient::DeviceQuotient),
+}
+
+#[cfg(all(test, feature = "gpu"))]
+impl<F: RichField> QuotientCoefficients<F> {
+    fn into_host(self) -> Vec<PolynomialCoeffs<F>> {
+        match self {
+            Self::Host(polynomials) => polynomials,
+            Self::Device(device) => device.read(),
+        }
+    }
+}
+
 /// The quotient polynomials, one per challenge, as coefficients. With the `gpu` feature and a
 /// suitable adapter, supported circuits without lookups use the GPU kernel,
 /// optionally sharing rows with the CPU. The result is the same as
@@ -857,9 +883,9 @@ fn compute_quotient_polys<
     deltas: &[F],
     alphas: &[F],
     #[cfg(feature = "gpu")] plan: Option<&crate::gpu::policy::ExecutionPlan>,
-) -> Vec<PolynomialCoeffs<F>> {
+) -> QuotientCoefficients<F> {
     #[cfg(feature = "gpu")]
-    if let Some(result) = crate::gpu::quotient::try_compute_quotient_polys::<F, C, D>(
+    if let Some(result) = crate::gpu::quotient::try_compute_quotient::<F, C, D>(
         common_data,
         prover_data,
         public_inputs_hash,
@@ -870,9 +896,21 @@ fn compute_quotient_polys<
         alphas,
         plan,
     ) {
-        return result;
+        // Preserve commitment fallback for unsupported hashers or a quotient
+        // batch whose extended chunks exceed the adapter's limits.
+        if crate::gpu::lde::applicable::<F, C, D>(
+            common_data.config.num_challenges * common_data.quotient_degree_factor,
+            common_data.degree(),
+            common_data.config.fri_config.rate_bits,
+            common_data.config.zero_knowledge && PlonkOracle::QUOTIENT.blinding,
+        )
+        .is_some()
+        {
+            return QuotientCoefficients::Device(result);
+        }
+        return QuotientCoefficients::Host(result.read());
     }
-    compute_quotient_polys_cpu::<F, C, D>(
+    QuotientCoefficients::Host(compute_quotient_polys_cpu::<F, C, D>(
         common_data,
         prover_data,
         public_inputs_hash,
@@ -882,7 +920,7 @@ fn compute_quotient_polys<
         gammas,
         deltas,
         alphas,
-    )
+    ))
 }
 
 /// `compute_quotient_polys` on the CPU.
@@ -1298,7 +1336,8 @@ mod gpu_tests {
             &alphas,
             #[cfg(feature = "gpu")]
             None,
-        );
+        )
+        .into_host();
         let degree = common_data.degree();
         let quotient_degree = common_data.quotient_degree();
         let chunks: Vec<PolynomialCoeffs<F>> = quotient_polys

@@ -500,6 +500,46 @@ pub(crate) fn from_device_values<
     )
 }
 
+/// Commits column-major device coefficients, staging the host copy while the
+/// LDE and Merkle hashing run. No coefficient upload or host chunking is needed.
+pub(crate) fn from_device_coeffs<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    ctx: &std::sync::Arc<GpuContext>,
+    coeffs: DeviceBuffer,
+    columns: usize,
+    degree: usize,
+    rate_bits: usize,
+    blinding: bool,
+    cap_height: usize,
+    timing: &mut TimingTree,
+    retain_leaves: bool,
+) -> PolynomialBatch<F, C, D> {
+    let bytes = (columns * degree * 8) as u64;
+    let staging = ctx.readback_buffer(bytes);
+    let mut encoder = ctx.encoder("stage device coefficients");
+    encoder.copy_buffer_to_buffer(&coeffs, 0, &staging, 0, bytes.next_multiple_of(16));
+    let done = ctx.submit_async(encoder);
+    commit(
+        ctx,
+        HostCoefficients::Staged {
+            staging,
+            done,
+            columns,
+            degree,
+        },
+        coeffs,
+        crate::gpu::DeviceCache::default(),
+        rate_bits,
+        blinding,
+        cap_height,
+        timing,
+        retain_leaves,
+    )
+}
+
 /// `PolynomialBatch::from_coeffs` on the device.
 #[cfg(test)]
 pub(crate) fn from_coeffs<
@@ -678,7 +718,7 @@ fn commit<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usi
             let polynomials = timed!(
                 timing,
                 "gpu: read coefficients",
-                audit_coefficient_transfer("download", "commitment_ifft", columns, degree, || {
+                audit_coefficient_transfer("download", "commitment", columns, degree, || {
                     ctx.read_staged_with_timing(
                         staging,
                         (columns * degree * 8) as u64,

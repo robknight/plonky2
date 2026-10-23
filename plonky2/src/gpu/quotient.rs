@@ -1685,8 +1685,92 @@ pub(crate) fn prepare<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, 
     Some((ctx, program))
 }
 
+/// Quotient coefficients awaiting commitment, still in device memory.
+pub(crate) struct DeviceQuotient {
+    ctx: Arc<GpuContext>,
+    coeffs: DeviceBuffer,
+    len: usize,
+    challenges: usize,
+}
+
+impl DeviceQuotient {
+    /// Remove each challenge's padding, checking the same zero tail as the
+    /// CPU's `trim_to_len`. A power-of-two quotient needs neither copy nor readback.
+    fn compact<F: RichField>(&self, len: usize) -> DeviceBuffer {
+        assert!(len <= self.len);
+        if len == self.len {
+            return self.coeffs.clone();
+        }
+        let tail = self.len - len;
+        let tails = self
+            .ctx
+            .storage("quotient tails", (self.challenges * tail * 8) as u64);
+        let compact = self
+            .ctx
+            .storage("quotient chunks", (self.challenges * len * 8) as u64);
+        let mut encoder = self.ctx.encoder("compact quotient coefficients");
+        for c in 0..self.challenges {
+            encoder.copy_buffer_to_buffer(
+                &self.coeffs,
+                (c * self.len * 8) as u64,
+                &compact,
+                (c * len * 8) as u64,
+                (len * 8) as u64,
+            );
+            encoder.copy_buffer_to_buffer(
+                &self.coeffs,
+                ((c * self.len + len) * 8) as u64,
+                &tails,
+                (c * tail * 8) as u64,
+                (tail * 8) as u64,
+            );
+        }
+        self.ctx.submit_async(encoder);
+        assert!(
+            self.ctx
+                .read_u64(&tails, self.challenges * tail)
+                .into_iter()
+                .all(|word| F::from_noncanonical_u64(word) == F::ZERO),
+            "Quotient has failed, the vanishing polynomial is not divisible by Z_H"
+        );
+        compact
+    }
+
+    pub(crate) fn commit<
+        F: RichField + Extendable<D>,
+        C: GenericConfig<D, F = F>,
+        const D: usize,
+    >(
+        self,
+        common: &CommonCircuitData<F, D>,
+        timing: &mut crate::util::timing::TimingTree,
+        retain_leaves: bool,
+    ) -> PolynomialBatch<F, C, D> {
+        let coeffs = self.compact::<F>(common.quotient_degree());
+        crate::gpu::lde::from_device_coeffs(
+            &self.ctx,
+            coeffs,
+            self.challenges * common.quotient_degree_factor,
+            common.degree(),
+            common.config.fri_config.rate_bits,
+            common.config.zero_knowledge
+                && crate::plonk::plonk_common::PlonkOracle::QUOTIENT.blinding,
+            common.config.fri_config.cap_height,
+            timing,
+            retain_leaves,
+        )
+    }
+
+    pub(crate) fn read<F: RichField>(self) -> Vec<PolynomialCoeffs<F>> {
+        crate::gpu::lde::read_columns::<F>(&self.ctx, &self.coeffs, self.challenges, self.len)
+            .into_iter()
+            .map(PolynomialCoeffs::new)
+            .collect()
+    }
+}
+
 /// Execute the prepared quotient, or return None for a CPU-quotient plan.
-pub(crate) fn try_compute_quotient_polys<
+pub(crate) fn try_compute_quotient<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
     const D: usize,
@@ -1700,7 +1784,7 @@ pub(crate) fn try_compute_quotient_polys<
     gammas: &[F],
     alphas: &[F],
     plan: Option<&crate::gpu::policy::ExecutionPlan>,
-) -> Option<Vec<PolynomialCoeffs<F>>> {
+) -> Option<DeviceQuotient> {
     let owned_plan;
     let plan = match plan {
         Some(plan) => plan,
@@ -1945,32 +2029,46 @@ pub(crate) fn try_compute_quotient_polys<
             shift_out: Some(GoldilocksField::coset_shift().inverse()),
         },
     );
-    ctx.submit(encoder);
+    ctx.submit_async(encoder);
     drop((cs_lde, w_lde, z_lde, out, work));
-    Some(crate::gpu::lde::audit_coefficient_transfer(
-        "download",
-        "quotient_ifft",
-        num_challenges,
-        n,
-        || {
-            let words = ctx.read_u64(&coeffs, num_challenges * n);
-            log::debug!(
-            "gpu: quotient: LDEs and tables {ldes:?}, evaluation {evaluation:?}, IFFT and readback {:?}",
-            start.elapsed()
-        );
-            words
-                .par_chunks_exact(n)
-                .map(|column| {
-                    PolynomialCoeffs::new(
-                        column
-                            .iter()
-                            .map(|&w| F::from_noncanonical_u64(w))
-                            .collect(),
-                    )
-                })
-                .collect()
-        },
-    ))
+    log::debug!("gpu: quotient: LDEs and tables {ldes:?}, evaluation {evaluation:?}, IFFT submitted in {:?}", start.elapsed());
+    Some(DeviceQuotient {
+        ctx: plan.prepared.as_ref().unwrap().0.clone(),
+        coeffs,
+        len: n,
+        challenges: num_challenges,
+    })
+}
+
+/// Host result for differential tests; production commits the device result directly.
+#[cfg(test)]
+pub(crate) fn try_compute_quotient_polys<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    common: &CommonCircuitData<F, D>,
+    prover: &ProverOnlyCircuitData<F, C, D>,
+    public_inputs_hash: &HashOut<F>,
+    wires: &PolynomialBatch<F, C, D>,
+    zs: &PolynomialBatch<F, C, D>,
+    betas: &[F],
+    gammas: &[F],
+    alphas: &[F],
+    plan: Option<&crate::gpu::policy::ExecutionPlan>,
+) -> Option<Vec<PolynomialCoeffs<F>>> {
+    try_compute_quotient(
+        common,
+        prover,
+        public_inputs_hash,
+        wires,
+        zs,
+        betas,
+        gammas,
+        alphas,
+        plan,
+    )
+    .map(DeviceQuotient::read)
 }
 
 #[cfg(test)]
@@ -1998,5 +2096,58 @@ mod limit_tests {
         // The per-row table is three fields even for a one-column circuit.
         assert!(!requirements.fits(2 << 20, 65535));
         assert!(!requirements.fits(binding, 1));
+    }
+}
+
+#[cfg(test)]
+mod device_coefficient_tests {
+    use super::*;
+
+    #[test]
+    fn device_quotient_compacts_challenges_and_rejects_nonzero_tails() {
+        let config = crate::gpu::GpuConfig {
+            allow_software: true,
+            ..Default::default()
+        };
+        let Ok(ctx) = GpuContext::with_config(&config) else {
+            eprintln!("no compute adapter; skipping");
+            return;
+        };
+        let ctx = Arc::new(ctx);
+        let mut quotient = DeviceQuotient {
+            coeffs: ctx.upload("test quotient", &[1, 2, 3, 0, 4, 5, 6, 0]),
+            ctx: ctx.clone(),
+            len: 4,
+            challenges: 2,
+        };
+        let unchanged = quotient.compact::<GoldilocksField>(4);
+        assert_eq!(*unchanged, *quotient.coeffs);
+        let compact = quotient.compact::<GoldilocksField>(3);
+        assert_eq!(ctx.read_u64(&compact, 6), [1, 2, 3, 4, 5, 6]);
+        let batch = crate::gpu::lde::from_device_coeffs::<
+            GoldilocksField,
+            crate::plonk::config::PoseidonGoldilocksConfig,
+            2,
+        >(
+            &ctx,
+            quotient.coeffs.clone(),
+            2,
+            4,
+            2,
+            false,
+            1,
+            &mut crate::util::timing::TimingTree::default(),
+            false,
+        );
+        assert_eq!(*batch.device_coeffs.get().unwrap(), *quotient.coeffs);
+        assert_eq!(
+            batch.polynomials[1].coeffs,
+            [4, 5, 6, 0].map(GoldilocksField::from_canonical_u64)
+        );
+        quotient.coeffs = ctx.upload("invalid quotient", &[1, 2, 3, 0, 4, 5, 6, 7]);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            quotient.compact::<GoldilocksField>(3)
+        }))
+        .is_err());
     }
 }
