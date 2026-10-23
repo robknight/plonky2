@@ -1571,7 +1571,8 @@ fn device_lde<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D:
             shift_out: None,
         },
     );
-    ctx.submit(encoder);
+    // Subsequent kernels consume this LDE on the same queue.
+    ctx.submit_async(encoder);
     if keep {
         batch.batch().device.set_if_within_limit(ctx, lde.clone());
     }
@@ -1947,7 +1948,14 @@ pub(crate) fn try_compute_quotient<
                 pass.dispatch_workgroups((gpu_rows as u32).div_ceil(HASH_WORKGROUP), 1, 1);
             }
             let done = ctx.submit_async(encoder);
-            ctx.wait(&done);
+            // Only hybrid feedback and explicit timestamp reads need the
+            // completed evaluation here. Otherwise the IFFT queues behind it.
+            let wait = cpu_rows > 0;
+            #[cfg(feature = "gpu-profiling")]
+            let wait = wait || span.is_some();
+            if wait {
+                ctx.wait(&done);
+            }
             let elapsed = start.elapsed();
             #[cfg(feature = "gpu-profiling")]
             if let Some(span) = span {

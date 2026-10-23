@@ -170,7 +170,8 @@ pub(crate) fn try_partial_products_commitment<
                 1,
             );
         }
-        ctx.submit(encoder);
+        // The following IFFT is ordered after this submission on the same queue.
+        ctx.submit_async(encoder);
         out
     });
     Some(from_device_values(
