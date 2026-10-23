@@ -370,6 +370,9 @@ pub(crate) fn try_prove_openings<
             fri_params,
             final_poly_coeff_len,
             max_num_query_steps,
+            oracles
+                .iter()
+                .any(|o| o.batch().merkle_tree.leaves.is_column_backed()),
         )
     );
     let pow_witness = timed!(

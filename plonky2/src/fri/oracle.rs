@@ -150,8 +150,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 cap_height,
                 timing,
                 plan.map_or_else(
-                    || ctx.options.retain_leaves(ctx.mappable),
-                    |p| p.retain_leaves(),
+                    || ctx.options.leaf_storage(ctx.mappable),
+                    |p| p.leaf_storage(),
                 ),
                 retain_values,
             );
@@ -247,8 +247,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 cap_height,
                 timing,
                 plan.map_or_else(
-                    || ctx.options.retain_leaves(ctx.mappable),
-                    |p| p.retain_leaves(),
+                    || ctx.options.leaf_storage(ctx.mappable),
+                    |p| p.leaf_storage(),
                 ),
             );
             if plan.is_none() {

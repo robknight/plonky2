@@ -25,6 +25,99 @@ pub(crate) enum LeafSource {
     },
 }
 
+pub(crate) struct LeafGatherKernel {
+    layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::ComputePipeline,
+}
+
+/// Gather queried leaves into row order without retaining a full transpose.
+/// Column indices have exactly the same bit reversal and FRI grouping as
+/// `hash_leaves`; the field words themselves are copied unchanged.
+pub(crate) fn gather_leaves(
+    ctx: &GpuContext,
+    src: &wgpu::Buffer,
+    source: LeafSource,
+    indices: &[usize],
+) -> (DeviceBuffer, wgpu::SubmissionIndex) {
+    let leaf_len = match source {
+        LeafSource::Rows { leaf_len } => leaf_len,
+        LeafSource::Columns {
+            columns,
+            log_n,
+            arity_bits,
+        } => {
+            assert!(columns > 0 && arity_bits <= log_n && log_n < 32);
+            assert!(indices.iter().all(|&i| i < 1usize << (log_n - arity_bits)));
+            assert!(src.size() >= (u64::from(columns) << log_n) * 8);
+            columns << arity_bits
+        }
+    };
+    let row_bytes = u64::from(leaf_len) * 8;
+    let compact = ctx.storage("queried leaf rows", row_bytes * indices.len() as u64);
+    let mut encoder = ctx.encoder("gather queried leaf rows");
+    match source {
+        LeafSource::Rows { .. } => {
+            for (j, &index) in indices.iter().enumerate() {
+                assert!((index as u64 + 1) * row_bytes <= src.size());
+                encoder.copy_buffer_to_buffer(
+                    src,
+                    index as u64 * row_bytes,
+                    &compact,
+                    j as u64 * row_bytes,
+                    row_bytes,
+                );
+            }
+        }
+        LeafSource::Columns {
+            columns,
+            log_n,
+            arity_bits,
+        } => {
+            let kernel = ctx.leaf_gather.get_or_init(|| {
+                let layout = super::storage_layout(
+                    &ctx.device,
+                    "leaf gather",
+                    &[(true, true), (false, true), (false, true), (false, false)],
+                );
+                let module = super::module(
+                    &ctx.device,
+                    "leaf gather",
+                    super::shader::leaf_gather_module(),
+                );
+                let pipeline = super::pipeline(&ctx.device, &layout, &module, "gather_leaves");
+                LeafGatherKernel { layout, pipeline }
+            });
+            let count = u32::try_from(indices.len() * leaf_len as usize).expect("leaf gather size");
+            let groups = count.div_ceil(HASH_WORKGROUP);
+            let x = groups.min(ctx.max_workgroups).max(1);
+            let params = ctx.uniform(
+                "leaf gather params",
+                &[
+                    log_n,
+                    columns,
+                    arity_bits,
+                    leaf_len,
+                    count,
+                    x * HASH_WORKGROUP,
+                    0,
+                    0,
+                ],
+            );
+            let indices = ctx.upload(
+                "leaf query indices",
+                &indices.iter().map(|&i| i as u64).collect::<Vec<_>>(),
+            );
+            let bindings = ctx.bind(&kernel.layout, &[&params, src, &indices, &compact]);
+            let mut pass = ctx.begin_pass(&mut encoder, "gather column leaves", None);
+            pass.set_pipeline(&kernel.pipeline);
+            pass.set_bind_group(0, &bindings, &[]);
+            pass.dispatch_workgroups(x, groups.div_ceil(x).max(1), 1);
+        }
+    }
+    let done = ctx.submit_async(encoder);
+    (compact, done)
+}
+
 /// A tree's digests and cap on the device. The leaves are hashed by one
 /// submission and the levels by a second, so that a host that only needs
 /// the leaves (or the rows the leaf kernel wrote) can go on while the

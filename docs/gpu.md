@@ -15,7 +15,9 @@ Merkle hashing, the batched IFFT, coset low-degree extensions and leaf layout of
 
 Every kernel reproduces the CPU implementation bit for bit; the tests compare digests, caps and coefficients exactly. A proof made on the GPU is identical in form to one made on the CPU and verifies with the unchanged verifier.
 
-The prover releases column LDE caches when no later computation consumes them: after commitments for a CPU quotient, and after committing the quotient itself. Freed storage may remain in the bounded reuse pool; live buffer savings and allocated device memory are different measurements.
+Resident proofs keep commitment leaves in the same column-major buffers used by the quotient, and gather the queried rows on demand. This avoids a full duplicate row layout (556 MiB for 139 columns of 2^19 elements). Hybrid proofs on unified memory keep the row layout for their CPU quotient share. Resident FRI layers also reuse their column buffers; hybrid and CPU-quotient proofs retain the existing FRI row layout to avoid extra query dispatches. Full host access, equality and serialization still materialize leaves in their original row order.
+
+The prover releases column LDE caches when no later computation consumes them: after commitments for a CPU quotient, and after committing the quotient itself. Resident leaves can still share those buffers. Freed storage may remain in the bounded reuse pool; live buffer savings and allocated device memory are different measurements.
 
 ### Platforms
 

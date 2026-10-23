@@ -3,6 +3,7 @@
 //! hardware regression tests require a physical GPU.
 
 mod arithmetic_grid;
+mod column_leaves;
 mod inversion;
 mod permutation_products;
 mod residency_matrix;
@@ -184,6 +185,7 @@ fn shaders_validate() {
             ("hash", shader::hash_module(flavor)),
             ("pow", shader::pow_module(flavor)),
             ("fft", shader::fft_module(flavor)),
+            ("leaf gather", shader::leaf_gather_module().to_owned()),
             ("fold", shader::fold_module(flavor)),
             ("open", shader::open_module(flavor)),
             ("combine", shader::combine_module(flavor)),
@@ -2562,7 +2564,7 @@ fn subgroup_values_are_retained_only_for_permutation() {
             false,
             2,
             &mut TimingTree::default(),
-            false,
+            policy::LeafStorage::Host,
             retain_values,
         );
         assert_eq!(batch.batch.device_values.get().is_some(), retain_values);
@@ -2609,7 +2611,11 @@ fn proof_local_coefficients_materialize_only_for_cpu_access() {
             false,
             2,
             &mut TimingTree::default(),
-            resident,
+            if resident {
+                policy::LeafStorage::Columns
+            } else {
+                policy::LeafStorage::Host
+            },
             false,
         );
         assert!(!batch.host_coefficients_materialized());

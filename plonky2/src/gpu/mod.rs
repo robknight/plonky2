@@ -333,6 +333,7 @@ pub struct GpuContext {
     /// The proof-of-work search, compiled on first use.
     pub(crate) pow_kernel: OnceLock<Option<pow::PowKernel>>,
     pub(crate) quotient_tail: OnceLock<quotient::TailCheckKernel>,
+    pub(crate) leaf_gather: OnceLock<merkle::LeafGatherKernel>,
     open_layout: wgpu::BindGroupLayout,
     pub(crate) point_powers: wgpu::ComputePipeline,
     pub(crate) eval_openings: wgpu::ComputePipeline,
@@ -513,6 +514,14 @@ impl GpuOptions {
     /// also keeps them for hybrid proofs on unified memory.
     pub(crate) fn retain_leaves(&self, mappable: bool) -> bool {
         self.mode.path(mappable) == policy::ExecutionPath::Resident
+    }
+
+    pub(crate) fn leaf_storage(&self, mappable: bool) -> policy::LeafStorage {
+        if self.retain_leaves(mappable) {
+            policy::LeafStorage::Columns
+        } else {
+            policy::LeafStorage::Host
+        }
     }
 }
 
@@ -848,6 +857,7 @@ impl GpuContext {
             fold,
             pow_kernel: OnceLock::new(),
             quotient_tail: OnceLock::new(),
+            leaf_gather: OnceLock::new(),
             open_layout,
             point_powers,
             eval_openings,
@@ -1136,11 +1146,7 @@ impl GpuContext {
                 (staging, copied)
             },
         );
-        let result = self.map_and_read(&staging, bytes, Some(&copied), timing.as_deref_mut(), f);
-        timed_optional(timing, "gpu: recycle readback", || {
-            self.recycle_readback(staging)
-        });
-        result
+        self.read_staged_with_timing(staging, bytes, &copied, timing, f)
     }
 
     /// A host-mappable buffer of at least `bytes`, from the readback pool when
@@ -1161,6 +1167,25 @@ impl GpuContext {
                 mapped_at_creation: false,
             })
         })
+    }
+
+    /// Full host access to a shared LDE takes a snapshot so the primary
+    /// buffer remains usable by concurrent GPU readers. These infrequent,
+    /// potentially large snapshots are not retained in the readback pool.
+    pub(crate) fn read_snapshot<R>(
+        &self,
+        source: &wgpu::Buffer,
+        bytes: u64,
+        decode: impl FnOnce(&[u8]) -> R,
+    ) -> R {
+        if bytes == 0 {
+            return decode(&[]);
+        }
+        let staging = self.readback_buffer(bytes);
+        let mut encoder = self.encoder("materialize column leaves");
+        encoder.copy_buffer_to_buffer(source, 0, &staging, 0, bytes);
+        let copied = self.submit_async(encoder);
+        self.map_and_read(&staging, bytes, Some(&copied), None, decode)
     }
 
     /// A host-mappable upload buffer of at least `bytes`, mapped for writing,
@@ -1278,7 +1303,6 @@ impl GpuContext {
     /// Calls `f` with the first `bytes` of `staging`, a `readback_buffer`
     /// filled by a copy in submission `index`, then recycles it. Later
     /// submissions may still be running: the mapping waits only for `index`.
-    #[cfg(all(test, feature = "gpu-profiling"))]
     pub(crate) fn read_staged_with_timing<R>(
         &self,
         staging: wgpu::Buffer,

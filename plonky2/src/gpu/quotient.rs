@@ -1767,7 +1767,7 @@ impl DeviceQuotient {
         self,
         common: &CommonCircuitData<F, D>,
         timing: &mut crate::util::timing::TimingTree,
-        retain_leaves: bool,
+        leaf_storage: crate::gpu::policy::LeafStorage,
     ) -> ProverPolynomialBatch<F, C, D> {
         let coeffs = self.compact(common.quotient_degree());
         crate::gpu::lde::from_device_coeffs(
@@ -1780,7 +1780,7 @@ impl DeviceQuotient {
                 && crate::plonk::plonk_common::PlonkOracle::QUOTIENT.blinding,
             common.config.fri_config.cap_height,
             timing,
-            retain_leaves,
+            leaf_storage,
         )
     }
 
@@ -2177,7 +2177,7 @@ mod device_coefficient_tests {
             false,
             1,
             &mut crate::util::timing::TimingTree::default(),
-            false,
+            crate::gpu::policy::LeafStorage::Host,
         );
         assert_eq!(*batch.batch.device_coeffs.get().unwrap(), *quotient.coeffs);
         assert_eq!(

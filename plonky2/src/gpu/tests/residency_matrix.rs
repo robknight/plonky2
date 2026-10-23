@@ -80,7 +80,7 @@ fn unified_residency_matrix() {
         blinded,
         data.common.config.fri_config.cap_height,
         &mut TimingTree::default(),
-        resident,
+        plan.leaf_storage(),
         false,
     );
     assert_eq!(

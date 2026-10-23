@@ -293,7 +293,7 @@ where
                     config.zero_knowledge && PlonkOracle::WIRES.blinding,
                     config.fri_config.cap_height,
                     timing,
-                    gpu_plan.retain_leaves(),
+                    gpu_plan.leaf_storage(),
                     retain_values,
                 )
             ),
@@ -475,7 +475,7 @@ where
         QuotientCoefficients::Device(quotient) => timed!(
             timing,
             "commit to quotient polys",
-            quotient.commit::<F, C, D>(common_data, timing, gpu_plan.retain_leaves())
+            quotient.commit::<F, C, D>(common_data, timing, gpu_plan.leaf_storage())
         ),
         QuotientCoefficients::Host(polynomials) => {
             let all_quotient_poly_chunks: Vec<PolynomialCoeffs<F>> = timed!(

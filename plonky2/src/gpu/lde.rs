@@ -1,6 +1,7 @@
 //! Batched NTTs and the polynomial batch commitment on the device: IFFT of
 //! the values, coset LDE, and leaf hashing straight from the column-major
-//! evaluations, which also writes row-major Merkle leaves. These are read back
+//! evaluations. Resident proofs reuse these columns as their leaves; hybrid
+//! proofs write row-major leaves for CPU quotient evaluation. These are read back
 //! or retained on the device according to the proof's execution policy. The
 //! batch keeps both the coefficients and the extended evaluations on the
 //! device for the quotient and the opening phase.
@@ -13,6 +14,7 @@ use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::{Field, PrimeField64};
 use crate::fri::oracle::{PolynomialBatch, ProverOracle, ProverPolynomialBatch, SALT_SIZE};
 use crate::gpu::merkle::{build_tree, supported, LeafSource};
+use crate::gpu::policy::LeafStorage;
 use crate::gpu::shader::{
     fft_plan, FFT_INVERSE, FFT_LOAD_BITREV, FFT_SHIFT_IN, FFT_SHIFT_OUT, FFT_TO_OUTPUT,
     FFT_WORKGROUP, HASH_WORKGROUP,
@@ -411,7 +413,7 @@ pub(crate) fn from_values<
         blinding,
         cap_height,
         timing,
-        ctx.options.retain_leaves(ctx.mappable),
+        ctx.options.leaf_storage(ctx.mappable),
         false,
     )
     .into_host()
@@ -428,7 +430,7 @@ pub(crate) fn from_values_with_residency<
     blinding: bool,
     cap_height: usize,
     timing: &mut TimingTree,
-    retain_leaves: bool,
+    leaf_storage: LeafStorage,
     retain_values: bool,
 ) -> ProverPolynomialBatch<F, C, D> {
     let degree = values[0].len();
@@ -450,7 +452,7 @@ pub(crate) fn from_values_with_residency<
         blinding,
         cap_height,
         timing,
-        retain_leaves,
+        leaf_storage,
         retain_values,
     )
 }
@@ -471,7 +473,7 @@ pub(crate) fn from_device_values<
     blinding: bool,
     cap_height: usize,
     timing: &mut TimingTree,
-    retain_leaves: bool,
+    leaf_storage: LeafStorage,
     retain_values: bool,
 ) -> ProverPolynomialBatch<F, C, D> {
     let log_d = log2_strict(degree) as u32;
@@ -526,7 +528,7 @@ pub(crate) fn from_device_values<
         blinding,
         cap_height,
         timing,
-        retain_leaves,
+        leaf_storage,
     )
 }
 
@@ -545,7 +547,7 @@ pub(crate) fn from_device_coeffs<
     blinding: bool,
     cap_height: usize,
     timing: &mut TimingTree,
-    retain_leaves: bool,
+    leaf_storage: LeafStorage,
 ) -> ProverPolynomialBatch<F, C, D> {
     commit(
         ctx,
@@ -556,7 +558,7 @@ pub(crate) fn from_device_coeffs<
         blinding,
         cap_height,
         timing,
-        retain_leaves,
+        leaf_storage,
     )
 }
 
@@ -581,7 +583,7 @@ pub(crate) fn from_coeffs<
         blinding,
         cap_height,
         timing,
-        ctx.options.retain_leaves(ctx.mappable),
+        ctx.options.leaf_storage(ctx.mappable),
     )
     .into_host()
 }
@@ -597,7 +599,7 @@ pub(crate) fn from_coeffs_with_residency<
     blinding: bool,
     cap_height: usize,
     timing: &mut TimingTree,
-    retain_leaves: bool,
+    leaf_storage: LeafStorage,
 ) -> ProverPolynomialBatch<F, C, D> {
     let coeffs = timed!(timing, "gpu: upload coefficients", {
         audit_coefficient_transfer(
@@ -623,7 +625,7 @@ pub(crate) fn from_coeffs_with_residency<
         blinding,
         cap_height,
         timing,
-        retain_leaves,
+        leaf_storage,
     )
 }
 
@@ -638,7 +640,7 @@ fn commit<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usi
     blinding: bool,
     cap_height: usize,
     timing: &mut TimingTree,
-    retain_leaves: bool,
+    leaf_storage: LeafStorage,
 ) -> ProverPolynomialBatch<F, C, D> {
     let (num_polys, degree) = match &host_coeffs {
         HostCoefficients::Ready(polynomials) => {
@@ -703,11 +705,13 @@ fn commit<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usi
         // The salt columns follow the polynomials' columns in the LDE buffer.
         ctx.write(&lde, (num_polys * n) as u64, &salts);
     });
-    let rows = timed!(
-        timing,
-        "gpu: allocate leaf buffer",
-        ctx.storage("leaves", (columns * n * 8) as u64)
-    );
+    let rows = (leaf_storage != LeafStorage::Columns).then(|| {
+        timed!(
+            timing,
+            "gpu: allocate leaf buffer",
+            ctx.storage("leaves", (columns * n * 8) as u64)
+        )
+    });
     let tree = timed!(
         timing,
         "gpu: submit leaf hashing with row layout, and levels",
@@ -721,27 +725,46 @@ fn commit<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usi
             },
             log_n,
             cap_height as u32,
-            Some(&rows),
+            rows.as_deref(),
         )
     );
     // The rows are complete once the leaves are hashed; they are read while
     // the levels above are still being hashed.
-    let leaves = if retain_leaves {
-        MerkleLeaves::from_device(ctx.clone(), rows, columns, n, tree.leaves_done.clone())
-    } else {
-        timed!(
+    let leaves = match leaf_storage {
+        LeafStorage::Columns => MerkleLeaves::from_device_columns(
+            ctx.clone(),
+            lde.clone(),
+            columns,
+            log_n,
+            0,
+            tree.leaves_done.clone(),
+        ),
+        LeafStorage::Rows => MerkleLeaves::from_device(
+            ctx.clone(),
+            rows.expect("row buffer"),
+            columns,
+            n,
+            tree.leaves_done.clone(),
+        ),
+        LeafStorage::Host => timed!(
             timing,
             "gpu: hash leaves and read rows",
             MerkleLeaves::new(
-                read_fields::<F>(ctx, &rows, n * columns, &tree.leaves_done, timing),
+                read_fields::<F>(
+                    ctx,
+                    rows.as_ref().expect("row buffer"),
+                    n * columns,
+                    &tree.leaves_done,
+                    timing
+                ),
                 columns,
                 n
             )
-        )
+        ),
     };
     // With retained leaves (within a proof) the digests stay on the device
     // too; the FRI queries read only their authentication paths.
-    let (digests, cap) = if retain_leaves {
+    let (digests, cap) = if leaf_storage != LeafStorage::Host {
         let cap = timed!(
             timing,
             "gpu: hash levels and read cap",

@@ -98,6 +98,7 @@ pub(crate) fn try_committed_trees<
         fri_params,
         final_poly_coeff_len,
         max_num_query_steps,
+        ctx.options.retain_leaves(ctx.mappable),
     ))
 }
 
@@ -124,6 +125,7 @@ pub(crate) fn commit_phase_fits(ctx: &GpuContext, log_n: u32, fri_params: &FriPa
 /// The commit phase from the device copies of the first layer: `vals` and
 /// `coeffs_buffer` hold `D` columns of `n` components. Leaves and digests stay
 /// on the device until the query phase gathers their sparse proof data.
+/// Resident proofs reuse columns; other proofs retain the existing row layout.
 pub(crate) fn committed_trees<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -137,13 +139,14 @@ pub(crate) fn committed_trees<
     fri_params: &FriParams,
     final_poly_coeff_len: Option<usize>,
     max_num_query_steps: Option<usize>,
+    column_leaves: bool,
 ) -> FriCommitedTrees<F, C, D> {
     let mut trees = Vec::with_capacity(fri_params.reduction_arity_bits.len());
     let mut log_n = log2_strict(n) as u32;
     let mut shift = F::MULTIPLICATIVE_GROUP_GENERATOR;
     for (layer, &arity_bits) in fri_params.reduction_arity_bits.iter().enumerate() {
         let arity = 1usize << arity_bits;
-        let rows = ctx.storage("fri leaves", (D * n * 8) as u64);
+        let rows = (!column_leaves).then(|| ctx.storage("fri leaves", (D * n * 8) as u64));
         let tree = build_tree(
             ctx,
             &vals,
@@ -154,16 +157,27 @@ pub(crate) fn committed_trees<
             },
             log_n - arity_bits as u32,
             fri_params.config.cap_height as u32,
-            Some(&rows),
+            rows.as_deref(),
         );
         let cap = tree.read_cap::<F, C::Hasher>(ctx, None);
-        let leaves = MerkleLeaves::from_device(
-            ctx.clone(),
-            rows,
-            D * arity,
-            n >> arity_bits,
-            tree.leaves_done,
-        );
+        let leaves = if column_leaves {
+            MerkleLeaves::from_device_columns(
+                ctx.clone(),
+                vals.clone(),
+                D,
+                log_n,
+                arity_bits as u32,
+                tree.leaves_done,
+            )
+        } else {
+            MerkleLeaves::from_device(
+                ctx.clone(),
+                rows.expect("FRI row buffer"),
+                D * arity,
+                n >> arity_bits,
+                tree.leaves_done,
+            )
+        };
         let digests = MerkleDigests::from_device::<F, C::Hasher>(
             ctx.clone(),
             tree.digests,
@@ -343,7 +357,10 @@ mod resident_tests {
             return;
         };
         let ctx = Arc::new(ctx);
-        for arities in [vec![], vec![4, 4], vec![3, 3, 2]] {
+        for (arities, column_leaves) in [vec![], vec![4, 4], vec![3, 3, 2]]
+            .into_iter()
+            .flat_map(|arities| [false, true].map(move |columns| (arities.clone(), columns)))
+        {
             let mut coeffs = vec![QuadraticExtension::<F>::ZERO; 1024];
             for (i, c) in coeffs.iter_mut().take(256).enumerate() {
                 *c = QuadraticExtension([F::from_canonical_usize(i), F::ONE]);
@@ -377,6 +394,7 @@ mod resident_tests {
                 &params,
                 Some(256),
                 Some(4),
+                column_leaves,
             );
             let (cpu_trees, cpu_final) = fri_committed_trees_cpu::<F, C, 2>(
                 coeffs,
@@ -405,6 +423,7 @@ mod resident_tests {
             for (gpu, cpu) in gpu_trees.iter().zip(&cpu_trees) {
                 assert_eq!(gpu.cap, cpu.cap);
                 assert!(gpu.leaves.is_device_resident());
+                assert_eq!(gpu.leaves.is_column_backed(), column_leaves);
                 assert!(gpu.digests.is_device_resident());
             }
             assert_eq!(

@@ -43,6 +43,15 @@ pub(crate) enum ExecutionPath {
     CpuQuotient,
 }
 
+/// Hybrid CPU evaluation needs contiguous rows; fully resident proofs can
+/// reuse the column-major LDE as their leaf storage and gather queries later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LeafStorage {
+    Host,
+    Rows,
+    Columns,
+}
+
 /// The prepared program pins the context while this proof is running. CPU share
 /// is a snapshot: another proof's feedback cannot alter this proof's plan.
 pub(crate) struct ExecutionPlan {
@@ -84,14 +93,23 @@ impl ExecutionPlan {
         }
     }
 
-    /// Whether this proof's commitments keep their leaf rows on the device:
-    /// resident, or hybrid where the host maps device buffers directly, so the
-    /// CPU quotient share copies only the rows it reads.
+    /// Whether this proof keeps leaves on the device: columns for resident
+    /// proofs, rows for hybrid proofs where the host maps buffers directly.
     pub(crate) fn retain_leaves(&self) -> bool {
         match self.path {
             ExecutionPath::Resident => true,
             ExecutionPath::Hybrid => self.prepared.as_ref().is_some_and(|(ctx, _)| ctx.mappable),
             ExecutionPath::CpuQuotient => false,
+        }
+    }
+
+    pub(crate) fn leaf_storage(&self) -> LeafStorage {
+        if !self.retain_leaves() {
+            LeafStorage::Host
+        } else if self.path == ExecutionPath::Resident {
+            LeafStorage::Columns
+        } else {
+            LeafStorage::Rows
         }
     }
 }
@@ -110,6 +128,7 @@ mod tests {
             let unsupported = ExecutionPlan::from_prepared(None, Some(mode));
             assert_eq!(unsupported.path, ExecutionPath::CpuQuotient);
             assert!(!unsupported.retain_leaves());
+            assert_eq!(unsupported.leaf_storage(), LeafStorage::Host);
             for mappable in [false, true] {
                 let expected = if mode == ExecutionMode::Resident
                     || (mode == ExecutionMode::Auto && !mappable)

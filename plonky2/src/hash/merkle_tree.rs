@@ -65,7 +65,9 @@ struct DeviceLeaves<F: Copy> {
     // host copy exists, take/drop the buffer AND context for all leaf clones.
     resident: std::sync::Mutex<Option<ResidentBuffer>>,
     count: usize,
+    source: crate::gpu::merkle::LeafSource,
     decode: fn(&[u8]) -> Vec<F>,
+    decode_all: fn(&[u8], crate::gpu::merkle::LeafSource) -> Vec<F>,
     full: std::sync::OnceLock<Vec<F>>,
     queries: std::sync::OnceLock<std::collections::HashMap<usize, Vec<F>>>,
     rows: std::sync::OnceLock<PreparedRows<F>>,
@@ -92,12 +94,17 @@ impl<F: Copy> DeviceLeaves<F> {
                 "gpu: downloading all {} leaf values to the host",
                 self.count
             );
-            let values = d.context.read_after(
-                &d.buffer,
-                (self.count * 8) as u64,
-                Some(&d.done),
-                self.decode,
-            );
+            let bytes = (self.count * 8) as u64;
+            let decode = |bytes: &[u8]| (self.decode_all)(bytes, self.source);
+            let values = if matches!(self.source, crate::gpu::merkle::LeafSource::Columns { .. }) {
+                // The same LDE may still be read by another proof's quotient.
+                // Even on unified memory, map a staging snapshot rather than
+                // temporarily making the shared primary buffer unavailable.
+                d.context.read_snapshot(&d.buffer, bytes, decode)
+            } else {
+                d.context
+                    .read_after(&d.buffer, bytes, Some(&d.done), decode)
+            };
             // All GPU readbacks are complete. Host data now owns the contents.
             resident.take();
             values
@@ -183,6 +190,60 @@ fn decode_leaf_fields<F: crate::field::types::PrimeField64>(bytes: &[u8]) -> Vec
     words.iter().map(decode).collect()
 }
 
+/// Materialize columns directly into the public row order. Scoped workers
+/// avoid a Rayon task waiting on the OnceLock being initialized here.
+#[cfg(feature = "gpu")]
+fn decode_device_leaves<F: crate::field::types::PrimeField64>(
+    bytes: &[u8],
+    source: crate::gpu::merkle::LeafSource,
+) -> Vec<F> {
+    let crate::gpu::merkle::LeafSource::Columns {
+        columns,
+        log_n,
+        arity_bits,
+    } = source
+    else {
+        return decode_leaf_fields(bytes);
+    };
+    let columns = columns as usize;
+    let n = 1usize << log_n;
+    let leaf_len = columns << arity_bits;
+    let words = bytes.as_chunks::<8>().0;
+    let mut values = vec![F::ZERO; words.len()];
+    #[cfg(not(feature = "parallel"))]
+    let workers = 1;
+    #[cfg(feature = "parallel")]
+    let workers = if words.len() >= 1 << 17 {
+        std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(8)
+    } else {
+        1
+    };
+    let rows_per_worker = (n >> arity_bits).div_ceil(workers);
+    let fill = |first: usize, rows: &mut [F]| {
+        for (r, row) in rows.chunks_mut(leaf_len).enumerate() {
+            for (e, value) in row.iter_mut().enumerate() {
+                let index = ((first + r) << arity_bits) + e / columns;
+                let i = crate::util::reverse_bits(index, log_n as usize);
+                let word = words[(e % columns) * n + i];
+                *value = F::from_noncanonical_u64(u64::from_le_bytes(word));
+            }
+        }
+    };
+    if workers == 1 {
+        fill(0, &mut values);
+    } else {
+        std::thread::scope(|scope| {
+            for (worker, rows) in values.chunks_mut(rows_per_worker * leaf_len).enumerate() {
+                let fill = &fill;
+                scope.spawn(move || fill(worker * rows_per_worker, rows));
+            }
+        });
+    }
+    values
+}
+
 #[cfg(feature = "gpu")]
 impl<F: crate::field::types::PrimeField64> MerkleLeaves<F> {
     pub(crate) fn from_device(
@@ -191,6 +252,49 @@ impl<F: crate::field::types::PrimeField64> MerkleLeaves<F> {
         leaf_len: usize,
         num_leaves: usize,
         done: wgpu::SubmissionIndex,
+    ) -> Self {
+        Self::from_device_source(
+            context,
+            buffer,
+            leaf_len,
+            num_leaves,
+            done,
+            crate::gpu::merkle::LeafSource::Rows {
+                leaf_len: leaf_len as u32,
+            },
+        )
+    }
+
+    pub(crate) fn from_device_columns(
+        context: std::sync::Arc<crate::gpu::GpuContext>,
+        buffer: crate::gpu::DeviceBuffer,
+        columns: usize,
+        log_n: u32,
+        arity_bits: u32,
+        done: wgpu::SubmissionIndex,
+    ) -> Self {
+        assert!(columns > 0 && arity_bits <= log_n && log_n < 32);
+        Self::from_device_source(
+            context,
+            buffer,
+            columns << arity_bits,
+            1usize << (log_n - arity_bits),
+            done,
+            crate::gpu::merkle::LeafSource::Columns {
+                columns: columns as u32,
+                log_n,
+                arity_bits,
+            },
+        )
+    }
+
+    fn from_device_source(
+        context: std::sync::Arc<crate::gpu::GpuContext>,
+        buffer: crate::gpu::DeviceBuffer,
+        leaf_len: usize,
+        num_leaves: usize,
+        done: wgpu::SubmissionIndex,
+        source: crate::gpu::merkle::LeafSource,
     ) -> Self {
         let count = leaf_len * num_leaves;
         assert!(buffer.size() >= (count * 8) as u64);
@@ -204,7 +308,9 @@ impl<F: crate::field::types::PrimeField64> MerkleLeaves<F> {
                         done,
                     })),
                     count,
+                    source,
                     decode: decode_leaf_fields::<F>,
+                    decode_all: decode_device_leaves::<F>,
                     full: Default::default(),
                     queries: Default::default(),
                     rows: Default::default(),
@@ -239,18 +345,8 @@ impl<F: Copy> MerkleLeaves<F> {
             };
             let ctx = &buffer.context;
             let row_bytes = (self.leaf_len * 8) as u64;
-            let compact = ctx.storage("queried leaf rows", row_bytes * indices.len() as u64);
-            let mut encoder = ctx.encoder("gather queried leaf rows");
-            for (j, &index) in indices.iter().enumerate() {
-                encoder.copy_buffer_to_buffer(
-                    &buffer.buffer,
-                    index as u64 * row_bytes,
-                    &compact,
-                    j as u64 * row_bytes,
-                    row_bytes,
-                );
-            }
-            let done = ctx.submit_async(encoder);
+            let (compact, done) =
+                crate::gpu::merkle::gather_leaves(ctx, &buffer.buffer, d.source, &indices);
             ctx.read_after(
                 &compact,
                 row_bytes * indices.len() as u64,
@@ -302,51 +398,66 @@ impl<F: Copy> MerkleLeaves<F> {
         indices.dedup();
         assert!(indices.iter().all(|&i| i < self.num_leaves));
         let row_bytes = self.leaf_len * 8;
-        let data = buffer.context.read_after(
-            &buffer.buffer,
-            (d.count * 8) as u64,
-            Some(&buffer.done),
-            |bytes| {
-                // Each scoped worker copies and decodes its own run of rows in
-                // small blocks, so every decode call stays single-threaded.
-                let workers = std::thread::available_parallelism()
-                    .map_or(1, usize::from)
-                    .clamp(1, 8);
-                let chunk = indices.len().div_ceil(workers).max(1);
-                let decode = d.decode;
-                let parts = std::thread::scope(|scope| {
-                    let handles = indices
-                        .chunks(chunk)
-                        .map(|run| {
-                            scope.spawn(move || {
-                                let mut out = Vec::with_capacity(run.len() * row_bytes / 8);
-                                let mut block = Vec::with_capacity(256 * row_bytes);
-                                for rows in run.chunks(256) {
-                                    block.clear();
-                                    for &i in rows {
-                                        block.extend_from_slice(
-                                            &bytes[i * row_bytes..(i + 1) * row_bytes],
-                                        );
+        let data = if matches!(d.source, crate::gpu::merkle::LeafSource::Columns { .. }) {
+            let (compact, done) = crate::gpu::merkle::gather_leaves(
+                &buffer.context,
+                &buffer.buffer,
+                d.source,
+                &indices,
+            );
+            buffer.context.read_after(
+                &compact,
+                (indices.len() * row_bytes) as u64,
+                Some(&done),
+                d.decode,
+            )
+        } else {
+            buffer.context.read_after(
+                &buffer.buffer,
+                (d.count * 8) as u64,
+                Some(&buffer.done),
+                |bytes| {
+                    // Each scoped worker copies and decodes its own run of rows in
+                    // small blocks, so every decode call stays single-threaded.
+                    let workers = std::thread::available_parallelism()
+                        .map_or(1, usize::from)
+                        .clamp(1, 8);
+                    let chunk = indices.len().div_ceil(workers).max(1);
+                    let decode = d.decode;
+                    let parts = std::thread::scope(|scope| {
+                        let handles = indices
+                            .chunks(chunk)
+                            .map(|run| {
+                                scope.spawn(move || {
+                                    let mut out = Vec::with_capacity(run.len() * row_bytes / 8);
+                                    let mut block = Vec::with_capacity(256 * row_bytes);
+                                    for rows in run.chunks(256) {
+                                        block.clear();
+                                        for &i in rows {
+                                            block.extend_from_slice(
+                                                &bytes[i * row_bytes..(i + 1) * row_bytes],
+                                            );
+                                        }
+                                        out.extend(decode(&block));
                                     }
-                                    out.extend(decode(&block));
-                                }
-                                out
+                                    out
+                                })
                             })
-                        })
-                        .collect::<Vec<_>>();
-                    handles
-                        .into_iter()
-                        .map(|handle| handle.join().expect("leaf row worker panicked"))
-                        .collect::<Vec<_>>()
-                });
-                // Consume the parts so each is freed once copied.
-                let mut data = Vec::with_capacity(indices.len() * self.leaf_len);
-                for part in parts {
-                    data.extend(part);
-                }
-                data
-            },
-        );
+                            .collect::<Vec<_>>();
+                        handles
+                            .into_iter()
+                            .map(|handle| handle.join().expect("leaf row worker panicked"))
+                            .collect::<Vec<_>>()
+                    });
+                    // Consume the parts so each is freed once copied.
+                    let mut data = Vec::with_capacity(indices.len() * self.leaf_len);
+                    for part in parts {
+                        data.extend(part);
+                    }
+                    data
+                },
+            )
+        };
         drop(resident);
         let mut index = vec![u32::MAX; self.num_leaves];
         for (k, &i) in indices.iter().enumerate() {
@@ -368,6 +479,13 @@ impl<F: Copy> MerkleLeaves<F> {
             .device
             .as_ref()
             .is_some_and(|d| d.resident.lock().unwrap().is_some())
+    }
+
+    pub(crate) fn is_column_backed(&self) -> bool {
+        self.values.device.as_ref().is_some_and(|d| {
+            matches!(d.source, crate::gpu::merkle::LeafSource::Columns { .. })
+                && d.resident.lock().unwrap().is_some()
+        })
     }
 }
 

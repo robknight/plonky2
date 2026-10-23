@@ -766,6 +766,33 @@ pub fn hash_module(flavor: Flavor) -> String {
     out
 }
 
+/// Copies column-backed commitment/FRI leaves into a compact query buffer.
+/// No field arithmetic or 64-bit shader integers are needed.
+pub(crate) fn leaf_gather_module() -> &'static str {
+    r#"
+struct Params {
+    log_n: u32, columns: u32, arity_bits: u32, leaf_len: u32,
+    count: u32, stride: u32, pad0: u32, pad1: u32,
+}
+@group(0) @binding(0) var<uniform> p: Params;
+@group(0) @binding(1) var<storage, read> src: array<vec2<u32>>;
+@group(0) @binding(2) var<storage, read> indices: array<vec2<u32>>;
+@group(0) @binding(3) var<storage, read_write> out: array<vec2<u32>>;
+@compute @workgroup_size(64)
+fn gather_leaves(@builtin(global_invocation_id) id: vec3<u32>) {
+    let k = id.x + id.y * p.stride;
+    if (k >= p.count) { return; }
+    let query = k / p.leaf_len;
+    let e = k % p.leaf_len;
+    var row = 0u;
+    if (p.log_n != 0u) {
+        row = reverseBits((indices[query].x << p.arity_bits) + e / p.columns) >> (32u - p.log_n);
+    }
+    out[k] = src[(e % p.columns) * (1u << p.log_n) + row];
+}
+"#
+}
+
 /// Proof-of-work search: each invocation tries candidate
 /// `base + id` in word `position` of the prepared sponge state, applies the
 /// exact permutation and keeps the smallest index whose response (word 7, the
