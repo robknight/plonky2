@@ -324,6 +324,7 @@ pub struct GpuContext {
     hash_layout: wgpu::BindGroupLayout,
     pub(crate) hash_leaves: wgpu::ComputePipeline,
     pub(crate) hash_nodes: wgpu::ComputePipeline,
+    #[cfg(test)]
     pub(crate) permute: wgpu::ComputePipeline,
     fft_layout: wgpu::BindGroupLayout,
     pub(crate) fft: wgpu::ComputePipeline,
@@ -704,6 +705,7 @@ impl GpuContext {
         let hash_module = module(&device, "plonky2 hash", &shader::hash_module(flavor));
         let hash_leaves = pipeline(&device, &hash_layout, &hash_module, "hash_leaves");
         let hash_nodes = pipeline(&device, &hash_layout, &hash_module, "hash_nodes");
+        #[cfg(test)]
         let permute = pipeline(&device, &hash_layout, &hash_module, "poseidon_permute");
 
         let fft_layout = storage_layout(
@@ -835,6 +837,7 @@ impl GpuContext {
             hash_layout,
             hash_leaves,
             hash_nodes,
+            #[cfg(test)]
             permute,
             fft_layout,
             fft,
@@ -1382,7 +1385,11 @@ impl GpuContext {
     }
 
     /// Applies the Poseidon permutation to each state.
-    pub fn permute_states(&self, states: &[[GoldilocksField; 12]]) -> Vec<[GoldilocksField; 12]> {
+    #[cfg(test)]
+    pub(crate) fn permute_states(
+        &self,
+        states: &[[GoldilocksField; 12]],
+    ) -> Vec<[GoldilocksField; 12]> {
         let words = states
             .iter()
             .flatten()

@@ -9,7 +9,7 @@
 //! `eval_unfiltered_circuit` on a scratch builder with symbolic inputs and
 //! interprets the recorded gate instances (arithmetic, multiplication and
 //! reducing gates) into a DAG of field operations, from which
-//! [`emit_gate`] generates WGSL. Gates whose circuit evaluation uses
+//! the quotient compiler generates bytecode. Gates whose circuit evaluation uses
 //! anything else (witness generators, other gate types) are reported as
 //! untraceable and the quotient falls back to the CPU.
 //!
@@ -17,6 +17,7 @@
 //! the base field: extension targets are traced as pairs of nodes whose
 //! second component folds to zero, and the tracer checks that it does.
 
+#[cfg(test)]
 use core::fmt::Write;
 
 use hashbrown::HashMap;
@@ -30,6 +31,7 @@ use crate::gates::multiplication_extension::MulExtensionGate;
 use crate::gates::poseidon_mds::PoseidonMdsGate;
 use crate::gates::reducing::ReducingGate;
 use crate::gates::reducing_extension::ReducingExtensionGate;
+#[cfg(test)]
 use crate::gpu::shader::literal;
 use crate::hash::hash_types::RichField;
 use crate::hash::poseidon::{Poseidon, SPONGE_WIDTH};
@@ -642,7 +644,8 @@ fn lookup_mul_raw<F: PrimeField64>(dag: &Dag<F>, a: NodeId, b: NodeId) -> Option
 /// the pairs to `i` and every orientation of each pair is tried, and one is
 /// accepted only if all five coefficient nodes rebuilt from it exist, so a
 /// group computes exactly the nodes it replaces.
-pub fn fuse_quintic_products<F: PrimeField64>(trace: &mut GateTrace<F>) {
+#[cfg(test)]
+pub(crate) fn fuse_quintic_products<F: PrimeField64>(trace: &mut GateTrace<F>) {
     if let Some(fused) = quintic_fused_trace(trace) {
         *trace = fused;
     }
@@ -1270,7 +1273,8 @@ pub(crate) fn negation_folded_trace<F: PrimeField64>(trace: &GateTrace<F>) -> Ga
 /// adding `filter * constraint_k` to `cs[k]`. The body reads inputs through
 /// `wire(row, i)`, `constant(row, j)` and `public_input(k)`, which the
 /// enclosing module defines.
-pub fn emit_gate<F: PrimeField64>(
+#[cfg(test)]
+pub(crate) fn emit_gate<F: PrimeField64>(
     trace: &GateTrace<F>,
     name: &str,
     num_constraints: usize,
@@ -1365,7 +1369,7 @@ pub fn emit_gate<F: PrimeField64>(
 }
 
 /// Row `r` of the Poseidon MDS layer over `v`.
-pub fn mds_row<F: RichField>(v: &[F; 12], r: usize) -> F {
+pub(crate) fn mds_row<F: RichField>(v: &[F; 12], r: usize) -> F {
     let mut acc = F::ZERO;
     for i in 0..SPONGE_WIDTH {
         acc +=
@@ -1376,7 +1380,8 @@ pub fn mds_row<F: RichField>(v: &[F; 12], r: usize) -> F {
 
 /// Coefficient `k` of the product of the quintic extension elements `v[..5]`
 /// and `v[5..]` in `F[X] / (X^5 - QMUL_W)`.
-pub fn qmul_coeff<F: RichField>(v: &[F; 10], k: usize) -> F {
+#[cfg(test)]
+pub(crate) fn qmul_coeff<F: RichField>(v: &[F; 10], k: usize) -> F {
     let w = F::from_canonical_u64(QMUL_W);
     let mut acc = F::ZERO;
     for i in 0..5 {
@@ -1388,7 +1393,8 @@ pub fn qmul_coeff<F: RichField>(v: &[F; 10], k: usize) -> F {
 }
 
 /// Evaluates the trace on the host, for tests.
-pub fn evaluate<F: RichField>(
+#[cfg(test)]
+pub(crate) fn evaluate<F: RichField>(
     trace: &GateTrace<F>,
     wires: &[F],
     constants: &[F],

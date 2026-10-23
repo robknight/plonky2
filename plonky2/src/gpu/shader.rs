@@ -686,6 +686,10 @@ fn hash_nodes(@builtin(global_invocation_id) id: vec3<u32>) {
     write_digest(hp.layer, k, canonical(out.s0), canonical(out.s1), canonical(out.s2), canonical(out.s3));
 }
 
+"#;
+
+#[cfg(test)]
+const PERMUTE_KERNEL: &str = r#"
 // Applies the permutation to `count` states of twelve elements in src,
 // writing the canonical results to digests.
 @compute @workgroup_size(64)
@@ -751,12 +755,14 @@ fn qmul(x: array<Field, 5>, y: array<Field, 5>) -> array<Field, 5> {
 }
 "#;
 
-/// The hashing module: sponge over leaves, two-to-one nodes and a batch permutation.
+/// The hashing module: sponge over leaves and two-to-one nodes.
 pub fn hash_module(flavor: Flavor) -> String {
     let mut out = prelude(flavor);
     out.push_str(MDS);
     permutation(&mut out);
     out.push_str(HASH_KERNELS);
+    #[cfg(test)]
+    out.push_str(PERMUTE_KERNEL);
     out
 }
 

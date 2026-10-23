@@ -116,7 +116,13 @@ pub(crate) struct FftJob<'a> {
 
 /// Records the groups of `job` into `encoder`.
 pub(crate) fn fft(ctx: &GpuContext, encoder: &mut wgpu::CommandEncoder, job: FftJob<'_>) {
-    fft_groups(ctx, encoder, job, None);
+    fft_groups(
+        ctx,
+        encoder,
+        job,
+        #[cfg(test)]
+        None,
+    );
 }
 
 /// Records the groups of `job` into `encoder`, or only group `only` (for
@@ -125,7 +131,7 @@ pub(crate) fn fft_groups(
     ctx: &GpuContext,
     encoder: &mut wgpu::CommandEncoder,
     job: FftJob<'_>,
-    only: Option<usize>,
+    #[cfg(test)] only: Option<usize>,
 ) {
     assert!(
         job.shift_in.is_none() || job.shift_out.is_none(),
@@ -141,10 +147,10 @@ pub(crate) fn fft_groups(
     };
     let n_inv = GoldilocksField::inverse_2exp(job.log_n as usize).to_canonical_u64();
     let output = job.output.unwrap_or(&ctx.dummy_rw);
-    let bindings = plan
-        .iter()
-        .enumerate()
-        .filter(|(g, _)| only.is_none_or(|o| o == *g))
+    let groups = plan.iter().enumerate();
+    #[cfg(test)]
+    let groups = groups.filter(|(g, _)| only.is_none_or(|o| o == *g));
+    let bindings = groups
         .map(|(g, &(s0, stages, low_bits))| {
             let mut flags = 0;
             let mut skip = 0;
@@ -785,7 +791,8 @@ fn commit<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usi
 }
 
 /// `PolynomialValues::ifft` of each column on the device (for tests and benchmarks).
-pub fn ifft_batch<F: PrimeField64>(ctx: &GpuContext, values: &[Vec<F>]) -> Vec<Vec<F>> {
+#[cfg(test)]
+pub(crate) fn ifft_batch<F: PrimeField64>(ctx: &GpuContext, values: &[Vec<F>]) -> Vec<Vec<F>> {
     let degree = values[0].len();
     let log_d = log2_strict(degree) as u32;
     let columns = values.iter().map(|v| v.as_slice()).collect::<Vec<_>>();
@@ -815,7 +822,8 @@ pub fn ifft_batch<F: PrimeField64>(ctx: &GpuContext, values: &[Vec<F>]) -> Vec<V
 
 /// `coset_fft_with_options(shift, Some(rate_bits), ..)` of each column's
 /// zero-padded coefficients on the device (for tests and benchmarks).
-pub fn coset_lde_batch<F: PrimeField64>(
+#[cfg(test)]
+pub(crate) fn coset_lde_batch<F: PrimeField64>(
     ctx: &GpuContext,
     coeffs: &[Vec<F>],
     rate_bits: usize,
@@ -851,7 +859,8 @@ pub fn coset_lde_batch<F: PrimeField64>(
 }
 
 /// `coset_ifft(shift)` of each column on the device (for tests and benchmarks).
-pub fn coset_ifft_batch<F: PrimeField64>(
+#[cfg(test)]
+pub(crate) fn coset_ifft_batch<F: PrimeField64>(
     ctx: &GpuContext,
     values: &[Vec<F>],
     shift: F,

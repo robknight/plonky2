@@ -1322,7 +1322,22 @@ pub fn kernel_source(
     num_challenges: u32,
     uses_qmul: bool,
 ) -> String {
-    kernel_source_with_program(flavor, registers, num_challenges, uses_qmul, None)
+    let mut out = shader::prelude_with_mds(flavor);
+    if uses_qmul {
+        out.push_str(shader::QMUL);
+    }
+    out.push_str(&format!(
+        "const NC: u32 = {num_challenges}u;\nconst NREGS: u32 = {registers}u;\nconst PIH_OFFSET: u32 = {}u;\n",
+        2 * num_challenges
+    ));
+    let kernel = QUOTIENT_KERNEL
+        .replace("            // CASES\n", &interpreter_cases())
+        .replace(
+            "            // QMUL_CASE\n",
+            if uses_qmul { QUINTIC_CASE } else { "" },
+        );
+    out.push_str(&kernel);
+    out
 }
 
 /// The switch cases of the ops with register or wire operands, one per
@@ -1383,38 +1398,21 @@ fn interpreter_cases() -> String {
 /// The kernel with the interpreter loop replaced by `program` (WGSL
 /// statements over `regs`, `h`, `acc` and `gate_filter`), for experiments
 /// with straight-line gate code.
-pub fn kernel_source_with_program(
+#[cfg(all(test, feature = "gpu-profiling"))]
+pub(crate) fn kernel_source_with_program(
     flavor: shader::Flavor,
     registers: u32,
     num_challenges: u32,
     uses_qmul: bool,
     program: Option<&str>,
 ) -> String {
-    let mut out = shader::prelude_with_mds(flavor);
-    if uses_qmul {
-        out.push_str(shader::QMUL);
-    }
-    out.push_str(&format!(
-        "const NC: u32 = {num_challenges}u;\nconst NREGS: u32 = {registers}u;\nconst PIH_OFFSET: u32 = {}u;\n",
-        2 * num_challenges
-    ));
-    let kernel = QUOTIENT_KERNEL
-        .replace("            // CASES\n", &interpreter_cases())
-        .replace(
-            "            // QMUL_CASE\n",
-            if uses_qmul { QUINTIC_CASE } else { "" },
-        );
-    match program {
-        None => out.push_str(&kernel),
-        Some(program) => {
-            let begin = kernel.find("    // BEGIN program\n").unwrap();
-            let end = kernel.find("    // END program\n").unwrap();
-            out.push_str(&kernel[..begin]);
-            out.push_str(program);
-            out.push_str(&kernel[end..]);
-        }
-    }
-    out
+    let kernel = kernel_source(flavor, registers, num_challenges, uses_qmul);
+    let Some(program) = program else {
+        return kernel;
+    };
+    let begin = kernel.find("    // BEGIN program\n").unwrap();
+    let end = kernel.find("    // END program\n").unwrap();
+    format!("{}{program}{}", &kernel[..begin], &kernel[end..])
 }
 
 impl GpuContext {
