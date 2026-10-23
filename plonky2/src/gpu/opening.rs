@@ -309,7 +309,8 @@ pub(crate) fn try_prove_openings<
         let alphas = ctx.upload("alpha powers", &alphas);
         let scratch = ctx.storage(
             "combination scratch",
-            (num_batches * (3 * D * degree + 2 * D * num_blocks) * 8) as u64,
+            (num_batches * D * (COMBINE_BLOCK as usize + 1 + 2 * degree + 2 * num_blocks) * 8)
+                as u64,
         );
         let coeffs = ctx.storage("initial polynomial", (D * n * 8) as u64);
         let values = ctx.storage("initial codeword", (D * n * 8) as u64);
@@ -325,7 +326,9 @@ pub(crate) fn try_prove_openings<
             let [powers, reduce, divide, scan, combine] = &ctx.combine;
             pass.set_pipeline(powers);
             pass.dispatch_workgroups(
-                (degree as u32).div_ceil(HASH_WORKGROUP),
+                (degree as u32)
+                    .min(COMBINE_BLOCK + 1)
+                    .div_ceil(HASH_WORKGROUP),
                 num_batches as u32,
                 1,
             );

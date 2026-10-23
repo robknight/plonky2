@@ -1130,7 +1130,7 @@ struct CombineParams {
 // Per term: the power of alpha weighting it (real, imaginary).
 @group(0) @binding(6) var<storage, read> alphas: array<Field>;
 // Per batch, each as the real parts then the imaginary parts: z^k for
-// k < degree; the reduced coefficients C_b; the within-block quotients;
+// k <= BLOCK; the reduced coefficients C_b; the within-block quotients;
 // then per batch the block sums T_B and the block suffixes R_B.
 @group(0) @binding(7) var<storage, read_write> scratch: array<Field>;
 // The combined quotient's coefficients: the real parts, then the imaginary parts.
@@ -1147,22 +1147,22 @@ fn coefficient(oracle: u32, index: u32) -> Field {
     }
 }
 
-fn zp_off(b: u32) -> u32 { return b * 2u * cp.degree; }
-fn c_off(b: u32) -> u32 { return (cp.num_batches + b) * 2u * cp.degree; }
-fn l_off(b: u32) -> u32 { return (2u * cp.num_batches + b) * 2u * cp.degree; }
-fn t_off(b: u32) -> u32 { return 3u * cp.num_batches * 2u * cp.degree + b * 2u * cp.num_blocks; }
-fn r_off(b: u32) -> u32 { return 3u * cp.num_batches * 2u * cp.degree + (cp.num_batches + b) * 2u * cp.num_blocks; }
+fn zp_off(b: u32) -> u32 { return b * 2u * (BLOCK + 1u); }
+fn c_off(b: u32) -> u32 { return zp_off(cp.num_batches) + b * 2u * cp.degree; }
+fn l_off(b: u32) -> u32 { return c_off(cp.num_batches + b); }
+fn t_off(b: u32) -> u32 { return l_off(cp.num_batches) + b * 2u * cp.num_blocks; }
+fn r_off(b: u32) -> u32 { return t_off(cp.num_batches + b); }
 
 // z_b^k for batch id.y.
 @compute @workgroup_size(64)
 fn batch_powers(@builtin(global_invocation_id) id: vec3<u32>) {
     let k = id.x;
     let b = id.y;
-    if (k >= cp.degree) { return; }
+    if (k > BLOCK || k >= cp.degree) { return; }
     let z = ext_pow(cp.points[b].xy, cp.points[b].zw, k);
     let o = zp_off(b);
     scratch[o + k] = z[0];
-    scratch[o + cp.degree + k] = z[1];
+    scratch[o + BLOCK + 1u + k] = z[1];
 }
 
 // C_b = sum_j alpha^j f_j over the batch's polynomials: one thread per
@@ -1235,7 +1235,7 @@ fn scan_blocks(@builtin(global_invocation_id) id: vec3<u32>) {
         scratch[r + cp.num_blocks + blk] = a1;
         if (blk == 0u) { break; }
         let zs0 = scratch[zp_off(b) + BLOCK];
-        let zs1 = scratch[zp_off(b) + cp.degree + BLOCK];
+        let zs1 = scratch[zp_off(b) + BLOCK + 1u + BLOCK];
         let m = ext_mul(a0, a1, zs0, zs1);
         a0 = add_field(m[0], scratch[t + blk]);
         a1 = add_field(m[1], scratch[t + cp.num_blocks + blk]);
@@ -1258,7 +1258,7 @@ fn combine_quotients(@builtin(global_invocation_id) id: vec3<u32>) {
             let l = l_off(b);
             let r = r_off(b);
             let z = zp_off(b);
-            let m = ext_mul(scratch[z + e], scratch[z + cp.degree + e],
+            let m = ext_mul(scratch[z + e], scratch[z + BLOCK + 1u + e],
                             scratch[r + blk], scratch[r + cp.num_blocks + blk]);
             let q0 = add_field(scratch[l + k], m[0]);
             let q1 = add_field(scratch[l + cp.degree + k], m[1]);
