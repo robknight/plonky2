@@ -341,9 +341,10 @@ pub struct GpuContext {
     /// `combine_quotients`, dispatched in this order.
     pub(crate) combine: [wgpu::ComputePipeline; 5],
     permutation_layout: wgpu::BindGroupLayout,
-    /// `row_products`, `block_products`, `block_prefix` and `fill_columns`,
-    /// dispatched in this order.
-    pub(crate) permutation: [wgpu::ComputePipeline; 4],
+    /// `block_products`, `block_prefix` and `fill_columns`, following row products.
+    pub(crate) permutation: [wgpu::ComputePipeline; 3],
+    /// Row products specialized to the number of chunks, bounding private storage.
+    permutation_rows: cache::GpuCache<u32, Arc<wgpu::ComputePipeline>>,
     /// A small buffer bound where a kernel does not use a read-only binding.
     pub(crate) dummy: DeviceBuffer,
     /// As `dummy`, for read-write bindings (a buffer cannot be bound both ways in one dispatch).
@@ -391,6 +392,13 @@ impl Drop for DeviceBufferInner {
 impl cache::CacheValue for DeviceBuffer {
     fn bytes(&self) -> u64 {
         self.size()
+    }
+}
+
+impl cache::CacheValue for Arc<wgpu::ComputePipeline> {
+    // Driver allocation sizes are opaque; the cache bounds entry count.
+    fn bytes(&self) -> u64 {
+        0
     }
 }
 
@@ -790,13 +798,8 @@ impl GpuContext {
             "plonky2 permutation",
             &shader::permutation_module(flavor),
         );
-        let permutation = [
-            "row_products",
-            "block_products",
-            "block_prefix",
-            "fill_columns",
-        ]
-        .map(|entry| pipeline(&device, &permutation_layout, &permutation_module, entry));
+        let permutation = ["block_products", "block_prefix", "fill_columns"]
+            .map(|entry| pipeline(&device, &permutation_layout, &permutation_module, entry));
 
         if let Some(error) = pollster::block_on(validation.pop()) {
             anyhow::bail!("shader or pipeline validation failed: {error}");
@@ -852,6 +855,7 @@ impl GpuContext {
             combine,
             permutation_layout,
             permutation,
+            permutation_rows: cache::GpuCache::new(retained.clone()),
             dummy: DeviceBuffer::unpooled(dummy),
             dummy_rw: DeviceBuffer::unpooled(dummy_rw),
             twiddles: cache::GpuCache::new(retained.clone()),

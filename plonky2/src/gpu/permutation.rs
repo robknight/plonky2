@@ -15,7 +15,7 @@ use crate::fri::oracle::{ProverOracle, ProverPolynomialBatch};
 use crate::gpu::lde::{from_device_values, upload_columns};
 use crate::gpu::merkle::supported;
 use crate::gpu::shader::{HASH_WORKGROUP, PERMUTATION_BLOCK};
-use crate::gpu::{context, DeviceBuffer, GpuContext};
+use crate::gpu::{context, module, pipeline, shader, DeviceBuffer, GpuContext};
 use crate::hash::hash_types::RichField;
 use crate::plonk::circuit_data::{CommonCircuitData, ProverOnlyCircuitData};
 use crate::plonk::config::GenericConfig;
@@ -24,6 +24,30 @@ use crate::util::timing::TimingTree;
 
 /// The kernels take at most this many routed wires.
 const MAX_ROUTED: usize = 128;
+
+impl GpuContext {
+    fn permutation_rows(
+        &self,
+        chunks: u32,
+        max_degree: usize,
+    ) -> std::sync::Arc<wgpu::ComputePipeline> {
+        let key = if max_degree <= 2 { 0 } else { chunks };
+        self.permutation_rows.get_or_init(key, || {
+            let source = if key == 0 {
+                shader::permutation_module_individual(self.flavor)
+            } else {
+                shader::permutation_module_with_chunks(self.flavor, chunks)
+            };
+            let module = module(&self.device, "permutation rows", &source);
+            std::sync::Arc::new(pipeline(
+                &self.device,
+                &self.permutation_layout,
+                &module,
+                "row_products",
+            ))
+        })
+    }
+}
 
 /// The device copy of the circuit's sigma values, column-major.
 fn device_sigmas<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
@@ -107,6 +131,7 @@ pub(crate) fn try_partial_products_commitment<
     let num_blocks = degree / PERMUTATION_BLOCK as usize;
     let num_columns = num_challenges * (1 + num_prods);
     let out = timed!(timing, "gpu: partial products and Z's", {
+        let rows = ctx.permutation_rows(num_chunks as u32, max_degree);
         let sigmas = device_sigmas(&ctx, prover_data, config.num_routed_wires);
         let mut consts = Vec::new();
         for (&beta, &gamma) in betas.iter().zip(gammas) {
@@ -148,8 +173,8 @@ pub(crate) fn try_partial_products_commitment<
         {
             let mut pass = ctx.begin_pass(&mut encoder, "partial products", None);
             pass.set_bind_group(0, &bindings, &[]);
-            let [rows, blocks, prefix, fill] = &ctx.permutation;
-            pass.set_pipeline(rows);
+            let [blocks, prefix, fill] = &ctx.permutation;
+            pass.set_pipeline(&rows);
             pass.dispatch_workgroups(
                 (degree as u32).div_ceil(HASH_WORKGROUP),
                 num_challenges as u32,

@@ -4,6 +4,7 @@
 
 mod arithmetic_grid;
 mod inversion;
+mod permutation_products;
 mod residency_matrix;
 
 use rand::{RngCore, SeedableRng};
@@ -186,6 +187,11 @@ fn shaders_validate() {
             ("fold", shader::fold_module(flavor)),
             ("open", shader::open_module(flavor)),
             ("combine", shader::combine_module(flavor)),
+            ("permutation", shader::permutation_module(flavor)),
+            (
+                "chunk permutation",
+                shader::permutation_module_with_chunks(flavor, 10),
+            ),
             ("quotient tail", shader::quotient_tail_module(flavor)),
         ] {
             let module = naga::front::wgsl::parse_str(&source)

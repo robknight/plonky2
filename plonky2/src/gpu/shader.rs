@@ -1322,6 +1322,101 @@ pub fn combine_module(flavor: Flavor) -> String {
     out
 }
 
+const CHUNK_PRODUCT_ROWS: &str = r#"
+// Row id.x, challenge id.y: the products over chunks of the quotients
+// (w_j + beta k_j x + gamma) / (w_j + beta sigma_j + gamma), with the
+// chunk denominators inverted together. Individual wire ratios are never
+// needed: prod(n_j / d_j) = prod(n_j) / prod(d_j) within each chunk.
+@compute @workgroup_size(64)
+fn row_products(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x;
+    let c = id.y;
+    if (i >= pp.degree) { return; }
+    let half = pp.degree >> 1u;
+    var x = twiddles[i & (half - 1u)];
+    if (i >= half) { x = sub_field(Field(0u, 0u), x); }
+    let beta = consts[2u * c];
+    let gamma = consts[2u * c + 1u];
+    var nums: array<Field, MAX_CHUNKS>;
+    var dens: array<Field, MAX_CHUNKS>;
+    var prefix: array<Field, MAX_CHUNKS>;
+    var acc = Field(1u, 0u);
+    for (var k = 0u; k < pp.num_chunks; k++) {
+        var num = Field(1u, 0u);
+        var den = Field(1u, 0u);
+        let end = min((k + 1u) * pp.max_degree, pp.num_routed);
+        for (var j = k * pp.max_degree; j < end; j++) {
+            let w = wires[j * pp.degree + i];
+            let d = add_field(add_field(w, mul_field(beta, sigmas[j * pp.degree + i])), gamma);
+            let n = add_field(add_field(w, mul_field(consts[pp.bk_offset + c * pp.num_routed + j], x)), gamma);
+            num = mul_field(num, n);
+            den = mul_field(den, d);
+        }
+        nums[k] = num;
+        dens[k] = den;
+        prefix[k] = acc;
+        acc = mul_field(acc, den);
+    }
+    var inv = inv_field(acc);
+    let base = chunks_off(c) + i * pp.num_chunks;
+    var k = pp.num_chunks;
+    loop {
+        k--;
+        scratch[base + k] = mul_field(nums[k], mul_field(inv, prefix[k]));
+        inv = mul_field(inv, dens[k]);
+        if (k == 0u) { break; }
+    }
+}
+
+"#;
+
+// Narrow chunks keep the original one-array algorithm: three chunk tables
+// would increase private storage without enough arithmetic savings.
+const INDIVIDUAL_PRODUCT_ROWS: &str = r#"
+// Row id.x, challenge id.y: the products over chunks of the quotients
+// (w_j + beta k_j x + gamma) / (w_j + beta sigma_j + gamma), with the
+// denominators inverted together.
+@compute @workgroup_size(64)
+fn row_products(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x;
+    let c = id.y;
+    if (i >= pp.degree) { return; }
+    let half = pp.degree >> 1u;
+    var x = twiddles[i & (half - 1u)];
+    if (i >= half) { x = sub_field(Field(0u, 0u), x); }
+    let beta = consts[2u * c];
+    let gamma = consts[2u * c + 1u];
+    var den: array<Field, MAX_CHUNKS>;
+    var acc = Field(1u, 0u);
+    for (var j = 0u; j < pp.num_routed; j++) {
+        let w = wires[j * pp.degree + i];
+        let d = add_field(add_field(w, mul_field(beta, sigmas[j * pp.degree + i])), gamma);
+        den[j] = acc;
+        acc = mul_field(acc, d);
+    }
+    var inv = inv_field(acc);
+    let base = chunks_off(c) + i * pp.num_chunks;
+    var chunk = Field(1u, 0u);
+    var k = pp.num_routed;
+    loop {
+        k--;
+        let w = wires[k * pp.degree + i];
+        let d = add_field(add_field(w, mul_field(beta, sigmas[k * pp.degree + i])), gamma);
+        let n = add_field(add_field(w, mul_field(consts[pp.bk_offset + c * pp.num_routed + k], x)), gamma);
+        // 1 / d_k = inv * prod_{j < k} d_j, then drop d_k from inv.
+        let q = mul_field(n, mul_field(inv, den[k]));
+        inv = mul_field(inv, d);
+        chunk = mul_field(chunk, q);
+        if (k % pp.max_degree == 0u) {
+            scratch[base + k / pp.max_degree] = chunk;
+            chunk = Field(1u, 0u);
+        }
+        if (k == 0u) { break; }
+    }
+}
+
+"#;
+
 const PERMUTATION_KERNELS: &str = r#"
 struct PermParams {
     // Rows (the degree).
@@ -1355,54 +1450,14 @@ struct PermParams {
 @group(0) @binding(6) var<storage, read_write> out: array<Field>;
 
 const BLOCK: u32 = 256u;
-const MAX_ROUTED: u32 = 128u;
+const MAX_CHUNKS: u32 = 128u;
 
 fn chunks_off(c: u32) -> u32 { return c * pp.degree * pp.num_chunks; }
 fn blocks_off(c: u32) -> u32 { return pp.num_challenges * pp.degree * pp.num_chunks + c * pp.num_blocks; }
 fn prefix_off(c: u32) -> u32 { return pp.num_challenges * (pp.degree * pp.num_chunks + pp.num_blocks) + c * pp.num_blocks; }
 
 
-// Row id.x, challenge id.y: the products over chunks of the quotients
-// (w_j + beta k_j x + gamma) / (w_j + beta sigma_j + gamma), with the
-// denominators inverted together.
-@compute @workgroup_size(64)
-fn row_products(@builtin(global_invocation_id) id: vec3<u32>) {
-    let i = id.x;
-    let c = id.y;
-    if (i >= pp.degree) { return; }
-    let half = pp.degree >> 1u;
-    var x = twiddles[i & (half - 1u)];
-    if (i >= half) { x = sub_field(Field(0u, 0u), x); }
-    let beta = consts[2u * c];
-    let gamma = consts[2u * c + 1u];
-    var den: array<Field, MAX_ROUTED>;
-    var acc = Field(1u, 0u);
-    for (var j = 0u; j < pp.num_routed; j++) {
-        let w = wires[j * pp.degree + i];
-        let d = add_field(add_field(w, mul_field(beta, sigmas[j * pp.degree + i])), gamma);
-        den[j] = acc;
-        acc = mul_field(acc, d);
-    }
-    var inv = inv_field(acc);
-    let base = chunks_off(c) + i * pp.num_chunks;
-    var chunk = Field(1u, 0u);
-    var k = pp.num_routed;
-    loop {
-        k--;
-        let w = wires[k * pp.degree + i];
-        let d = add_field(add_field(w, mul_field(beta, sigmas[k * pp.degree + i])), gamma);
-        let n = add_field(add_field(w, mul_field(consts[pp.bk_offset + c * pp.num_routed + k], x)), gamma);
-        // 1 / d_k = inv * prod_{j < k} d_j, then drop d_k from inv.
-        let q = mul_field(n, mul_field(inv, den[k]));
-        inv = mul_field(inv, d);
-        chunk = mul_field(chunk, q);
-        if (k % pp.max_degree == 0u) {
-            scratch[base + k / pp.max_degree] = chunk;
-            chunk = Field(1u, 0u);
-        }
-        if (k == 0u) { break; }
-    }
-}
+// ROW_PRODUCTS
 
 // Block id.x of challenge id.y: the product of its rows' chunk products.
 @compute @workgroup_size(64)
@@ -1459,7 +1514,28 @@ pub const PERMUTATION_BLOCK: u32 = 256;
 /// and `fill_columns`, the partial products and Z of the permutation
 /// argument from the wire and sigma values.
 pub fn permutation_module(flavor: Flavor) -> String {
+    permutation_module_individual(flavor)
+}
+
+/// Size private chunk tables for this circuit, rather than every routed wire.
+pub(crate) fn permutation_module_with_chunks(flavor: Flavor, chunks: u32) -> String {
+    permutation_module_source(flavor, chunks, CHUNK_PRODUCT_ROWS)
+}
+
+pub(crate) fn permutation_module_individual(flavor: Flavor) -> String {
+    permutation_module_source(flavor, 128, INDIVIDUAL_PRODUCT_ROWS)
+}
+
+fn permutation_module_source(flavor: Flavor, chunks: u32, rows: &str) -> String {
+    assert!((1..=128).contains(&chunks));
     let mut out = prelude(flavor);
-    out.push_str(PERMUTATION_KERNELS);
+    out.push_str(
+        &PERMUTATION_KERNELS
+            .replace("// ROW_PRODUCTS", rows)
+            .replace(
+                "const MAX_CHUNKS: u32 = 128u;",
+                &format!("const MAX_CHUNKS: u32 = {chunks}u;"),
+            ),
+    );
     out
 }
