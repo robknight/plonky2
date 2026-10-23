@@ -67,14 +67,19 @@ pub struct RegionProgram {
 #[derive(Clone, Debug)]
 pub struct ProgramCache(Arc<Mutex<CacheState>>);
 
+#[derive(Debug)]
+struct CachedProgram {
+    initial: Vec<usize>,
+    generators: usize,
+    program: Arc<RegionProgram>,
+    /// Diagnostics that compile their own program leave this unset.
+    operations: Option<u128>,
+}
+
 #[derive(Debug, Default)]
 struct CacheState {
-    program: Option<(Vec<usize>, Vec<u32>, Arc<RegionProgram>)>,
-    /// Operation digest of an installed program, when known (programs that
-    /// diagnostics compile for themselves leave it unset).
-    operations: Option<u128>,
-    /// Whether a proof with other inputs than the installed program's has
-    /// already been reported, so the warning appears once per program.
+    // Only complete circuit programs are installed in this cache.
+    program: Option<CachedProgram>,
     warned_mismatch: bool,
 }
 
@@ -86,14 +91,6 @@ pub(crate) enum Installed {
     OtherInputs,
     /// No whole-circuit program.
     None,
-}
-
-fn covers_all(indices: &[u32], generators: usize) -> bool {
-    indices.len() == generators
-        && indices
-            .iter()
-            .enumerate()
-            .all(|(i, &index)| i == index as usize)
 }
 
 impl Default for ProgramCache {
@@ -120,8 +117,12 @@ impl ProgramCache {
         operations: u128,
     ) {
         let mut cached = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        cached.program = Some((initial, (0..generators as u32).collect(), program));
-        cached.operations = Some(operations);
+        cached.program = Some(CachedProgram {
+            initial,
+            generators,
+            program,
+            operations: Some(operations),
+        });
         cached.warned_mismatch = false;
     }
 
@@ -129,7 +130,6 @@ impl ProgramCache {
     pub(crate) fn clear(&self) {
         let mut cached = self.0.lock().unwrap_or_else(|e| e.into_inner());
         cached.program = None;
-        cached.operations = None;
         cached.warned_mismatch = false;
     }
 
@@ -140,7 +140,7 @@ impl ProgramCache {
         cached
             .program
             .as_ref()
-            .is_some_and(|(_, indices, _)| covers_all(indices, generators))
+            .is_some_and(|program| program.generators == generators)
     }
 
     /// The whole-circuit program in the slot, its mask and its operation
@@ -150,8 +150,14 @@ impl ProgramCache {
         generators: usize,
     ) -> Option<(Vec<usize>, Arc<RegionProgram>, Option<u128>)> {
         let cached = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let (mask, indices, program) = cached.program.as_ref()?;
-        covers_all(indices, generators).then(|| (mask.clone(), program.clone(), cached.operations))
+        let program = cached.program.as_ref()?;
+        (program.generators == generators).then(|| {
+            (
+                program.initial.clone(),
+                program.program.clone(),
+                program.operations,
+            )
+        })
     }
 
     /// The whole-circuit program for this initial-target mask. A program for
@@ -159,16 +165,16 @@ impl ProgramCache {
     /// the worklist, which is correct for any inputs.
     pub(crate) fn lookup_all(&self, generators: usize, initial: &[usize]) -> Installed {
         let mut cached = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let Some((mask, indices, program)) = cached.program.as_ref() else {
+        let Some(program) = cached.program.as_ref() else {
             return Installed::None;
         };
-        if !covers_all(indices, generators) {
+        if program.generators != generators {
             return Installed::None;
         }
-        if mask == initial {
-            return Installed::Program(program.clone());
+        if program.initial == initial {
+            return Installed::Program(program.program.clone());
         }
-        let compiled_for = mask.len();
+        let compiled_for = program.initial.len();
         if !cached.warned_mismatch {
             cached.warned_mismatch = true;
             log::warn!(
@@ -193,36 +199,22 @@ impl ProgramCache {
             .collect::<Vec<_>>();
         initial.sort_unstable();
         initial.dedup();
-        {
-            let cached = self.0.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((mask, indices, program)) = cached.program.as_ref() {
-                if *mask == initial && covers_all(indices, generators.len()) {
-                    return Ok((program.clone(), true));
-                }
+        let mut cached = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(program) = cached.program.as_ref() {
+            if program.initial == initial && program.generators == generators.len() {
+                return Ok((program.program.clone(), true));
             }
         }
         let indices = (0..generators.len())
             .map(u32::try_from)
             .collect::<Result<Vec<_>, _>>()?;
-        self.get_or_compile_mask(generators, entry, &indices, initial)
-    }
-
-    fn get_or_compile_mask<F: RichField + Extendable<D>, const D: usize>(
-        &self,
-        generators: &[WitnessGeneratorRef<F, D>],
-        entry: &PartitionWitness<F>,
-        indices: &[u32],
-        initial: Vec<usize>,
-    ) -> Result<(Arc<RegionProgram>, bool)> {
-        let mut cached = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((mask, selection, program)) = cached.program.as_ref() {
-            if *mask == initial && selection == indices {
-                return Ok((program.clone(), true));
-            }
-        }
-        let program = Arc::new(RegionProgram::compile(generators, entry, indices)?);
-        cached.program = Some((initial, indices.to_vec(), program.clone()));
-        cached.operations = None;
+        let program = Arc::new(RegionProgram::compile(generators, entry, &indices)?);
+        cached.program = Some(CachedProgram {
+            initial,
+            generators: generators.len(),
+            program: program.clone(),
+            operations: None,
+        });
         cached.warned_mismatch = false;
         Ok((program, false))
     }
