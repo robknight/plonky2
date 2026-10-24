@@ -544,3 +544,9 @@ pub fn benchmark_profile(active: bool) {
 pub fn benchmark_input_binding(direct: bool) {
     region::cpu::benchmark_input_binding(direct);
 }
+
+/// Benchmark-only buffer reuse control. Change only between serial proofs.
+#[doc(hidden)]
+pub fn benchmark_buffer_reuse(enabled: bool) {
+    region::buffers::benchmark_override(enabled);
+}

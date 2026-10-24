@@ -201,10 +201,7 @@ impl RegionProgram {
         };
         let profile = profile::Execution::new(self.state_slots);
         let allocation = profile.stage(Stage::Allocate);
-        let state = (0..self.state_slots).map(|_| AtomicU64::new(0)).collect();
-        let ready = (0..self.state_slots)
-            .map(|_| AtomicBool::new(false))
-            .collect();
+        let (state, ready) = super::buffers::acquire(self.state_slots as usize);
         drop(allocation);
         let executor = Executor {
             profile,
@@ -316,11 +313,11 @@ impl Drop for Executor<'_> {
     /// goes through `zeroize`, whose volatile writes the compiler may not
     /// elide, rather than relaxed atomic stores.
     fn drop(&mut self) {
-        use zeroize::Zeroize;
         let wipe = self.profile.stage(Stage::Wipe);
-        self.state
-            .par_iter_mut()
-            .for_each(|v| v.get_mut().zeroize());
+        super::buffers::release(
+            core::mem::take(&mut self.state),
+            core::mem::take(&mut self.ready),
+        );
         drop(wipe);
         self.profile.report();
     }

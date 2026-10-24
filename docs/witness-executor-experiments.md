@@ -209,3 +209,27 @@ Six same-process alternating comparisons reduced the full MainPod witness call b
 
 **Decision:** retain direct binding as the default for eligible installed programs. `P2_WITNESS_INPUT_BINDING=legacy` remains available for comparison. It introduces no additional per-circuit generated code or mapping allocation.
 
+## Poseidon input and output experiments rejected
+
+The I/O prototype loaded input slots in contiguous batches and stored canonical outputs in value order, avoiding temporary per-permutation trace arrays. A second path recognized contiguous blocks in the block8 layout and stored interleaved traces directly. Both used safe Rust and atomic stores. Exact replay, worklist comparisons, concurrent proofs, and Points passed.
+
+Hash-wide and hash-deep replay improved by about 9–10% in some configurations. MainPod's three same-process comparisons showed approximately 1.9% faster, 3.8% slower, and 1.0% faster execution. Block8 did not establish an overall MainPod advantage after gathering and full proving. Neither I/O implementation is retained. Vector stores with separately proved ownership and layouts designed jointly with region partitioning remain different experiments.
+
+## Wiped buffer reuse retained as an option
+
+The executor can reuse state and readiness allocations after wiping witness values with the existing volatile `zeroize` operations and clearing readiness flags. The cache owns each buffer exclusively, matches allocations by length, and retains at most 64 MiB of buffer capacity across circuits. Recent sizes can replace older ones. MainPod's state and readiness payload is about 35.5 MiB.
+
+Six same-process paired runs reduced MainPod execution by 1.4–14.1%, with a median paired reduction of 5.4%. Full-witness results ranged from 0.8% slower to 8.4% faster, with a median paired reduction of 2.1%. All eight x86 replay workloads improved. The final two processes showed smaller execution gains of 2.5% and 1.9%, so the larger earlier gains should not be treated as typical. Buffer ownership, wiping, readiness reset, budget enforcement, exact-state replay, worklist checks, concurrent proofs, and Points were checked.
+
+**Decision:** retain reuse as an opt-in execution optimization with `P2_WITNESS_BUFFERS=pool`. Fresh allocation remains the default. This makes the memory and latency tradeoff explicit without requiring circuit-specific tuning. It adds no circuit-specific Rust generation.
+
+## Configuration and validation at the end of this batch
+
+Use the `witness-executor` integration of pod2 with a Cargo override pointing at this branch's `plonky2` crate. The retained kernel configuration measured on the Xeon/A40 is `P2_AOT_MODE=adaptive`, `P2_AOT_LAYOUT=aos`, `P2_AOT_FUSE=1`, `P2_AOT_CHAIN_LEN=4`, `P2_AOT_SIMPLIFY_ARITH=1`, and `P2_POSEIDON_MODE=batch8-fft`, with eight Rayon threads and a native CPU build. Eight-way execution falls back on builds without the required AVX-512 features. Input binding is automatic for eligible installed programs. Buffer reuse is optional.
+
+This batch completed 1,515 verified MainPod proofs on the temporary Xeon/A40, plus recursive/nonempty Points checks and thousands of exact-state replay executions. The final local implementation passes 17 witness-program tests. The original repositories were left unchanged. Rejected prototypes remain in the benchmark artifacts and are absent from committed implementation code.
+
+The temporary Runpod pod `samwnq8xu2z3r3` was deleted; read-back returned 404. Final results and the measured binary were retrieved first, with archive SHA256 `ce6f7b155afbecc31f3dfe85824c1cccd80a2a55d2d16308010434ba200e2511`.
+
+The next architectural investigation is a more general region compiler supporting irregular operands and mixed descriptors, followed by partitioning and scheduling designed together. Affine fixed regions and scheduling over existing groups did not establish a general MainPod win. The surrounding witness pipeline now has a useful retained improvement, but these experiments do not establish that execution is close to optimal.
+

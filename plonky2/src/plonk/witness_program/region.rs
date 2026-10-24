@@ -21,6 +21,7 @@ use crate::iop::target::Target;
 use crate::iop::witness::{PartialWitness, PartitionWitness};
 
 pub(crate) mod aot;
+pub(super) mod buffers;
 pub mod cpu;
 mod profile;
 use std::borrow::Cow;
