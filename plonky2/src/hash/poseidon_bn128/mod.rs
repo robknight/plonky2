@@ -14,7 +14,7 @@
 //!
 //! [`PoseidonHash`]: crate::hash::poseidon::PoseidonHash
 
-mod constants;
+pub(crate) mod constants;
 pub mod permutation;
 
 use core::fmt;
@@ -27,7 +27,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::field::types::Field;
 use crate::hash::hash_types::RichField;
 use crate::hash::poseidon::PoseidonPermutation;
-use crate::plonk::config::{GenericHashOut, Hasher};
+use crate::plonk::config::{GenericHashOut, GpuHash, Hasher};
 
 /// The BN254 scalar field. arkworks' Montgomery arithmetic uses x86_64
 /// assembly when built with the `bmi2` and `adx` target features.
@@ -145,6 +145,7 @@ pub struct PoseidonBN128Hash;
 
 impl<F: RichField> Hasher<F> for PoseidonBN128Hash {
     const HASH_SIZE: usize = 32;
+    const GPU_HASH: GpuHash = GpuHash::PoseidonBn128;
     type Hash = PoseidonBN128HashOut<F>;
     type Permutation = PoseidonPermutation<F>;
 

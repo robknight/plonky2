@@ -135,11 +135,47 @@ pub(crate) struct DeviceTree {
     timestamps: Option<super::timestamps::MerkleTimestamps>,
 }
 
+/// The layout and pipelines of one hash's tree kernels.
+struct TreeKernels<'a> {
+    layout: &'a wgpu::BindGroupLayout,
+    leaves: &'a wgpu::ComputePipeline,
+    nodes: &'a wgpu::ComputePipeline,
+    /// Bound after the five bindings every tree kernel shares.
+    extra: Option<&'a wgpu::Buffer>,
+}
+
+/// The tree kernels of `hash` on `ctx`, compiling them on first use; `None`
+/// when no kernel implements it or the device rejected them.
+fn tree_kernels(ctx: &GpuContext, hash: GpuHash) -> Option<TreeKernels<'_>> {
+    match hash {
+        GpuHash::None => None,
+        GpuHash::Poseidon => Some(TreeKernels {
+            layout: &ctx.hash_layout,
+            leaves: &ctx.hash_leaves,
+            nodes: &ctx.hash_nodes,
+            extra: None,
+        }),
+        #[cfg(feature = "poseidon_bn128")]
+        GpuHash::PoseidonBn128 => ctx
+            .poseidon_bn128
+            .get_or_init(|| super::poseidon_bn128::compile(ctx))
+            .as_ref()
+            .map(|k| TreeKernels {
+                layout: &k.layout,
+                leaves: &k.leaves,
+                nodes: &k.nodes,
+                extra: Some(&k.constants),
+            }),
+    }
+}
+
 /// Hashes `2^log_leaves` leaves of `source` into a tree with a cap of height
-/// `cap_height`. With `rows`, every gathered leaf is also written there, row
-/// by row, as the leaf hashing reads it.
+/// `cap_height`, with the kernels of `hash` (which [`supported_on`] has
+/// accepted). With `rows`, every gathered leaf is also written there, row by
+/// row, as the leaf hashing reads it.
 pub(crate) fn build_tree(
     ctx: &GpuContext,
+    hash: GpuHash,
     src: &wgpu::Buffer,
     source: LeafSource,
     log_leaves: u32,
@@ -181,17 +217,20 @@ pub(crate) fn build_tree(
             ],
         )
     };
+    let kernels = tree_kernels(ctx, hash).expect("tree kernels of a supported hash");
+    let bind = |params: &wgpu::Buffer, rows: &wgpu::Buffer| {
+        let mut buffers = vec![params, src, &*digests, &*cap, rows];
+        buffers.extend(kernels.extra);
+        ctx.bind(kernels.layout, &buffers)
+    };
     let rows = rows.unwrap_or(&ctx.dummy_rw);
     let mut bindings = Vec::with_capacity(num_layers as usize + 1);
-    bindings.push(ctx.bind_hash(&params(num_leaves as u32, 0), src, &digests, &cap, rows));
+    bindings.push(bind(&params(num_leaves as u32, 0), rows));
     // The levels do not bind the rows, so that the host can map them as soon
     // as the leaves are hashed.
     for layer in 1..=num_layers {
-        bindings.push(ctx.bind_hash(
+        bindings.push(bind(
             &params((num_leaves >> layer) as u32, layer),
-            src,
-            &digests,
-            &cap,
             &ctx.dummy_rw,
         ));
     }
@@ -205,7 +244,7 @@ pub(crate) fn build_tree(
             &leaves_label,
             timestamps.as_ref().map(|t| t.writes(0)),
         );
-        pass.set_pipeline(&ctx.hash_leaves);
+        pass.set_pipeline(kernels.leaves);
         pass.set_bind_group(0, &bindings[0], &[]);
         pass.dispatch_workgroups((num_leaves as u32).div_ceil(HASH_WORKGROUP), 1, 1);
     }
@@ -217,7 +256,7 @@ pub(crate) fn build_tree(
             "merkle levels",
             timestamps.as_ref().map(|t| t.writes(2)),
         );
-        pass.set_pipeline(&ctx.hash_nodes);
+        pass.set_pipeline(kernels.nodes);
         for layer in 1..=num_layers {
             pass.set_bind_group(0, &bindings[layer as usize], &[]);
             pass.dispatch_workgroups(
@@ -379,9 +418,16 @@ impl DeviceTree {
     }
 }
 
-/// Whether the GPU can build trees for this field and hasher.
+/// Whether a kernel builds trees for this field and hasher. A circuit-only
+/// check; [`supported_on`] also checks the device.
 pub(crate) fn supported<F: RichField, H: Hasher<F>>() -> bool {
     H::GPU_HASH != GpuHash::None && field_supported::<F>()
+}
+
+/// Whether `ctx` builds trees for this field and hasher: [`supported`], and
+/// the device accepted the hash's kernels (compiled on first use).
+pub(crate) fn supported_on<F: RichField, H: Hasher<F>>(ctx: &GpuContext) -> bool {
+    supported::<F, H>() && tree_kernels(ctx, H::GPU_HASH).is_some()
 }
 
 /// The digests and the cap of a tree.
@@ -401,7 +447,8 @@ pub(crate) fn try_new<F: RichField, H: Hasher<F>>(
     }
     let ctx = context()?;
     let ctx = &*ctx;
-    if !ctx.fits(leaves.num_values() as u64 * 8)
+    if !supported_on::<F, H>(ctx)
+        || !ctx.fits(leaves.num_values() as u64 * 8)
         || (leaves.len() as u32).div_ceil(HASH_WORKGROUP) > ctx.max_workgroups
     {
         return None;
@@ -425,6 +472,7 @@ pub(crate) fn build_from_rows<F: RichField, H: Hasher<F>>(
     let src = ctx.upload("leaves", &field_words(leaves.as_flat_slice()));
     let tree = build_tree(
         ctx,
+        H::GPU_HASH,
         &src,
         LeafSource::Rows {
             leaf_len: leaf_len as u32,

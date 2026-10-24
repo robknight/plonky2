@@ -25,6 +25,9 @@
 //! - [`permutation_module`]: the partial products and Z of the permutation
 //!   argument.
 //! - [`pow_module`]: `pow_search`, the proof-of-work nonce search.
+//!
+//! With the `poseidon_bn128` feature, `gpu::poseidon_bn128` generates the tree
+//! kernels of `PoseidonBN128Hash` from `HASH_BINDINGS` and this prelude.
 
 use core::fmt::Write;
 
@@ -570,8 +573,9 @@ pub fn prelude(flavor: Flavor) -> String {
     out
 }
 
-/// Parameters of the hashing kernels (uniform binding 0 of [`hash_module`]).
-const HASH_KERNELS: &str = r#"
+/// Parameters, bindings and digest layout shared by the tree kernels of every
+/// hash (uniform binding 0 and storage bindings 1 to 4 of [`hash_module`]).
+pub(crate) const HASH_BINDINGS: &str = r#"
 struct HashParams {
     // Leaves (hash_leaves), nodes of the output layer (hash_nodes) or states
     // (poseidon_permute) in this dispatch.
@@ -631,7 +635,10 @@ fn leaf_elem(i: u32, e: u32) -> Field {
     if (hp.write_rows != 0u) { rows[i * hp.leaf_len + e] = v; }
     return v;
 }
+"#;
 
+/// The Goldilocks Poseidon sponge over leaves and two-to-one nodes.
+const HASH_KERNELS: &str = r#"
 @compute @workgroup_size(64)
 fn hash_leaves(@builtin(global_invocation_id) id: vec3<u32>) {
     let t = id.x;
@@ -760,6 +767,7 @@ pub fn hash_module(flavor: Flavor) -> String {
     let mut out = prelude(flavor);
     out.push_str(MDS);
     permutation(&mut out);
+    out.push_str(HASH_BINDINGS);
     out.push_str(HASH_KERNELS);
     #[cfg(test)]
     out.push_str(PERMUTE_KERNEL);

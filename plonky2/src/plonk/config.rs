@@ -40,6 +40,9 @@ pub enum GpuHash {
     None,
     /// [`PoseidonHash`] over the Goldilocks field.
     Poseidon,
+    /// [`PoseidonBN128Hash`](crate::hash::poseidon_bn128::PoseidonBN128Hash).
+    #[cfg(feature = "poseidon_bn128")]
+    PoseidonBn128,
 }
 
 /// Trait for hash functions.

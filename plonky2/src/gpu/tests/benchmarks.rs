@@ -102,6 +102,7 @@ fn bench_merkle_query_readback() {
     for iteration in 0..16 {
         let tree = merkle::build_tree(
             &ctx,
+            crate::plonk::config::GpuHash::Poseidon,
             &source,
             merkle::LeafSource::Rows {
                 leaf_len: columns as u32,
@@ -243,6 +244,7 @@ fn bench_commitment() {
         let start = Instant::now();
         let tree = merkle::build_tree(
             ctx,
+            crate::plonk::config::GpuHash::Poseidon,
             &src,
             merkle::LeafSource::Rows {
                 leaf_len: (columns + 4) as u32,

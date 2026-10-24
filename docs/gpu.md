@@ -13,6 +13,8 @@ The API reference is in the rustdoc of `plonky2::gpu` and `plonky2::plonk::witne
 
 Merkle hashing, the batched IFFT, coset low-degree extensions and leaf layout of polynomial commitments, the permutation argument's partial products and Z polynomials, FRI folding and commitment, the quotient polynomial, the openings and the proof-of-work search. The quotient kernel interprets a program generated per circuit from the gates' own constraint evaluations. Custom gates need no GPU code when their recursive constraint evaluations use operations the tracer supports; unsupported circuits use the CPU quotient path. Witness generation stays on the CPU (see below).
 
+Merkle trees are built on the GPU for `PoseidonHash` and, with the `poseidon_bn128` feature, for `PoseidonBN128Hash` (Poseidon over BN254, used by `PoseidonBN128GoldilocksConfig` for proofs that are verified inside a BN254 SNARK); with any other hasher the commitments, FRI and openings stay on the CPU. The proof-of-work search runs on the GPU whenever the hasher's sponge uses the Goldilocks Poseidon permutation, which `PoseidonBN128Hash` does.
+
 Every kernel reproduces the CPU implementation bit for bit; the tests compare digests, caps and coefficients exactly. A proof made on the GPU is identical in form to one made on the CPU and verifies with the unchanged verifier.
 
 Resident proofs keep commitment leaves in the same column-major buffers used by the quotient, and gather the queried rows on demand. This avoids a full duplicate row layout (556 MiB for 139 columns of 2^19 elements). Hybrid proofs on unified memory keep the row layout for their CPU quotient share. Resident FRI layers also reuse their column buffers; hybrid and CPU-quotient proofs retain the existing FRI row layout to avoid extra query dispatches. Full host access, equality and serialization still materialize leaves in their original row order.
@@ -75,4 +77,4 @@ A circuit can be compiled only over the Goldilocks field, if every generator des
 
 ## Testing
 
-Run the tests in release mode: `cargo test --release --features gpu --lib` runs the differential tests of every kernel against the CPU on the available adapter, and `--features gpu-profiling` adds the diagnostic paths.
+Run the tests in release mode: `cargo test --release --features gpu --lib` runs the differential tests of every kernel against the CPU on the available adapter, `--features gpu,poseidon_bn128` adds the BN254 Poseidon kernels, and `--features gpu-profiling` adds the diagnostic paths.

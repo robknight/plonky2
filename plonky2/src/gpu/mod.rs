@@ -15,6 +15,12 @@
 //! proof.
 //!
 //! The kernels are generated in [`shader`] from this crate's Poseidon constants.
+//! Merkle trees are built on the GPU for the hashers whose
+//! [`Hasher::GPU_HASH`](crate::plonk::config::Hasher::GPU_HASH) names a kernel:
+//! `PoseidonHash` and, with the `poseidon_bn128` feature, `PoseidonBN128Hash`
+//! (see `poseidon_bn128`); other hashers build them on the CPU. The
+//! proof-of-work search runs on the GPU whenever the hasher's sponge uses the
+//! Goldilocks Poseidon permutation, whichever hash builds its trees.
 //! The field arithmetic and permutation run on Metal, Vulkan and DirectX 12,
 //! with a portable flavor for adapters without 64-bit shader integers.
 //!
@@ -85,6 +91,9 @@ pub mod opening;
 #[doc(hidden)]
 pub mod permutation;
 pub(crate) mod policy;
+#[cfg(feature = "poseidon_bn128")]
+#[doc(hidden)]
+pub mod poseidon_bn128;
 pub use config::{Backend, ConfigureError, GpuConfig};
 pub use policy::ExecutionMode;
 pub(crate) mod pow;
@@ -334,6 +343,9 @@ pub struct GpuContext {
     pub(crate) fold: wgpu::ComputePipeline,
     /// The proof-of-work search, compiled on first use.
     pub(crate) pow_kernel: OnceLock<Option<pow::PowKernel>>,
+    /// The `PoseidonBN128Hash` tree kernels, compiled on first use.
+    #[cfg(feature = "poseidon_bn128")]
+    pub(crate) poseidon_bn128: OnceLock<Option<poseidon_bn128::TreeKernels>>,
     pub(crate) quotient_tail: OnceLock<quotient::TailCheckKernel>,
     pub(crate) leaf_gather: OnceLock<merkle::LeafGatherKernel>,
     open_layout: wgpu::BindGroupLayout,
@@ -860,6 +872,8 @@ impl GpuContext {
             fold_layout,
             fold,
             pow_kernel: OnceLock::new(),
+            #[cfg(feature = "poseidon_bn128")]
+            poseidon_bn128: OnceLock::new(),
             quotient_tail: OnceLock::new(),
             leaf_gather: OnceLock::new(),
             open_layout,
@@ -979,17 +993,6 @@ impl GpuContext {
             layout,
             entries: &entries,
         })
-    }
-
-    pub(crate) fn bind_hash(
-        &self,
-        params: &wgpu::Buffer,
-        src: &wgpu::Buffer,
-        digests: &wgpu::Buffer,
-        cap: &wgpu::Buffer,
-        rows: &wgpu::Buffer,
-    ) -> wgpu::BindGroup {
-        self.bind(&self.hash_layout, &[params, src, digests, cap, rows])
     }
 
     pub(crate) fn bind_fft(
@@ -1433,7 +1436,10 @@ impl GpuContext {
             "permute params",
             &[states.len() as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         );
-        let bindings = self.bind_hash(&params, &src, &out, &self.dummy_rw, &self.dummy_rw);
+        let bindings = self.bind(
+            &self.hash_layout,
+            &[&params, &src, &out, &self.dummy_rw, &self.dummy_rw],
+        );
         let mut encoder = self.encoder("permute");
         {
             let mut pass = self.begin_pass(&mut encoder, "permute", None);

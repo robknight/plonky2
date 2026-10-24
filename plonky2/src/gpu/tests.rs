@@ -7,6 +7,8 @@ mod column_leaves;
 mod fft_tiles;
 mod inversion;
 mod permutation_products;
+#[cfg(feature = "poseidon_bn128")]
+mod poseidon_bn128;
 mod residency_matrix;
 
 use rand::{RngCore, SeedableRng};
@@ -69,6 +71,7 @@ fn resident_merkle_query_paths() {
             let expected = MerkleTree::<F, H>::new_cpu(leaves.clone(), cap_height);
             let tree = merkle::build_tree(
                 &ctx,
+                crate::plonk::config::GpuHash::Poseidon,
                 &source,
                 merkle::LeafSource::Rows { leaf_len: 9 },
                 7,

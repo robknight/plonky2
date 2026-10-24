@@ -13,7 +13,7 @@ use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::{Field, PrimeField64};
 use crate::fri::oracle::{PolynomialBatch, ProverOracle, ProverPolynomialBatch, SALT_SIZE};
-use crate::gpu::merkle::{build_tree, supported, LeafSource};
+use crate::gpu::merkle::{build_tree, supported, supported_on, LeafSource};
 use crate::gpu::policy::LeafStorage;
 use crate::gpu::shader::{
     fft_plan, FFT_INVERSE, FFT_LOAD_BITREV, FFT_SHIFT_IN, FFT_SHIFT_OUT, FFT_TO_OUTPUT,
@@ -22,7 +22,7 @@ use crate::gpu::shader::{
 use crate::gpu::{context, DeviceBuffer, GpuContext};
 use crate::hash::hash_types::RichField;
 use crate::hash::merkle_tree::{MerkleCap, MerkleDigests, MerkleLeaves, MerkleTree};
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{GenericConfig, Hasher};
 use crate::timed;
 use crate::util::log2_strict;
 use crate::util::timing::TimingTree;
@@ -290,6 +290,9 @@ pub(crate) fn applicable<
         return None;
     }
     let ctx = context()?;
+    if !supported_on::<F, C::Hasher>(&ctx) {
+        return None;
+    }
     let n = 1u64 << log_n;
     let fits = ctx.fits(columns as u64 * n * 8);
     let workgroups = (n >> FFT_WORKGROUP.trailing_zeros()).max(n.div_ceil(HASH_WORKGROUP as u64))
@@ -767,6 +770,7 @@ fn commit<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usi
         "gpu: submit leaf hashing with row layout, and levels",
         build_tree(
             ctx,
+            <C::Hasher as Hasher<F>>::GPU_HASH,
             &lde,
             LeafSource::Columns {
                 columns: columns as u32,

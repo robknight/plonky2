@@ -14,13 +14,13 @@ use crate::field::types::Field;
 use crate::fri::prover::FriCommitedTrees;
 use crate::fri::FriParams;
 use crate::gpu::lde::{fft, FftJob};
-use crate::gpu::merkle::{build_tree, supported, LeafSource};
+use crate::gpu::merkle::{build_tree, supported, supported_on, LeafSource};
 use crate::gpu::shader::HASH_WORKGROUP;
 use crate::gpu::{context, DeviceBuffer, GpuContext};
 use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::merkle_tree::{MerkleCap, MerkleDigests, MerkleLeaves, MerkleTree};
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{GenericConfig, Hasher};
 use crate::util::log2_strict;
 
 /// Uploads extension elements as `D` columns of their base field components.
@@ -84,7 +84,7 @@ pub(crate) fn try_committed_trees<
     }
     let ctx = context()?;
     let ctx = &ctx;
-    if !commit_phase_fits(ctx, log_n, fri_params) {
+    if !supported_on::<F, C::Hasher>(ctx) || !commit_phase_fits(ctx, log_n, fri_params) {
         return None;
     }
     let vals = upload_extension::<F, D>(ctx, "fri values", &values.values);
@@ -149,6 +149,7 @@ pub(crate) fn committed_trees<
         let rows = (!column_leaves).then(|| ctx.storage("fri leaves", (D * n * 8) as u64));
         let tree = build_tree(
             ctx,
+            <C::Hasher as Hasher<F>>::GPU_HASH,
             &vals,
             LeafSource::Columns {
                 columns: D as u32,

@@ -24,7 +24,7 @@ use crate::fri::structure::FriInstanceInfo;
 use crate::fri::FriParams;
 use crate::gpu::fri::{commit_phase_fits, committed_trees, read_extension};
 use crate::gpu::lde::{device_coefficients, fft, FftJob};
-use crate::gpu::merkle::supported;
+use crate::gpu::merkle::{supported, supported_on};
 use crate::gpu::shader::{fft_plan, COMBINE_BLOCK, HASH_WORKGROUP};
 use crate::gpu::{context, field_supported, DeviceBuffer, GpuContext};
 use crate::hash::hash_types::RichField;
@@ -241,7 +241,8 @@ pub(crate) fn try_prove_openings<
     }
     let ctx = context()?;
     let ctx = &ctx;
-    if !commit_phase_fits(ctx, log_n, fri_params)
+    if !supported_on::<F, C::Hasher>(ctx)
+        || !commit_phase_fits(ctx, log_n, fri_params)
         || !ctx.fits((columns * degree * 8) as u64)
         || fft_plan(log_n)
             .iter()

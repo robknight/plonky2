@@ -7,7 +7,7 @@ use super::Fr;
 
 /// The constants parsed once, with the MDS matrices transposed so that a
 /// matrix-vector product reads each row contiguously.
-pub(super) struct Constants {
+pub(crate) struct Constants {
     /// Round constants: `WIDTH` before the first round and after the S-boxes
     /// of every full round but the last, one per partial round.
     pub c: [Fr; 88],
@@ -19,7 +19,7 @@ pub(super) struct Constants {
     pub p_t: [[Fr; 4]; 4],
 }
 
-pub(super) static CONSTANTS: LazyLock<Constants> = LazyLock::new(|| {
+pub(crate) static CONSTANTS: LazyLock<Constants> = LazyLock::new(|| {
     let parse = |s: &str| -> Fr { s.parse().unwrap() };
     let transpose =
         |m: &[[&str; 4]; 4]| std::array::from_fn(|i| std::array::from_fn(|j| parse(m[j][i])));
