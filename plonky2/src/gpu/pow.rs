@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 use crate::gpu::{context, field_supported, module, pipeline, shader, storage_layout, GpuContext};
 use crate::hash::hash_types::RichField;
+use crate::hash::hashing::PlonkyPermutation;
+use crate::plonk::config::Hasher;
 
 pub(crate) struct PowKernel {
     layout: wgpu::BindGroupLayout,
@@ -26,6 +28,13 @@ const MAX_BATCH: u32 = 1 << 20;
 /// The search covers up to `2^(min_leading_zeros + BUDGET_BITS)` candidates,
 /// so it fails to find a nonce with probability about `exp(-2^BUDGET_BITS)`.
 const BUDGET_BITS: u32 = 4;
+
+/// Whether the device searches proof-of-work nonces for this field and the
+/// permutation of `H`'s sponge, which may differ from the hash its Merkle
+/// trees use.
+pub(crate) fn supported<F: RichField, H: Hasher<F>>() -> bool {
+    <H::Permutation as PlonkyPermutation<F>>::GPU_POSEIDON && field_supported::<F>()
+}
 
 /// The smallest candidate `c` such that the permutation of `state` with word
 /// `position` replaced by `c` has a response with at least

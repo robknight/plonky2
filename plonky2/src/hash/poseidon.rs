@@ -18,7 +18,7 @@ use crate::hash::hashing::{compress, hash_n_to_hash_no_pad, PlonkyPermutation};
 use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::target::{BoolTarget, Target};
 use crate::plonk::circuit_builder::CircuitBuilder;
-use crate::plonk::config::{AlgebraicHasher, Hasher};
+use crate::plonk::config::{AlgebraicHasher, GpuHash, Hasher};
 
 pub const SPONGE_RATE: usize = 8;
 pub const SPONGE_CAPACITY: usize = 4;
@@ -835,6 +835,7 @@ impl<T: Copy + Debug + Default + Eq + Permuter + Send + Sync> PlonkyPermutation<
 {
     const RATE: usize = SPONGE_RATE;
     const WIDTH: usize = SPONGE_WIDTH;
+    const GPU_POSEIDON: bool = true;
 
     fn new<I: IntoIterator<Item = T>>(elts: I) -> Self {
         let mut perm = Self {
@@ -874,7 +875,7 @@ impl<T: Copy + Debug + Default + Eq + Permuter + Send + Sync> PlonkyPermutation<
 pub struct PoseidonHash;
 impl<F: RichField> Hasher<F> for PoseidonHash {
     const HASH_SIZE: usize = 4 * 8;
-    const GPU_POSEIDON: bool = true;
+    const GPU_HASH: GpuHash = GpuHash::Poseidon;
     type Hash = HashOut<F>;
     type Permutation = PoseidonPermutation<F>;
 

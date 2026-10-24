@@ -32,15 +32,25 @@ pub trait GenericHashOut<F: RichField>:
     fn to_vec(&self) -> Vec<F>;
 }
 
+/// The hash functions whose Merkle trees the `gpu` feature's kernels build.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuHash {
+    /// No kernel: trees are built on the CPU.
+    None,
+    /// [`PoseidonHash`] over the Goldilocks field.
+    Poseidon,
+}
+
 /// Trait for hash functions.
 pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
     /// Size of `Hash` in bytes.
     const HASH_SIZE: usize;
 
-    /// Whether this hasher is the Poseidon sponge over the base field that the GPU kernels
-    /// implement (`PoseidonHash`). The GPU paths use the CPU for any other hasher.
+    /// The GPU kernel that builds this hasher's Merkle trees. Only this crate's hashers set
+    /// it; the GPU paths build trees on the CPU for [`GpuHash::None`].
     #[doc(hidden)]
-    const GPU_POSEIDON: bool = false;
+    const GPU_HASH: GpuHash = GpuHash::None;
 
     /// Hash Output
     type Hash: GenericHashOut<F>;

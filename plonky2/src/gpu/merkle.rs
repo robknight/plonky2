@@ -7,7 +7,7 @@ use crate::gpu::shader::HASH_WORKGROUP;
 use crate::gpu::{context, field_supported, field_words, DeviceBuffer, GpuContext};
 use crate::hash::hash_types::RichField;
 use crate::hash::merkle_tree::MerkleLeaves;
-use crate::plonk::config::{GenericHashOut, Hasher};
+use crate::plonk::config::{GenericHashOut, GpuHash, Hasher};
 use crate::util::log2_strict;
 
 /// Where a leaf's elements come from.
@@ -381,7 +381,7 @@ impl DeviceTree {
 
 /// Whether the GPU can build trees for this field and hasher.
 pub(crate) fn supported<F: RichField, H: Hasher<F>>() -> bool {
-    H::GPU_POSEIDON && field_supported::<F>()
+    H::GPU_HASH != GpuHash::None && field_supported::<F>()
 }
 
 /// The digests and the cap of a tree.

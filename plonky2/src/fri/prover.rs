@@ -226,11 +226,12 @@ pub(crate) fn fri_proof_of_work<
         leading_zeros >= min_leading_zeros
     };
 
-    // With the Poseidon hasher the search runs on the GPU when one is
-    // available; its nonce is checked here with the CPU permutation, and any
-    // failure falls back to the CPU search below.
+    // With the Poseidon permutation the search runs on the GPU when one is
+    // available, whichever hasher builds the Merkle trees; its nonce is
+    // checked here with the CPU permutation, and any failure falls back to
+    // the CPU search below.
     #[cfg(feature = "gpu")]
-    let gpu_witness = if <C::Hasher as crate::plonk::config::Hasher<F>>::GPU_POSEIDON {
+    let gpu_witness = if crate::gpu::pow::supported::<F, C::Hasher>() {
         crate::gpu::pow::search(
             duplex_intermediate_state.as_ref(),
             witness_input_pos,

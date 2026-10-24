@@ -65,6 +65,12 @@ pub trait PlonkyPermutation<T: Copy + Default>:
     const RATE: usize;
     const WIDTH: usize;
 
+    /// Whether this is the Poseidon permutation that the GPU proof-of-work kernel implements
+    /// ([`PoseidonPermutation`](crate::hash::poseidon::PoseidonPermutation)). The proof-of-work
+    /// search runs on the CPU for any other permutation.
+    #[doc(hidden)]
+    const GPU_POSEIDON: bool = false;
+
     /// Initialises internal state with values from `iter` until
     /// `iter` is exhausted or `Self::WIDTH` values have been
     /// received; remaining state (if any) initialised with
