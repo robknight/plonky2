@@ -1394,3 +1394,155 @@ fn bench_transfer_paths() {
         );
     }
 }
+
+/// Poseidon BN128: the in-register permutation rate of each flavour at
+/// several workgroup sizes (each thread permutes one state `ITERS` times), then
+/// trees of 2^16 leaves of 135 elements, the size of a wrap proof's wires
+/// commitment, and of single elements, whose leaves need no permutation.
+/// Run alone: `cargo test --release --features gpu-profiling,poseidon_bn128
+/// bench_poseidon_bn128 -- --ignored --nocapture`.
+#[cfg(feature = "poseidon_bn128")]
+#[test]
+#[ignore]
+fn bench_poseidon_bn128() {
+    use std::time::Instant;
+
+    use crate::gpu::poseidon_bn128 as kernels;
+    use crate::hash::poseidon_bn128::PoseidonBN128Hash;
+    use crate::plonk::config::GpuHash;
+    const ITERS: u32 = 8;
+    let Some(ctx) = ctx() else { return };
+    let ctx = &*ctx;
+    let threads = 1u32 << 16;
+    let layout = storage_layout(
+        &ctx.device,
+        "bn128 bench",
+        &[
+            (true, true),
+            (false, true),
+            (false, false),
+            (false, false),
+            (false, false),
+            (true, true),
+        ],
+    );
+    // Word 0 of each element is random and the top word zero, so every
+    // element is below p.
+    let mut rng = StdRng::seed_from_u64(0x42454e4348);
+    let words = (0..threads as usize * 16)
+        .map(|i| if i % 4 == 3 { 0 } else { rng.next_u64() })
+        .collect::<Vec<_>>();
+    let src = ctx.upload("bn128 bench states", &words);
+    let out = ctx.storage("bn128 bench out", threads as u64 * 4);
+    let params = ctx.uniform("bn128 bench params", &[threads, ITERS, 0, 0]);
+    let constants = ctx.uniform("bn128 constants", &kernels::constant_words());
+    let bindings = ctx.bind(
+        &layout,
+        &[
+            &params,
+            &src,
+            &out,
+            &ctx.dummy_rw,
+            &ctx.dummy_rw,
+            &constants,
+        ],
+    );
+    let mut variants = Vec::new();
+    for flavor in super::inversion::flavors(ctx) {
+        for size in [32u32, 64, 128, 256] {
+            let source = kernels::permutation_source(flavor)
+                + &format!(
+                    r#"
+struct Params {{ count: u32, iters: u32, pad1: u32, pad2: u32 }}
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> inputs: array<u32>;
+@group(0) @binding(2) var<storage, read_write> outputs: array<u32>;
+
+@compute @workgroup_size({size})
+fn bench(@builtin(global_invocation_id) id: vec3<u32>) {{
+    let t = id.x;
+    if (t >= params.count) {{ return; }}
+    var s: array<Fr, 4>;
+    for (var k = 0u; k < 4u; k++) {{
+        for (var j = 0u; j < 8u; j++) {{ s[k][j] = inputs[32u * t + 8u * k + j]; }}
+    }}
+    for (var i = 0u; i < params.iters; i++) {{ s = permute(s); }}
+    outputs[t] = s[0][0] ^ s[1][1] ^ s[2][2] ^ s[3][3];
+}}
+"#
+                );
+            let label = format!("{flavor:?} workgroup {size}");
+            let module = module(&ctx.device, &label, &source);
+            variants.push((
+                label,
+                size,
+                pipeline(&ctx.device, &layout, &module, "bench"),
+            ));
+        }
+    }
+    let time = |pipeline: &wgpu::ComputePipeline, size: u32| {
+        let mut encoder = ctx.encoder("bn128 bench");
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bindings, &[]);
+            pass.dispatch_workgroups(threads.div_ceil(size), 1, 1);
+        }
+        let start = Instant::now();
+        ctx.submit(encoder);
+        start.elapsed().as_secs_f64()
+    };
+    for (_, size, pipeline) in &variants {
+        time(pipeline, *size);
+    }
+    let mut best = vec![f64::MAX; variants.len()];
+    for round in 0..6 {
+        let order: Vec<usize> = if round % 2 == 0 {
+            (0..variants.len()).collect()
+        } else {
+            (0..variants.len()).rev().collect()
+        };
+        for i in order {
+            best[i] = best[i].min(time(&variants[i].2, variants[i].1));
+        }
+    }
+    for ((label, _, _), best) in variants.iter().zip(&best) {
+        let perms = f64::from(threads) * f64::from(ITERS);
+        eprintln!(
+            "BN128_PERMUTE {label:24} best {:8.2} ms  {:6.2} M permutations/s",
+            best * 1e3,
+            perms / best / 1e6
+        );
+    }
+
+    for leaf_len in [135u32, 1] {
+        let log_leaves = 16;
+        let leaves = random_fields(&mut rng, (leaf_len as usize) << log_leaves);
+        let src = ctx.upload(
+            "bn128 bench leaves",
+            &leaves
+                .iter()
+                .map(|x| x.to_noncanonical_u64())
+                .collect::<Vec<_>>(),
+        );
+        let mut best = f64::MAX;
+        for _ in 0..6 {
+            let start = Instant::now();
+            let tree = merkle::build_tree(
+                ctx,
+                GpuHash::PoseidonBn128,
+                &src,
+                merkle::LeafSource::Rows { leaf_len },
+                log_leaves,
+                4,
+                None,
+            );
+            tree.read::<F, PoseidonBN128Hash>(ctx);
+            best = best.min(start.elapsed().as_secs_f64());
+        }
+        eprintln!(
+            "BN128_TREE 2^{log_leaves} leaves x {leaf_len}: best {:.2} ms",
+            best * 1e3
+        );
+    }
+}
