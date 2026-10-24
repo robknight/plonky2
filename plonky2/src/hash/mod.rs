@@ -10,4 +10,6 @@ pub mod merkle_proofs;
 pub mod merkle_tree;
 pub mod path_compression;
 pub mod poseidon;
+#[cfg(feature = "poseidon_bn128")]
+pub mod poseidon_bn128;
 pub mod poseidon_goldilocks;

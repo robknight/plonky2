@@ -24,9 +24,15 @@ parallel = ["hashbrown/rayon", "plonky2_maybe_rayon/parallel", "dep:rayon"]
 std = ["anyhow/std", "rand/std", "itertools/use_std"]
 rand_chacha = ["dep:rand_chacha", "dep:chacha20", "dep:zeroize"]
 timing = ["std", "dep:web-time"]
+# PoseidonBN128Hash and PoseidonBN128GoldilocksConfig: Merkle trees hashed with
+# Poseidon over BN254, for proofs verified inside a BN254 SNARK.
+poseidon_bn128 = ["std", "num/alloc", "dep:ark-bn254", "dep:ark-ff"]
 
 [dependencies]
 ahash = { workspace = true }
+# ark-ff's `asm` feature takes effect only with the bmi2 and adx target features.
+ark-bn254 = { version = "0.5", optional = true, default-features = false, features = ["scalar_field"] }
+ark-ff = { version = "0.5", optional = true, default-features = false, features = ["asm"] }
 anyhow = { workspace = true }
 hashbrown = { workspace = true }
 itertools = { workspace = true }

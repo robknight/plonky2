@@ -130,6 +130,20 @@ impl GenericConfig<2> for PoseidonGoldilocksConfig {
     type InnerHasher = PoseidonHash;
 }
 
+/// Configuration using Poseidon over BN254 for Merkle trees and Poseidon over
+/// the Goldilocks field inside the circuit, for proofs verified inside a BN254
+/// SNARK.
+#[cfg(feature = "poseidon_bn128")]
+#[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Serialize)]
+pub struct PoseidonBN128GoldilocksConfig;
+#[cfg(feature = "poseidon_bn128")]
+impl GenericConfig<2> for PoseidonBN128GoldilocksConfig {
+    type F = GoldilocksField;
+    type FE = QuadraticExtension<Self::F>;
+    type Hasher = crate::hash::poseidon_bn128::PoseidonBN128Hash;
+    type InnerHasher = PoseidonHash;
+}
+
 /// Configuration using truncated Keccak over the Goldilocks field.
 #[derive(Debug, Copy, Clone, Default, Eq, PartialEq)]
 pub struct KeccakGoldilocksConfig;
