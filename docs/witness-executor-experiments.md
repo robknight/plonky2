@@ -195,3 +195,17 @@ For MainPod, automatic detection finds 98 eligible groups covering 6,584 arithme
 
 Raw results and source snapshots for this series are retained in `.benchmark-artifacts/witness-optimization-2026-10-24/` in the shared workspace.
 
+## Fixed regions and dependency scheduling results
+
+The affine fixed-address Rust prototype improved arithmetic-deep execution by 24–32% in three x86 replay comparisons. MainPod live execution changed by approximately minus 0.8%, plus 2.3%, and plus 3.7%, with small full-witness changes. Its limited MainPod coverage and additional circuit-specific generation and compilation do not justify retaining this prototype. More general regions with irregular operands and mixed descriptors remain open.
+
+Two scheduling prototypes preserved the existing arithmetic kernels and group boundaries. One used scoped ready-group tasks with dependency counters; the other used persistent workers consuming serial chunks from a priority queue. Both passed exact-state checks, worklist comparisons, and concurrent proofs. MainPod live results were inconsistent across three paired processes. The scoped scheduler substantially regressed arithmetic-deep; the chunk queue also regressed deep and wide hash workloads. Neither implementation is retained. These results test scheduling over existing groups, rather than a compiler that fuses larger regions and retains values across their boundaries.
+
+## Direct input binding retained
+
+Input binding now uses the cached canonical slot map already needed for final gathering. It checks membership, duplicate agreement, and complete root coverage while producing root values, removing repeated input sorting and per-input binary searches on the common path. The fast path is eligible only when the installed input mask equals the program's boundary roots. Programs with other masks retain the previous lookup and worklist fallback behavior.
+
+Six same-process alternating comparisons reduced the full MainPod witness call by 10.8–16.6%, saving approximately 6–10.8 ms per proof. Execution arithmetic is unchanged; this is a witness-preparation improvement. The final input-mask eligibility check was confirmed in two of those processes. MainPod, recursive/nonempty Points, worklist comparisons, and concurrent proofs passed. The exact staged implementation passed all 15 witness-program tests, including agreeing noncanonical aliases, conflicting aliases, unconstrained roots, missing inputs, and extra inputs.
+
+**Decision:** retain direct binding as the default for eligible installed programs. `P2_WITNESS_INPUT_BINDING=legacy` remains available for comparison. It introduces no additional per-circuit generated code or mapping allocation.
+

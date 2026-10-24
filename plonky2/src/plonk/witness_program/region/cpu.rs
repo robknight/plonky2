@@ -36,6 +36,19 @@ use crate::plonk::config::GenericConfig;
 
 type Q = QuinticExtension<G>;
 
+static INPUT_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
+pub(crate) fn benchmark_input_binding(direct: bool) {
+    INPUT_OVERRIDE.store(u8::from(direct), Ordering::Relaxed);
+}
+fn direct_binding() -> bool {
+    let mode = INPUT_OVERRIDE.load(Ordering::Relaxed);
+    if mode != 255 {
+        return mode != 0;
+    }
+    static MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| std::env::var("P2_WITNESS_INPUT_BINDING").as_deref() != Ok("legacy"))
+}
+
 impl RegionProgram {
     /// State slot written by each random value, indexed by the random index
     /// the program assigns. Slots below the representative count are
@@ -1834,6 +1847,74 @@ pub(crate) fn generate_wires<
     generate_wires_with(inputs, prover, common, allow_device, None)
 }
 
+/// Bind and validate an input mask in one pass through the supplied targets.
+/// The canonical slot map is already cached for final wire gathering. Roots
+/// occupy its prefix, so membership and position need no additional index.
+fn bind_roots_direct<F: PrimeField64>(
+    inputs: &PartialWitness<F>,
+    program: &RegionProgram,
+    map: &[usize],
+    num_wires: usize,
+    degree: usize,
+) -> Result<Option<Vec<u64>>> {
+    let slots = program.rep_slots(map.len());
+    let mut values = vec![0; program.roots.len()];
+    let mut seen = vec![false; values.len()];
+    for (&target, &value) in &inputs.target_values {
+        let representative = map
+            .get(target.index(num_wires, degree))
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("input target {target:?} is outside the circuit"))?;
+        let Some(position) = slots
+            .get(representative)
+            .copied()
+            .filter(|&s| (s as usize) < values.len())
+            .map(|s| s as usize)
+        else {
+            return Ok(None);
+        };
+        let value = value.to_canonical_u64();
+        if seen[position] {
+            ensure!(
+                values[position] == value,
+                "input {target:?} conflicts with another input of its partition"
+            );
+        } else {
+            values[position] = value;
+            seen[position] = true;
+        }
+    }
+    Ok(seen.iter().all(|&x| x).then_some(values))
+}
+
+fn report_input_mismatch<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    inputs: &PartialWitness<F>,
+    prover: &ProverOnlyCircuitData<F, C, D>,
+    common: &CommonCircuitData<F, D>,
+) -> Result<()> {
+    let mut initial = inputs
+        .target_values
+        .keys()
+        .map(|t| {
+            prover
+                .representative_map
+                .get(t.index(common.config.num_wires, common.degree()))
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("input outside circuit"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    initial.sort_unstable();
+    initial.dedup();
+    let _ = prover
+        .witness_program
+        .lookup_all(prover.generators.len(), &initial);
+    Ok(())
+}
+
 pub(crate) fn generate_wires_with<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -1869,21 +1950,46 @@ pub(crate) fn generate_wires_with<
         ..Default::default()
     };
 
+    let mut direct = direct_binding();
     let started = Instant::now();
     let input_discovery = profile::Pipeline::new("input-discovery", prover.generators.len());
-    let mut initial = inputs
-        .target_values
-        .keys()
-        .map(|&t| rep(t))
-        .collect::<Result<Vec<_>>>()?;
-    initial.sort_unstable();
-    initial.dedup();
-    let program = match prover
-        .witness_program
-        .lookup_all(prover.generators.len(), &initial)
-    {
-        super::Installed::Program(program) => program,
-        super::Installed::OtherInputs | super::Installed::None => return Ok(None),
+    let lookup = || -> Result<Option<std::sync::Arc<RegionProgram>>> {
+        let mut initial = inputs
+            .target_values
+            .keys()
+            .map(|&t| rep(t))
+            .collect::<Result<Vec<_>>>()?;
+        initial.sort_unstable();
+        initial.dedup();
+        Ok(
+            match prover
+                .witness_program
+                .lookup_all(prover.generators.len(), &initial)
+            {
+                super::Installed::Program(p) => Some(p),
+                super::Installed::OtherInputs | super::Installed::None => None,
+            },
+        )
+    };
+    let program = if direct {
+        match prover
+            .witness_program
+            .candidate_all(prover.generators.len())
+        {
+            Some(program) => program,
+            None => {
+                direct = false;
+                match lookup()? {
+                    Some(program) => program,
+                    None => return Ok(None),
+                }
+            }
+        }
+    } else {
+        match lookup()? {
+            Some(program) => program,
+            None => return Ok(None),
+        }
     };
     report.compile_cached = true;
     report.plan = "installed";
@@ -1892,33 +1998,42 @@ pub(crate) fn generate_wires_with<
     report.representatives = program.representatives.len();
     report.random_values = program.random_count as usize;
     report.layers = program.layer_count();
-
-    // Boundary roots straight from the inputs; duplicates must agree.
     let started = Instant::now();
     let root_binding = profile::Pipeline::new("root-binding", prover.generators.len());
-    let mut root_values = vec![0u64; program.roots.len()];
-    let mut seen = vec![false; program.roots.len()];
-    for (&target, &value) in &inputs.target_values {
-        let representative = rep(target)?;
-        let position = program
-            .roots
-            .binary_search(&representative)
-            .map_err(|_| anyhow::anyhow!("input {target:?} is not a boundary root"))?;
-        let value = value.to_canonical_u64();
-        if seen[position] {
-            ensure!(
-                root_values[position] == value,
-                "input {target:?} conflicts with another input of its partition"
-            );
-        } else {
-            root_values[position] = value;
-            seen[position] = true;
+    let root_values = if direct {
+        match bind_roots_direct(inputs, &program, map, num_wires, degree)? {
+            Some(values) => values,
+            None => {
+                report_input_mismatch(inputs, prover, common)?;
+                return Ok(None);
+            }
         }
-    }
-    ensure!(
-        seen.iter().all(|&set| set),
-        "a boundary root has no input value"
-    );
+    } else {
+        let mut values = vec![0u64; program.roots.len()];
+        let mut seen = vec![false; program.roots.len()];
+        for (&target, &value) in &inputs.target_values {
+            let representative = rep(target)?;
+            let position = program
+                .roots
+                .binary_search(&representative)
+                .map_err(|_| anyhow::anyhow!("input {target:?} is not a boundary root"))?;
+            let value = value.to_canonical_u64();
+            if seen[position] {
+                ensure!(
+                    values[position] == value,
+                    "input {target:?} conflicts with another input of its partition"
+                );
+            } else {
+                values[position] = value;
+                seen[position] = true;
+            }
+        }
+        ensure!(
+            seen.iter().all(|&set| set),
+            "a boundary root has no input value"
+        );
+        values
+    };
     drop(root_binding);
     let random_sampling = profile::Pipeline::new("random-sampling", prover.generators.len());
     let random = match random_values {
@@ -2291,6 +2406,54 @@ pub(crate) mod tests {
     use crate::plonk::config::PoseidonGoldilocksConfig as C;
     use crate::util::reducing::ReducingFactorTarget;
     use crate::util::timing::TimingTree;
+
+    #[test]
+    fn direct_binding_validates_aliases_missing_and_additional_roots() {
+        let mut builder = CircuitBuilder::<G, 2>::new(CircuitConfig::standard_recursion_config());
+        let a = builder.add_virtual_target();
+        let alias = builder.add_virtual_target();
+        builder.connect(a, alias);
+        let b = builder.add_virtual_target();
+        let unconstrained = builder.add_virtual_target();
+        let sum = builder.add(a, b);
+        builder.register_public_input(sum);
+        let data = builder.build::<C>();
+        let mut inputs = PartialWitness::new();
+        inputs.set_target(a, G::from_canonical_u64(9)).unwrap();
+        inputs.set_target(b, G::from_canonical_u64(5)).unwrap();
+        inputs
+            .set_target(unconstrained, G::from_canonical_u64(17))
+            .unwrap();
+        let program = data.compile_witness_program_like(&inputs).unwrap();
+        let bind = |inputs: &PartialWitness<G>| {
+            bind_roots_direct(
+                inputs,
+                &program.program,
+                &data.prover_only.representative_map,
+                data.common.config.num_wires,
+                data.common.degree(),
+            )
+        };
+        let expected = bind(&inputs).unwrap().unwrap();
+        assert_eq!(expected.len(), 3);
+        // Agreeing aliases may use distinct noncanonical field encodings.
+        inputs.set_target(alias, G(G::ORDER + 9)).unwrap();
+        assert_eq!(bind(&inputs).unwrap(), Some(expected));
+        let mut conflict = inputs.clone();
+        conflict
+            .target_values
+            .insert(alias, G::from_canonical_u64(10));
+        assert!(bind(&conflict)
+            .unwrap_err()
+            .to_string()
+            .contains("conflicts"));
+        let mut missing = inputs.clone();
+        missing.target_values.remove(&unconstrained);
+        assert!(bind(&missing).unwrap().is_none());
+        let mut extra = inputs.clone();
+        extra.set_target(sum, G::from_canonical_u64(14)).unwrap();
+        assert!(bind(&extra).unwrap().is_none());
+    }
 
     pub(crate) struct Fixture {
         pub(crate) data: CircuitData<G, C, 2>,

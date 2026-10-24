@@ -538,3 +538,9 @@ pub fn replay_snapshot(stem: &std::path::Path, iterations: usize) -> anyhow::Res
 pub fn benchmark_profile(active: bool) {
     region::benchmark_profile(active);
 }
+
+/// Benchmark-only input binding control. Change only between serial proofs.
+#[doc(hidden)]
+pub fn benchmark_input_binding(direct: bool) {
+    region::cpu::benchmark_input_binding(direct);
+}

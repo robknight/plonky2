@@ -169,6 +169,7 @@ pub struct ProgramCache(Arc<Mutex<CacheState>>);
 #[derive(Debug)]
 struct CachedProgram {
     initial: Vec<usize>,
+    roots_match_inputs: bool,
     generators: usize,
     program: Arc<RegionProgram>,
     /// Diagnostics that compile their own program leave this unset.
@@ -216,7 +217,9 @@ impl ProgramCache {
         operations: u128,
     ) {
         let mut cached = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let roots_match_inputs = initial.as_slice() == program.roots.as_ref();
         cached.program = Some(CachedProgram {
+            roots_match_inputs,
             initial,
             generators,
             program,
@@ -240,6 +243,15 @@ impl ProgramCache {
             .program
             .as_ref()
             .is_some_and(|program| program.generators == generators)
+    }
+
+    /// Candidate program; callers must validate that every supplied input
+    /// maps to a root and that every root is supplied before executing it.
+    pub(crate) fn candidate_all(&self, generators: usize) -> Option<Arc<RegionProgram>> {
+        let cached = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let program = cached.program.as_ref()?;
+        (program.generators == generators && program.roots_match_inputs)
+            .then(|| program.program.clone())
     }
 
     /// The whole-circuit program in the slot, its mask and its operation
@@ -308,7 +320,9 @@ impl ProgramCache {
             .map(u32::try_from)
             .collect::<Result<Vec<_>, _>>()?;
         let program = Arc::new(RegionProgram::compile(generators, entry, &indices)?);
+        let roots_match_inputs = initial.as_slice() == program.roots.as_ref();
         cached.program = Some(CachedProgram {
+            roots_match_inputs,
             initial,
             generators: generators.len(),
             program: program.clone(),
