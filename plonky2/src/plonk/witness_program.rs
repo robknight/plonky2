@@ -228,9 +228,23 @@ pub(crate) fn compile<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, 
     let started = std::time::Instant::now();
     let operations = plan_bytes::operation_digest(&prover.generators);
     log::debug!(target: COMPILE_LOG, "compile phase operation_digest {:?}", started.elapsed());
+    let key = key(prover, mask, operations);
+    if let Some(directory) = std::env::var_os("P2_AOT_EXPORT_DIR") {
+        std::fs::create_dir_all(&directory)
+            .and_then(|_| {
+                std::fs::write(
+                    std::path::Path::new(&directory).join(format!(
+                        "{}.p2w",
+                        region::aot::file_stem(&prover.circuit_digest.to_bytes())
+                    )),
+                    plan_bytes::encode(&program, &key),
+                )
+            })
+            .map_err(|e| WitnessProgramError::Invalid(format!("export: {e:#}")))?;
+    }
     Ok(WitnessProgram {
         program: Arc::new(program),
-        key: key(prover, mask, operations),
+        key,
     })
 }
 
@@ -512,4 +526,9 @@ mod tests {
         }
         assert!(!prove_and_verify(&data, pw));
     }
+}
+
+#[doc(hidden)]
+pub fn replay_snapshot(stem: &std::path::Path, iterations: usize) -> anyhow::Result<()> {
+    region::cpu::replay_snapshot(stem, iterations)
 }

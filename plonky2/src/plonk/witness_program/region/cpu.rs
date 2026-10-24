@@ -134,6 +134,36 @@ impl RegionProgram {
         root_values: &[u64],
         random_values: &'a [u64],
     ) -> Result<Executor<'a>> {
+        #[cfg(feature = "parallel")]
+        {
+            static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> =
+                std::sync::OnceLock::new();
+            let pool = POOL.get_or_init(|| {
+                std::env::var("P2_AOT_WITNESS_THREADS")
+                    .ok()
+                    .and_then(|x| x.parse::<usize>().ok())
+                    .filter(|&n| n > 0)
+                    .map(|n| {
+                        rayon::ThreadPoolBuilder::new()
+                            .num_threads(n)
+                            .build()
+                            .expect("witness thread pool")
+                    })
+            });
+            if let Some(pool) = pool {
+                return pool
+                    .install(|| self.execute_state_inner(root_values, random_values, false));
+            }
+        }
+        self.execute_state_inner(root_values, random_values, false)
+    }
+
+    fn execute_state_inner<'a>(
+        &'a self,
+        root_values: &[u64],
+        random_values: &'a [u64],
+        reference: bool,
+    ) -> Result<Executor<'a>> {
         ensure!(
             random_values.len() == self.random_count as usize,
             "expected {} random values, got {}",
@@ -146,9 +176,19 @@ impl RegionProgram {
             self.roots.len(),
             root_values.len()
         );
+        let fast = if !reference && super::aot::fast_enabled() {
+            if self.fast.get().is_none() {
+                let certificate = super::aot::certify(self)?;
+                let _ = self.fast.set(certificate);
+            }
+            self.fast.get()
+        } else {
+            None
+        };
         let executor = Executor {
             program: self,
             random: random_values,
+            fast,
             state: (0..self.state_slots).map(|_| AtomicU64::new(0)).collect(),
             ready: (0..self.state_slots)
                 .map(|_| AtomicBool::new(false))
@@ -208,7 +248,7 @@ impl RegionProgram {
                 "GPU_WITNESS_CPU_EXECUTOR_PROFILE layers={} total={total:?} {summary}",
                 self.groups.len()
             );
-        } else {
+        } else if reference || !super::aot::execute(&executor)? {
             for layer in &self.groups {
                 layer.par_iter().try_for_each(run_group)?;
             }
@@ -225,18 +265,21 @@ impl RegionProgram {
         // that omits a writer (for example a blinding value) is rejected
         // here rather than gathered as zero.
         ensure!(
-            executor.ready.par_iter().all(|r| r.load(Ordering::Relaxed)),
+            executor.ready.par_iter().enumerate().all(|(i, r)| {
+                executor.fast.is_some_and(|f| f.single[i] != 0) || r.load(Ordering::Relaxed)
+            }),
             "a state slot was never written by the plan"
         );
         Ok(executor)
     }
 }
 
-struct Executor<'a> {
-    program: &'a RegionProgram,
+pub(super) struct Executor<'a> {
+    pub(super) program: &'a RegionProgram,
     random: &'a [u64],
-    state: Vec<AtomicU64>,
+    pub(super) state: Vec<AtomicU64>,
     ready: Vec<AtomicBool>,
+    fast: Option<&'a super::aot::FastLayout>,
 }
 
 impl Drop for Executor<'_> {
@@ -253,7 +296,7 @@ impl Drop for Executor<'_> {
 
 /// Lanes per Rayon task. Expensive kinds split to single lanes; cheap
 /// kinds are batched so task overhead stays below the arithmetic.
-fn lane_chunk(kind: Kind) -> u32 {
+pub(super) fn lane_chunk(kind: Kind) -> u32 {
     match kind {
         Kind::Poseidon
         | Kind::EcAddXu
@@ -261,6 +304,7 @@ fn lane_chunk(kind: Kind) -> u32 {
         | Kind::EcAddHomogOffset
         | Kind::EcScalarMul
         | Kind::CosetInterpolation => 1,
+        Kind::ArithmeticChain => 64,
         Kind::TableLookup | Kind::QuinticMultiply | Kind::QuinticQuotient | Kind::Comparison => 16,
         _ => 512,
     }
@@ -390,11 +434,11 @@ fn q_add_mixed_fractional(p: [Q; 4], x: Q, u: Q, b1: G) -> Result<[Q; 4]> {
 }
 
 impl Executor<'_> {
-    fn load(&self, slot: u32) -> Result<G> {
+    pub(super) fn load(&self, slot: u32) -> Result<G> {
         let slot = slot as usize;
         ensure!(slot < self.state.len(), "state slot {slot} out of bounds");
         ensure!(
-            self.ready[slot].load(Ordering::Relaxed),
+            self.fast.is_some() || self.ready[slot].load(Ordering::Relaxed),
             "state slot {slot} read before it was written"
         );
         Ok(G::from_canonical_u64(
@@ -402,10 +446,14 @@ impl Executor<'_> {
         ))
     }
 
-    fn store(&self, slot: u32, value: G) -> Result<()> {
+    pub(super) fn store(&self, slot: u32, value: G) -> Result<()> {
         let slot = slot as usize;
         ensure!(slot < self.state.len(), "state slot {slot} out of bounds");
         let value = value.to_canonical_u64();
+        if self.fast.is_some_and(|f| f.single[slot] != 0) {
+            self.state[slot].store(value, Ordering::Relaxed);
+            return Ok(());
+        }
         if self.ready[slot].load(Ordering::Relaxed) {
             ensure!(
                 self.state[slot].load(Ordering::Relaxed) == value,
@@ -429,18 +477,25 @@ impl Executor<'_> {
             .ok_or_else(|| anyhow::anyhow!("plan target index {index} out of range"))
     }
 
-    fn input(&self, offset: u32, position: u32, count: u32, k: u32) -> Result<G> {
+    pub(super) fn input(&self, offset: u32, position: u32, count: u32, k: u32) -> Result<G> {
         self.load(self.target(offset, position, count, k)?)
     }
 
-    fn output(&self, offset: u32, position: u32, count: u32, k: u32, value: G) -> Result<()> {
+    pub(super) fn output(
+        &self,
+        offset: u32,
+        position: u32,
+        count: u32,
+        k: u32,
+        value: G,
+    ) -> Result<()> {
         let slot = self.target(offset, position, count, k)?;
         self.store(slot, value)
     }
 
     /// Coefficient of lane `k` at `position` in a group's coefficient block,
     /// with checked arithmetic and a bounds check.
-    fn coefficient(&self, base: u32, position: u64, count: u32, k: u32) -> Result<u64> {
+    pub(super) fn coefficient(&self, base: u32, position: u64, count: u32, k: u32) -> Result<u64> {
         let index = position
             .checked_mul(count as u64)
             .and_then(|v| v.checked_add(base as u64))
@@ -482,6 +537,542 @@ impl Executor<'_> {
                 let c0 = field(self.coefficient(co, 0, count, k)?);
                 let c1 = field(self.coefficient(co, 1, count, k)?);
                 self.output(offset, 3, count, k, x * y * c0 + z * c1)
+            }
+            Kind::ArithmeticChain => {
+                let co = group.coefficients_offset()?;
+                let n = group.outputs as usize;
+                ensure!(n > 0 && n <= 8, "invalid arithmetic chain length");
+                let mut locals = [G::ZERO; 8];
+                for j in 0..n {
+                    let read = |pos: u64| -> Result<G> {
+                        let reference = self.coefficient(co, (5 * j) as u64 + pos, count, k)?;
+                        if reference >> 63 != 0 {
+                            let index = (reference & !(1u64 << 63)) as usize;
+                            ensure!(index < j, "chain reads an unproduced temporary");
+                            Ok(locals[index])
+                        } else {
+                            ensure!(
+                                reference < group.inputs as u64,
+                                "chain input outside its boundary"
+                            );
+                            self.input(offset, reference as u32, count, k)
+                        }
+                    };
+                    let c0 = field(self.coefficient(co, (5 * j + 3) as u64, count, k)?);
+                    let c1 = field(self.coefficient(co, (5 * j + 4) as u64, count, k)?);
+                    let product = if c0 == G::ZERO {
+                        G::ZERO
+                    } else {
+                        let product = read(0)? * read(1)?;
+                        if c0 == G::ONE {
+                            product
+                        } else {
+                            product * c0
+                        }
+                    };
+                    let addend = if c1 == G::ZERO {
+                        G::ZERO
+                    } else {
+                        let addend = read(2)?;
+                        if c1 == G::ONE {
+                            addend
+                        } else {
+                            addend * c1
+                        }
+                    };
+                    locals[j] = product + addend;
+                    self.output(offset, group.inputs + j as u32, count, k, locals[j])?;
+                }
+                Ok(())
+            }
+            Kind::Copy => {
+                let x = self.input(offset, 0, count, k)?;
+                self.output(offset, 1, count, k, x)
+            }
+            Kind::Constant => {
+                let co = group.coefficients_offset()?;
+                let value = field(self.coefficient(co, 0, count, k)?);
+                self.output(offset, 0, count, k, value)
+            }
+            Kind::Equality => {
+                let x = canonical(self.input(offset, 0, count, k)?);
+                let y = canonical(self.input(offset, 1, count, k)?);
+                let same = x == y;
+                let flag = if same { G::ONE } else { G::ZERO };
+                let inverse = if same { G::ZERO } else { inverse(x - y)? };
+                self.output(offset, 2, count, k, flag)?;
+                self.output(offset, 3, count, k, inverse)
+            }
+            Kind::ExtensionArithmetic => {
+                let co = group.coefficients_offset()?;
+                let a = [
+                    self.input(offset, 0, count, k)?,
+                    self.input(offset, 1, count, k)?,
+                ];
+                let b = [
+                    self.input(offset, 2, count, k)?,
+                    self.input(offset, 3, count, k)?,
+                ];
+                let z = [
+                    self.input(offset, 4, count, k)?,
+                    self.input(offset, 5, count, k)?,
+                ];
+                let product = ext_mul(a, b);
+                let c0 = field(self.coefficient(co, 0, count, k)?);
+                let c1 = field(self.coefficient(co, 1, count, k)?);
+                self.output(offset, 6, count, k, product[0] * c0 + z[0] * c1)?;
+                self.output(offset, 7, count, k, product[1] * c0 + z[1] * c1)
+            }
+            Kind::ExtensionMultiply => {
+                let co = group.coefficients_offset()?;
+                let a = [
+                    self.input(offset, 0, count, k)?,
+                    self.input(offset, 1, count, k)?,
+                ];
+                let b = [
+                    self.input(offset, 2, count, k)?,
+                    self.input(offset, 3, count, k)?,
+                ];
+                let product = ext_mul(a, b);
+                let c = field(self.coefficient(co, 0, count, k)?);
+                self.output(offset, 4, count, k, product[0] * c)?;
+                self.output(offset, 5, count, k, product[1] * c)
+            }
+            Kind::RandomAccess => {
+                let co = group.parameter()?;
+                let vec_size = co;
+                let access = self.input(offset, 0, count, k)?.to_canonical_u64();
+                ensure!(
+                    access < vec_size as u64,
+                    "invalid index: random access {access} of {vec_size}"
+                );
+                let access = access as u32;
+                let selected = self.input(offset, 1 + access, count, k)?;
+                self.output(offset, 1 + vec_size, count, k, selected)?;
+                let mut bits = 0;
+                let mut size = vec_size;
+                while size > 1 {
+                    size >>= 1;
+                    bits += 1;
+                }
+                for i in 0..bits {
+                    let bit = G::from_canonical_u64(((access >> i) & 1) as u64);
+                    self.output(offset, 2 + vec_size + i, count, k, bit)?;
+                }
+                Ok(())
+            }
+            Kind::BaseSplit => {
+                let co = group.parameter()?;
+                let limb_bits = co & 255;
+                let limbs = co >> 8;
+                let mask = (1u64 << limb_bits) - 1;
+                let mut word = self.input(offset, 0, count, k)?.to_canonical_u64();
+                for i in 0..limbs {
+                    let limb = word & mask;
+                    self.output(offset, 1 + i, count, k, G::from_canonical_u64(limb))?;
+                    word >>= limb_bits;
+                }
+                ensure!(word == 0, "invalid arithmetic: base split overflow");
+                Ok(())
+            }
+            Kind::WireSplit => {
+                let co = group.parameter()?;
+                let width = co & 255;
+                let chunks = co >> 8;
+                let mut word = self.input(offset, 0, count, k)?.to_canonical_u64();
+                for i in 0..chunks {
+                    let chunk = if width == 0 {
+                        0
+                    } else if width < 64 {
+                        let chunk = word & ((1u64 << width) - 1);
+                        word >>= width;
+                        chunk
+                    } else {
+                        let chunk = word;
+                        word = 0;
+                        chunk
+                    };
+                    self.output(offset, 1 + i, count, k, G::from_canonical_u64(chunk))?;
+                }
+                ensure!(word == 0, "invalid arithmetic: wire split overflow");
+                Ok(())
+            }
+            Kind::LowHigh => {
+                let co = group.parameter()?;
+                let width = co;
+                let word = self.input(offset, 0, count, k)?.to_canonical_u64();
+                let (low, high) = if width == 0 {
+                    (0, word)
+                } else if width < 64 {
+                    (word & ((1u64 << width) - 1), word >> width)
+                } else {
+                    (word, 0)
+                };
+                self.output(offset, 1, count, k, G::from_canonical_u64(low))?;
+                self.output(offset, 2, count, k, G::from_canonical_u64(high))
+            }
+            Kind::Reducing | Kind::ReducingExtension => {
+                let co = group.parameter()?;
+                let extension_coeffs = kind == Kind::ReducingExtension;
+                let num_coeffs = co;
+                let alpha = [
+                    self.input(offset, 0, count, k)?,
+                    self.input(offset, 1, count, k)?,
+                ];
+                let mut acc = [
+                    self.input(offset, 2, count, k)?,
+                    self.input(offset, 3, count, k)?,
+                ];
+                let input_len = if extension_coeffs {
+                    4 + 2 * num_coeffs
+                } else {
+                    4 + num_coeffs
+                };
+                for i in 0..num_coeffs {
+                    let product = ext_mul(acc, alpha);
+                    if extension_coeffs {
+                        let c0 = self.input(offset, 4 + 2 * i, count, k)?;
+                        let c1 = self.input(offset, 5 + 2 * i, count, k)?;
+                        acc = [product[0] + c0, product[1] + c1];
+                    } else {
+                        let c = self.input(offset, 4 + i, count, k)?;
+                        acc = [product[0] + c, product[1]];
+                    }
+                    self.output(offset, input_len + 2 * i, count, k, acc[0])?;
+                    self.output(offset, input_len + 2 * i + 1, count, k, acc[1])?;
+                }
+                if !extension_coeffs {
+                    // The CPU base-coefficient generator records the final output twice.
+                    self.output(offset, input_len + 2 * num_coeffs, count, k, acc[0])?;
+                    self.output(offset, input_len + 2 * num_coeffs + 1, count, k, acc[1])?;
+                }
+                Ok(())
+            }
+            Kind::TableLookup => {
+                let co = group.coefficients_offset()?;
+                let metadata = co;
+                let low = self.input(offset, 0, count, k)?;
+                let high = self.input(offset, 1, count, k)?;
+                let index = (low + high * G::from_canonical_u64(64)).to_canonical_u64();
+                let rows = self.coefficient(metadata, 0, count, k)?;
+                ensure!(
+                    index < rows,
+                    "invalid index: table lookup {index} of {rows}"
+                );
+                let index = index as u32;
+                let output_len = self.coefficient(metadata, 1, count, k)? as u32;
+                let start = self.coefficient(metadata, index as u64 + 2, count, k)? as u32;
+                let end = self.coefficient(metadata, index as u64 + 3, count, k)? as u32;
+                let total = self.coefficient(metadata, rows + 2, count, k)? as u32;
+                for j in 0..output_len {
+                    let value = if start + j < end {
+                        self.input(offset, 2 + start + j, count, k)?
+                    } else {
+                        G::ZERO
+                    };
+                    self.output(offset, 2 + total + j, count, k, value)?;
+                }
+                Ok(())
+            }
+            Kind::ExtensionQuotient => {
+                let n0 = self.input(offset, 0, count, k)?;
+                let n1 = self.input(offset, 1, count, k)?;
+                let d0 = self.input(offset, 2, count, k)?;
+                let d1 = self.input(offset, 3, count, k)?;
+                let w = G::from_canonical_u64(7);
+                let norm = d0 * d0 - w * d1 * d1;
+                let inverse = inverse(norm)?;
+                let q0 = (n0 * d0 - w * n1 * d1) * inverse;
+                let q1 = (n1 * d0 - n0 * d1) * inverse;
+                self.output(offset, 4, count, k, q0)?;
+                self.output(offset, 5, count, k, q1)
+            }
+            Kind::EcAddXu => {
+                let co = group.coefficients_offset()?;
+                let yx = self.q_input(offset, 6, count, k)?;
+                let yu = self.q_input(offset, 11, count, k)?;
+                let mut px = self.q_input(offset, 16, count, k)?;
+                let mut pu = self.q_input(offset, 21, count, k)?;
+                let b1 = field(self.coefficient(co, 0, count, k)?);
+                let mut gx = Q::ZERO;
+                let mut gu = Q::ZERO;
+                for j in 0..5u32 {
+                    gx.0[j as usize] = field(self.coefficient(co, 1 + j as u64, count, k)?);
+                    gu.0[j as usize] = field(self.coefficient(co, 6 + j as u64, count, k)?);
+                }
+                for i in 0..3u32 {
+                    [px, pu] = q_add_xu(px, pu, px, pu, b1)?;
+                    self.q_output(offset, 106 - 30 * i, count, k, px)?;
+                    self.q_output(offset, 111 - 30 * i, count, k, pu)?;
+                    if canonical(self.input(offset, i, count, k)?) == G::ONE {
+                        [px, pu] = q_add_xu(px, pu, gx, gu, b1)?;
+                    }
+                    self.q_output(offset, 96 - 30 * i, count, k, px)?;
+                    self.q_output(offset, 101 - 30 * i, count, k, pu)?;
+                    if canonical(self.input(offset, 3 + i, count, k)?) == G::ONE {
+                        [px, pu] = q_add_xu(px, pu, yx, yu, b1)?;
+                    }
+                    self.q_output(offset, 86 - 30 * i, count, k, px)?;
+                    self.q_output(offset, 91 - 30 * i, count, k, pu)?;
+                }
+                Ok(())
+            }
+            Kind::PoseidonMds => {
+                let mut first = [G::ZERO; SPONGE_WIDTH];
+                let mut second = [G::ZERO; SPONGE_WIDTH];
+                for i in 0..SPONGE_WIDTH as u32 {
+                    first[i as usize] = self.input(offset, 2 * i, count, k)?;
+                    second[i as usize] = self.input(offset, 2 * i + 1, count, k)?;
+                }
+                let out0 = <G as Poseidon>::mds_layer(&first);
+                let out1 = <G as Poseidon>::mds_layer(&second);
+                for i in 0..SPONGE_WIDTH as u32 {
+                    self.output(offset, 24 + 2 * i, count, k, out0[i as usize])?;
+                    self.output(offset, 25 + 2 * i, count, k, out1[i as usize])?;
+                }
+                Ok(())
+            }
+            Kind::RandomValue => {
+                let co = group.coefficients_offset()?;
+                let index = self.coefficient(co, 0, count, k)?;
+                let value = *self
+                    .random
+                    .get(usize::try_from(index).unwrap_or(usize::MAX))
+                    .ok_or_else(|| anyhow::anyhow!("plan random index {index} out of range"))?;
+                ensure!(value < G::ORDER, "random value {value} is not canonical");
+                self.output(offset, 0, count, k, G::from_canonical_u64(value))
+            }
+            Kind::ConditionalZero => {
+                let denominator = canonical(self.input(offset, 0, count, k)?);
+                let numerator = self.input(offset, 1, count, k)?;
+                let quotient = if denominator != G::ZERO {
+                    numerator * inverse(denominator)?
+                } else {
+                    G::ZERO
+                };
+                self.output(offset, 2, count, k, quotient)
+            }
+            Kind::LtMask => {
+                let co = group.parameter()?;
+                let length = co;
+                let n = self.input(offset, 0, count, k)?.to_canonical_u64();
+                for j in 0..length {
+                    let bit = if (j as u64) < n { G::ONE } else { G::ZERO };
+                    self.output(offset, j + 1, count, k, bit)?;
+                }
+                Ok(())
+            }
+            Kind::QuinticMultiply => {
+                let lhs = self.q_input(offset, 0, count, k)?;
+                let rhs = self.q_input(offset, 5, count, k)?;
+                self.q_output(offset, 10, count, k, lhs * rhs)
+            }
+            Kind::QuinticQuotient => {
+                let numerator = self.q_input(offset, 0, count, k)?;
+                let denominator = self.q_input(offset, 5, count, k)?;
+                let quotient = numerator * q_inverse(denominator)?;
+                self.q_output(offset, 10, count, k, quotient)
+            }
+            Kind::EcAddHomogOffset => {
+                let co = group.coefficients_offset()?;
+                let b1 = field(self.coefficient(co, 0, count, k)?);
+                let mut h = q_add_homog(
+                    self.q_input(offset, 0, count, k)?,
+                    self.q_input(offset, 5, count, k)?,
+                    self.q_input(offset, 10, count, k)?,
+                    self.q_input(offset, 15, count, k)?,
+                    b1,
+                );
+                h[1].0[1] -= b1;
+                h[3].0[1] -= b1;
+                for (i, value) in h.into_iter().enumerate() {
+                    self.q_output(offset, 20 + 5 * i as u32, count, k, value)?;
+                }
+                Ok(())
+            }
+            Kind::EcScalarMul => {
+                let co = group.coefficients_offset()?;
+                let px = self.q_input(offset, 0, count, k)?;
+                let pu = self.q_input(offset, 5, count, k)?;
+                let words = self.coefficient(co, 0, count, k)? as u32;
+                let b1 = field(self.coefficient(co, 1, count, k)?);
+                let mut point = [Q::ZERO, Q::ONE, Q::ZERO, Q::ONE];
+                for bit in (0..words * 32).rev() {
+                    point = q_double_fractional(point, b1)?;
+                    let word = self.coefficient(co, 2 + (bit / 32) as u64, count, k)?;
+                    if word & (1 << (bit % 32)) != 0 {
+                        point = q_add_mixed_fractional(point, px, pu, b1)?;
+                    }
+                }
+                let result = q_div_pair(point[0], point[1], point[2], point[3])?;
+                self.q_output(offset, 10, count, k, result[0])?;
+                self.q_output(offset, 15, count, k, result[1])
+            }
+            Kind::CosetInterpolation => {
+                let co = group.coefficients_offset()?;
+                let degree = self.coefficient(co, 0, count, k)? as u32;
+                let n = self.coefficient(co, 1, count, k)? as u32;
+                let shift = self.input(offset, 0, count, k)?;
+                let inv_shift = inverse(shift)?;
+                let z = [
+                    self.input(offset, 1, count, k)? * inv_shift,
+                    self.input(offset, 2, count, k)? * inv_shift,
+                ];
+                let output_start = 3 + 2 * n;
+                self.output(offset, output_start, count, k, z[0])?;
+                self.output(offset, output_start + 1, count, k, z[1])?;
+                let mut e = [G::ZERO; 2];
+                let mut p = [G::ONE, G::ZERO];
+                let mut boundary = degree;
+                let mut intermediate = 0;
+                let num_intermediates = (n - 2) / (degree - 1);
+                for j in 0..n {
+                    let x = field(self.coefficient(co, 2 + j as u64, count, k)?);
+                    let weight = field(self.coefficient(co, 2 + n as u64 + j as u64, count, k)?);
+                    let t = [z[0] - x, z[1]];
+                    let v = [
+                        self.input(offset, 3 + 2 * j, count, k)?,
+                        self.input(offset, 4 + 2 * j, count, k)?,
+                    ];
+                    let et = ext_mul(e, t);
+                    let vp = ext_mul(v, p);
+                    e = [et[0] + vp[0] * weight, et[1] + vp[1] * weight];
+                    p = ext_mul(p, t);
+                    if j + 1 == boundary && intermediate < num_intermediates {
+                        let out = output_start + 2 + 4 * intermediate;
+                        self.output(offset, out, count, k, e[0])?;
+                        self.output(offset, out + 1, count, k, e[1])?;
+                        self.output(offset, out + 2, count, k, p[0])?;
+                        self.output(offset, out + 3, count, k, p[1])?;
+                        intermediate += 1;
+                        boundary += degree - 1;
+                    }
+                }
+                let final_out = output_start + 2 + 4 * num_intermediates;
+                self.output(offset, final_out, count, k, e[0])?;
+                self.output(offset, final_out + 1, count, k, e[1])
+            }
+            Kind::Comparison => {
+                let co = group.coefficients_offset()?;
+                let n = self.coefficient(co, 0, count, k)? as u32;
+                let width = self.coefficient(co, 1, count, k)? as u32;
+                ensure!(
+                    n != 0 && width != 0 && width < 64,
+                    "invalid arithmetic: comparison shape"
+                );
+                let first = self.input(offset, 0, count, k)?.to_canonical_u64();
+                let second = self.input(offset, 1, count, k)?.to_canonical_u64();
+                let out = 2;
+                let less_or_equal = if first <= second { G::ONE } else { G::ZERO };
+                self.output(offset, out, count, k, less_or_equal)?;
+                let mut msd = G::ZERO;
+                for i in 0..n {
+                    let mut fchunk = G::ZERO;
+                    let mut schunk = G::ZERO;
+                    let mut power = G::ONE;
+                    for j in 0..width {
+                        let index = (i * width + j) as u64;
+                        if bit(first, index) != 0 {
+                            fchunk += power;
+                        }
+                        if bit(second, index) != 0 {
+                            schunk += power;
+                        }
+                        power += power;
+                    }
+                    self.output(offset, out + 2 + i, count, k, fchunk)?;
+                    self.output(offset, out + 2 + n + i, count, k, schunk)?;
+                    let equal = fchunk == schunk;
+                    let dummy = if equal {
+                        G::ONE
+                    } else {
+                        inverse(schunk - fchunk)?
+                    };
+                    self.output(offset, out + 2 + 2 * n + i, count, k, dummy)?;
+                    let equal_flag = if equal { G::ONE } else { G::ZERO };
+                    self.output(offset, out + 2 + 3 * n + i, count, k, equal_flag)?;
+                    let carried = if equal { msd } else { G::ZERO };
+                    self.output(offset, out + 2 + 4 * n + i, count, k, carried)?;
+                    if !equal {
+                        msd = schunk - fchunk;
+                    }
+                }
+                self.output(offset, out + 1, count, k, msd)?;
+                let mut two_n = G::ONE;
+                for _ in 0..width {
+                    two_n += two_n;
+                }
+                let sum = (two_n + msd).to_canonical_u64();
+                for j in 0..=width {
+                    let value = G::from_canonical_u64(bit(sum, j as u64));
+                    self.output(offset, out + 2 + 5 * n + j, count, k, value)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub(super) fn step_fixed<const KIND: u8>(&self, group: &super::Group, k: u32) -> Result<()> {
+        let kind = Kind::from_code(KIND as usize)?;
+        let count = group.count;
+        let offset = group.targets_offset;
+        match kind {
+            Kind::Poseidon => self.step_poseidon(k, count, offset),
+            Kind::Arithmetic => {
+                let co = group.coefficients_offset()?;
+                let x = self.input(offset, 0, count, k)?;
+                let y = self.input(offset, 1, count, k)?;
+                let z = self.input(offset, 2, count, k)?;
+                let c0 = field(self.coefficient(co, 0, count, k)?);
+                let c1 = field(self.coefficient(co, 1, count, k)?);
+                self.output(offset, 3, count, k, x * y * c0 + z * c1)
+            }
+            Kind::ArithmeticChain => {
+                let co = group.coefficients_offset()?;
+                let n = group.outputs as usize;
+                ensure!(n > 0 && n <= 8, "invalid arithmetic chain length");
+                let mut locals = [G::ZERO; 8];
+                for j in 0..n {
+                    let read = |pos: u64| -> Result<G> {
+                        let reference = self.coefficient(co, (5 * j) as u64 + pos, count, k)?;
+                        if reference >> 63 != 0 {
+                            let index = (reference & !(1u64 << 63)) as usize;
+                            ensure!(index < j, "chain reads an unproduced temporary");
+                            Ok(locals[index])
+                        } else {
+                            ensure!(
+                                reference < group.inputs as u64,
+                                "chain input outside its boundary"
+                            );
+                            self.input(offset, reference as u32, count, k)
+                        }
+                    };
+                    let c0 = field(self.coefficient(co, (5 * j + 3) as u64, count, k)?);
+                    let c1 = field(self.coefficient(co, (5 * j + 4) as u64, count, k)?);
+                    let product = if c0 == G::ZERO {
+                        G::ZERO
+                    } else {
+                        let product = read(0)? * read(1)?;
+                        if c0 == G::ONE {
+                            product
+                        } else {
+                            product * c0
+                        }
+                    };
+                    let addend = if c1 == G::ZERO {
+                        G::ZERO
+                    } else {
+                        let addend = read(2)?;
+                        if c1 == G::ONE {
+                            addend
+                        } else {
+                            addend * c1
+                        }
+                    };
+                    locals[j] = product + addend;
+                    self.output(offset, group.inputs + j as u32, count, k, locals[j])?;
+                }
+                Ok(())
             }
             Kind::Copy => {
                 let x = self.input(offset, 0, count, k)?;
@@ -974,6 +1565,152 @@ impl Executor<'_> {
         }
         Ok(())
     }
+
+    pub(super) fn step_poseidon_simd(
+        &self,
+        g: &super::Group,
+        start: u32,
+        end: u32,
+        bases: &[u32],
+        _: u8,
+    ) -> Result<()> {
+        let mut k = start;
+        while k + 8 <= end {
+            self.poseidon_batch::<8>(g, k, bases)?;
+            k += 8;
+        }
+        for k in k..end {
+            if bases[k as usize] != u32::MAX {
+                self.step_poseidon_bulk(k, g.count, g.targets_offset, bases[k as usize])?;
+            } else {
+                self.step_fixed::<0>(g, k)?;
+            }
+        }
+        Ok(())
+    }
+    fn poseidon_batch<const W: usize>(
+        &self,
+        g: &super::Group,
+        k: u32,
+        bases: &[u32],
+    ) -> Result<()> {
+        use crate::hash::poseidon_trace_simd::{trace, Lanes};
+        let mut input = [Lanes([G::ZERO; W]); 12];
+        let mut swap = Lanes([G::ZERO; W]);
+        for lane in 0..W {
+            for i in 0..12 {
+                input[i].0[lane] =
+                    self.input(g.targets_offset, i as u32, g.count, k + lane as u32)?;
+            }
+            swap.0[lane] = canonical(self.input(g.targets_offset, 12, g.count, k + lane as u32)?);
+            ensure!(
+                swap.0[lane] == G::ZERO || swap.0[lane] == G::ONE,
+                "invalid Poseidon swap flag"
+            );
+        }
+        let out = trace(input, swap);
+        for lane in 0..W {
+            let values = core::array::from_fn(|i| out[i].0[lane]);
+            self.store_poseidon(g, k + lane as u32, bases[k as usize + lane], &values)?;
+        }
+        Ok(())
+    }
+    fn store_poseidon(&self, g: &super::Group, k: u32, base: u32, values: &[G; 122]) -> Result<()> {
+        if base == u32::MAX {
+            for (i, &v) in values.iter().enumerate() {
+                self.output(g.targets_offset, 13 + i as u32, g.count, k, v)?;
+            }
+        } else {
+            let destination = self
+                .state
+                .get(base as usize..base as usize + 122)
+                .ok_or_else(|| anyhow::anyhow!("Poseidon block outside state"))?;
+            for (cell, value) in destination.iter().zip(values) {
+                let value = value.to_canonical_u64();
+                cell.store(value, Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn step_poseidon_bulk(
+        &self,
+        k: u32,
+        count: u32,
+        offset: u32,
+        base: u32,
+    ) -> Result<()> {
+        let mut state = [G::ZERO; SPONGE_WIDTH];
+        for (i, value) in state.iter_mut().enumerate() {
+            *value = self.input(offset, i as u32, count, k)?;
+        }
+        let swap = canonical(self.input(offset, SPONGE_WIDTH as u32, count, k)?);
+        ensure!(
+            swap == G::ZERO || swap == G::ONE,
+            "invalid Poseidon swap flag"
+        );
+        let mut values = [G::ZERO; 122];
+        let mut written = 0;
+        let mut emit = |_: &Self, value: G| -> Result<()> {
+            values[written] = value;
+            written += 1;
+            Ok(())
+        };
+        for i in 0..4 {
+            emit(self, swap * (state[i + 4] - state[i]))?;
+        }
+        if swap == G::ONE {
+            for i in 0..4 {
+                state.swap(i, 4 + i);
+            }
+        }
+        let mut round_ctr = 0;
+        for r in 0..poseidon::HALF_N_FULL_ROUNDS {
+            <G as Poseidon>::constant_layer_field(&mut state, round_ctr);
+            if r != 0 {
+                for value in state {
+                    emit(self, value)?;
+                }
+            }
+            <G as Poseidon>::sbox_layer(&mut state);
+            state = <G as Poseidon>::mds_layer(&state);
+            round_ctr += 1;
+        }
+        <G as Poseidon>::partial_first_constant_layer(&mut state);
+        state = <G as Poseidon>::mds_partial_layer_init(&state);
+        for r in 0..(poseidon::N_PARTIAL_ROUNDS - 1) {
+            emit(self, state[0])?;
+            state[0] = <G as Poseidon>::sbox_monomial(state[0]);
+            state[0] += G::from_canonical_u64(<G as Poseidon>::FAST_PARTIAL_ROUND_CONSTANTS[r]);
+            state = <G as Poseidon>::mds_partial_layer_fast(&state, r);
+        }
+        emit(self, state[0])?;
+        state[0] = <G as Poseidon>::sbox_monomial(state[0]);
+        state = <G as Poseidon>::mds_partial_layer_fast(&state, poseidon::N_PARTIAL_ROUNDS - 1);
+        round_ctr += poseidon::N_PARTIAL_ROUNDS;
+        for _ in 0..poseidon::HALF_N_FULL_ROUNDS {
+            <G as Poseidon>::constant_layer_field(&mut state, round_ctr);
+            for value in state {
+                emit(self, value)?;
+            }
+            <G as Poseidon>::sbox_layer(&mut state);
+            state = <G as Poseidon>::mds_layer(&state);
+            round_ctr += 1;
+        }
+        for value in state {
+            emit(self, value)?;
+        }
+        ensure!(written == 122, "wrong Poseidon output width");
+        let end = base as usize + 122;
+        let destination = self
+            .state
+            .get(base as usize..end)
+            .ok_or_else(|| anyhow::anyhow!("Poseidon block outside state"))?;
+        for (cell, value) in destination.iter().zip(values) {
+            let value = value.to_canonical_u64();
+            cell.store(value, Ordering::Relaxed);
+        }
+        Ok(())
+    }
 }
 
 /// Random values per independently seeded work chunk.
@@ -1160,6 +1897,44 @@ pub(crate) fn generate_wires_with<
         None => sample_random_values::<F>(program.random_count as usize),
     };
     report.sample = started.elapsed();
+    if let Some(directory) = std::env::var_os("P2_AOT_SNAPSHOT_DIR") {
+        static SAVED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::OnceLock::new();
+        use crate::plonk::config::GenericHashOut;
+        let stem = super::aot::file_stem(&prover.circuit_digest.to_bytes());
+        if SAVED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(stem.clone())
+        {
+            let directory = std::path::Path::new(&directory);
+            std::fs::create_dir_all(directory)?;
+            let bytes = crate::plonk::witness_program::installed(prover)
+                .ok_or_else(|| anyhow::anyhow!("missing installed snapshot program"))?
+                .to_bytes();
+            std::fs::write(directory.join(format!("{stem}.p2w")), bytes)?;
+            std::fs::write(
+                directory.join(format!("{stem}.roots")),
+                root_values
+                    .iter()
+                    .flat_map(|x| x.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )?;
+            std::fs::write(
+                directory.join(format!("{stem}.random")),
+                random
+                    .iter()
+                    .flat_map(|x| x.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )?;
+            eprintln!(
+                "AOT_SNAPSHOT stem={stem} generators={} layers={}",
+                prover.generators.len(),
+                program.layer_count()
+            );
+        }
+    }
     let started = Instant::now();
     let executor = program.execute_state(&root_values, &random)?;
     report.execute = started.elapsed();
@@ -1206,28 +1981,56 @@ pub(crate) fn generate_wires_with<
         #[cfg(feature = "gpu")]
         Some(ctx) => {
             let cell_slots = program.cell_slots(map, num_wires, degree);
-            let bytes = num_wires * degree * 8;
-            // A reused mapped upload buffer, one mapped range per column
-            // filled in parallel, then copied into a pooled device buffer.
-            report.gather_mode = "reused";
-            let staging = ctx.upload_staging(bytes as u64);
-            cell_slots
-                .par_chunks(degree)
-                .enumerate()
-                .for_each(|(column, slots)| {
-                    let start = (column * degree * 8) as u64;
-                    let mut view = staging
-                        .buffer
-                        .slice(start..start + (degree * 8) as u64)
-                        .get_mapped_range_mut()
-                        .expect("mapped upload buffer");
-                    let (words, _) = view.slice(..).into_chunks::<8>();
-                    for (cell, &slot) in words.into_iter().zip(slots) {
-                        cell.write(slot_value(slot).to_le_bytes());
-                    }
-                });
-            let wire_values = ctx.storage("resident proving wires", bytes as u64);
-            ctx.finish_upload(staging, &wire_values, bytes as u64);
+            let gpu_gather =
+                std::env::var("P2_AOT_GPU_GATHER").as_deref() == Ok("1") && executor.fast.is_some();
+            let wire_values = if gpu_gather {
+                report.gather_mode = "gpu";
+                super::aot::gather_on_gpu(&executor, &ctx, cell_slots)?
+            } else {
+                let bytes = num_wires * degree * 8;
+                // A reused mapped upload buffer, one mapped range per column
+                // filled in parallel, then copied into a pooled device buffer.
+                report.gather_mode = "reused";
+                let staging = ctx.upload_staging(bytes as u64);
+                let columns = std::env::var("P2_AOT_GATHER_COLUMNS")
+                    .ok()
+                    .and_then(|x| x.parse::<usize>().ok())
+                    .unwrap_or(1)
+                    .clamp(1, num_wires);
+                let rows = std::env::var("P2_AOT_GATHER_ROWS")
+                    .ok()
+                    .and_then(|x| x.parse::<usize>().ok())
+                    .unwrap_or(if columns == 1 { degree } else { 64 })
+                    .clamp(1, degree);
+                let fill = |columns: usize, rows: usize| {
+                    cell_slots
+                        .par_chunks(degree * columns)
+                        .enumerate()
+                        .for_each(|(block, slots)| {
+                            let start = (block * columns * degree * 8) as u64;
+                            let mut view = staging
+                                .buffer
+                                .slice(start..start + (slots.len() * 8) as u64)
+                                .get_mapped_range_mut()
+                                .expect("mapped upload buffer");
+                            for row in (0..degree).step_by(rows) {
+                                let end = (row + rows).min(degree);
+                                for (column, slots) in slots.chunks(degree).enumerate() {
+                                    let begin = (column * degree + row) * 8;
+                                    let finish = (column * degree + end) * 8;
+                                    let (words, _) = view.slice(begin..finish).into_chunks::<8>();
+                                    for (cell, &slot) in words.into_iter().zip(&slots[row..end]) {
+                                        cell.write(slot_value(slot).to_le_bytes());
+                                    }
+                                }
+                            }
+                        });
+                };
+                fill(columns, rows);
+                let wire_values = ctx.storage("resident proving wires", bytes as u64);
+                ctx.finish_upload(staging, &wire_values, bytes as u64);
+                wire_values
+            };
             report.mode = "resident";
             Wires::Resident(crate::gpu::resident_witness::ResidentWitness { ctx, wire_values })
         }
@@ -1639,18 +2442,28 @@ pub(crate) mod tests {
             .find(|g| g.kind == Kind::RandomValue)
             .cloned()
             .expect("blinded circuit has random writers");
-        tampered.targets[group.targets_offset as usize] = tampered.state_slots;
+        tampered.targets.to_mut()[group.targets_offset as usize] = tampered.state_slots;
         tampered.state_slots += 1;
+        tampered.fast = Default::default();
         let error = tampered
             .execute_cpu(&entry, &random)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("never written"), "{error}");
+        assert!(
+            error.contains("never written")
+                || error.contains("unwritten")
+                || error.contains("earlier layer"),
+            "{error}"
+        );
         // A plan whose target offsets run past the table is an error, not a panic.
         let mut broken = (*program).clone();
         broken.groups[0][0].targets_offset = u32::MAX;
+        broken.fast = Default::default();
         let error = broken.execute_cpu(&entry, &random).unwrap_err().to_string();
-        assert!(error.contains("out of range"), "{error}");
+        assert!(
+            error.contains("out of range") || error.contains("invalid target block"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1703,9 +2516,10 @@ pub(crate) mod tests {
             .coefficients_offset()
             .expect("random group coefficient storage")
             as usize];
-        duplicate.coefficients[group
+        duplicate.coefficients.to_mut()[group
             .coefficients_offset()
-            .expect("random group coefficient storage") as usize
+            .expect("random group coefficient storage")
+            as usize
             + 1] = first;
         let error = plan_bytes::decode(&plan_bytes::encode(&duplicate, &key))
             .unwrap_err()
@@ -1713,11 +2527,87 @@ pub(crate) mod tests {
         assert!(error.contains("random"), "{error}");
         // Roots must occupy the prefix of canonical state: reject a changed root.
         let mut roots = (*program).clone();
-        roots.roots[0] = roots.representatives[0].wrapping_add(1);
+        roots.roots.to_mut()[0] = roots.representatives[0].wrapping_add(1);
         assert!(plan_bytes::decode(&plan_bytes::encode(&roots, &key)).is_err());
         // A flipped byte: rejected by the checksum.
         let mut damaged = bytes.clone();
         damaged[bytes.len() / 2] ^= 1;
         assert!(plan_bytes::decode(&damaged).is_err());
     }
+}
+
+/// Replays locally generated benchmark fixtures, excluding decode and input I/O.
+/// Both executors use the identical slot topology, inputs, and randomness.
+pub(crate) fn replay_snapshot(stem: &std::path::Path, iterations: usize) -> Result<()> {
+    let started = Instant::now();
+    let (key, program) = super::plan_bytes::decode(&std::fs::read(stem.with_extension("p2w"))?)?;
+    ensure!(
+        key.format == super::plan_bytes::WITNESS_PROGRAM_FORMAT,
+        "snapshot executor format changed"
+    );
+    let read_words = |extension: &str| -> Result<Vec<u64>> {
+        let bytes = std::fs::read(stem.with_extension(extension))?;
+        ensure!(bytes.len() % 8 == 0, "invalid word file");
+        Ok(bytes
+            .chunks_exact(8)
+            .map(|x| u64::from_le_bytes(x.try_into().unwrap()))
+            .collect())
+    };
+    let mut buckets = [(0u32, 0u32); 8];
+    for g in program
+        .groups
+        .iter()
+        .flatten()
+        .filter(|g| g.kind == Kind::Poseidon)
+    {
+        let i = if g.count < 8 {
+            0
+        } else if g.count < 16 {
+            1
+        } else if g.count < 32 {
+            2
+        } else if g.count < 64 {
+            3
+        } else if g.count < 128 {
+            4
+        } else if g.count < 256 {
+            5
+        } else if g.count < 512 {
+            6
+        } else {
+            7
+        };
+        buckets[i].0 += 1;
+        buckets[i].1 += g.count;
+    }
+    eprintln!("POSEIDON_GROUP_HIST buckets_lt_8_16_32_64_128_256_512_inf={buckets:?}");
+    let roots = read_words("roots")?;
+    let random = zeroize::Zeroizing::new(read_words("random")?);
+    let load_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let reference = program.execute_state_inner(&roots, &random, true)?;
+    eprintln!(
+        "AOT_REPLAY generators={} layers={} slots={} load_ms={load_ms:.6}",
+        key.generators,
+        program.layer_count(),
+        program.state_slots
+    );
+    for iteration in 0..iterations {
+        let started = Instant::now();
+        let actual = program.execute_state(&roots, &random)?;
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        for (a, b) in actual.state.iter().zip(&reference.state) {
+            ensure!(
+                a.load(Ordering::Relaxed) == b.load(Ordering::Relaxed),
+                "snapshot execution mismatch"
+            );
+        }
+        eprintln!(
+            "AOT_EXECUTE generators={} layers={} slots={} iteration={} ms={ms:.6} equal=true",
+            key.generators,
+            program.layer_count(),
+            program.state_slots,
+            iteration
+        );
+    }
+    Ok(())
 }

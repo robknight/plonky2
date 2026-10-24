@@ -11,3 +11,6 @@ pub mod merkle_tree;
 pub mod path_compression;
 pub mod poseidon;
 pub mod poseidon_goldilocks;
+
+#[doc(hidden)]
+pub mod poseidon_trace_simd;

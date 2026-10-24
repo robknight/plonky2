@@ -20,7 +20,9 @@ use crate::iop::generator::{WitnessGeneratorRef, WitnessOperation as Op};
 use crate::iop::target::Target;
 use crate::iop::witness::{PartialWitness, PartitionWitness};
 
+pub(crate) mod aot;
 pub mod cpu;
+use std::borrow::Cow;
 pub(crate) mod plan_bytes;
 
 /// Log target of the compiler's phase timings (debug level).
@@ -74,6 +76,7 @@ operation_kinds! {
     EcScalarMul = 23,
     CosetInterpolation = 24,
     Comparison = 25,
+    ArithmeticChain = 26,
 }
 use OperationKind as Kind;
 
@@ -108,6 +111,8 @@ impl OperationKind {
 
 #[derive(Clone, Debug)]
 struct Group {
+    inputs: u32,
+    outputs: u32,
     kind: Kind,
     count: u32,
     targets_offset: u32,
@@ -136,14 +141,15 @@ pub struct RegionProgram {
     /// Operation groups in dependency layers: every group in a layer depends
     /// only on earlier layers.
     groups: Vec<Vec<Group>>,
-    targets: Vec<u32>,
-    coefficients: Vec<u64>,
-    representatives: Vec<usize>,
-    roots: Vec<usize>,
+    targets: Cow<'static, [u32]>,
+    coefficients: Cow<'static, [u64]>,
+    representatives: Cow<'static, [usize]>,
+    roots: Cow<'static, [usize]>,
     random_count: u32,
     alias_count: u32,
     alias_pair_offset: u32,
     state_slots: u32,
+    fast: std::sync::OnceLock<aot::FastLayout>,
     /// Representative index to canonical slot, `u32::MAX` when absent; built
     /// on first use by the CPU executor's gather.
     rep_slots: std::sync::OnceLock<Vec<u32>>,
@@ -444,6 +450,124 @@ impl Lane {
     }
 }
 
+/// Fuses only single-consumer arithmetic chains. Intermediate outputs remain
+/// materialized for the proof, but their next arithmetic consumer uses a local
+/// temporary. Choosing only single-consumer edges makes contraction acyclic.
+fn fuse_arithmetic<F: RichField>(
+    nodes: Vec<Lane>,
+    entry: &PartitionWitness<F>,
+) -> Result<Vec<Lane>> {
+    if !aot::fusion_enabled() {
+        return Ok(nodes);
+    }
+    let limit = std::env::var("P2_AOT_CHAIN_LEN")
+        .ok()
+        .and_then(|x| x.parse::<usize>().ok())
+        .unwrap_or(8)
+        .clamp(2, 8);
+    const MANY: u32 = u32::MAX - 1;
+    let mut producer = vec![NONE; entry.values.len()];
+    let mut consumer = vec![NONE; entry.values.len()];
+    for (i, lane) in nodes.iter().enumerate() {
+        for &r in &lane.outputs {
+            producer[r] = if producer[r] == NONE { i as u32 } else { MANY };
+        }
+        for &r in &lane.inputs {
+            if consumer[r] == NONE {
+                consumer[r] = i as u32;
+            } else if consumer[r] != i as u32 {
+                consumer[r] = MANY;
+            }
+        }
+    }
+    let mut next = vec![NONE; nodes.len()];
+    let mut previous = vec![NONE; nodes.len()];
+    for (i, lane) in nodes.iter().enumerate() {
+        if lane.kind != Kind::Arithmetic || lane.outputs.len() != 1 {
+            continue;
+        }
+        let r = lane.outputs[0];
+        let j = consumer[r];
+        if entry.values[r].is_some() || producer[r] != i as u32 || j >= MANY || j == i as u32 {
+            continue;
+        }
+        if nodes[j as usize].kind != Kind::Arithmetic {
+            continue;
+        }
+        if previous[j as usize] == NONE {
+            previous[j as usize] = i as u32;
+            next[i] = j;
+        }
+    }
+    drop(producer);
+    drop(consumer);
+    let heads = (0..nodes.len())
+        .filter(|&i| previous[i] == NONE)
+        .collect::<Vec<_>>();
+    let before = nodes.len();
+    let mut remaining = nodes.into_iter().map(Some).collect::<Vec<_>>();
+    let mut result = Vec::with_capacity(before);
+    let mut chain_count = 0;
+    let mut fused_nodes = 0;
+    for head in heads {
+        let mut current = head as u32;
+        while current != NONE && remaining[current as usize].is_some() {
+            let mut chain = Vec::with_capacity(limit);
+            while current != NONE && remaining[current as usize].is_some() && chain.len() < limit {
+                chain.push(remaining[current as usize].take().unwrap());
+                current = next[current as usize];
+            }
+            if chain.len() == 1 {
+                result.push(chain.pop().unwrap());
+                continue;
+            }
+            chain_count += 1;
+            fused_nodes += chain.len();
+            let index = chain[0].index;
+            let mut inputs = Vec::new();
+            let mut outputs = Vec::new();
+            let mut coefficients = Vec::new();
+            for lane in chain {
+                ensure!(
+                    lane.inputs.len() == 3 && lane.coefficients.len() == 2,
+                    "invalid arithmetic shape"
+                );
+                for r in lane.inputs {
+                    if let Some(j) = outputs.iter().position(|&out| out == r) {
+                        coefficients.push((1u64 << 63) | j as u64);
+                    } else {
+                        let position =
+                            inputs
+                                .iter()
+                                .position(|&input| input == r)
+                                .unwrap_or_else(|| {
+                                    let position = inputs.len();
+                                    inputs.push(r);
+                                    position
+                                });
+                        coefficients.push(position as u64);
+                    }
+                }
+                coefficients.extend(lane.coefficients);
+                outputs.push(lane.outputs[0]);
+            }
+            result.push(Lane {
+                index,
+                kind: Kind::ArithmeticChain,
+                parameter: outputs.len() as u32,
+                name: "arithmetic_chain",
+                coefficients,
+                inputs,
+                outputs,
+            });
+        }
+    }
+    // Any cyclic component remains intact for the existing cycle diagnostic.
+    result.extend(remaining.into_iter().flatten());
+    eprintln!("AOT_FUSION before={before} after={} chains={chain_count} operations={fused_nodes} limit={limit}", result.len());
+    Ok(result)
+}
+
 impl RegionProgram {
     /// Number of dependency layers.
     pub fn layer_count(&self) -> usize {
@@ -504,6 +628,7 @@ impl RegionProgram {
                 Ok(Lane::new(index, &op, input, output))
             })
             .collect::<Result<Vec<_>>>()?;
+        let nodes = fuse_arithmetic(nodes, entry)?;
         let mut produced = vec![false; reps];
         for lane in &nodes {
             for &r in &lane.outputs {
@@ -804,6 +929,8 @@ impl RegionProgram {
                     }
                 }
                 layer_groups.push(Group {
+                    inputs: input_len as u32,
+                    outputs: output_len as u32,
                     kind,
                     count: u32::try_from(count)?,
                     targets_offset: u32::try_from(target_offset)?,
@@ -849,18 +976,21 @@ impl RegionProgram {
         if profile {
             log::debug!(target: COMPILE_LOG,"compile phase aliases {:?}", phase.elapsed());
         }
-        Ok(Self {
+        let mut program = Self {
             groups,
-            targets,
-            coefficients,
-            representatives,
-            roots,
+            targets: targets.into(),
+            coefficients: coefficients.into(),
+            representatives: representatives.into(),
+            roots: roots.into(),
             random_count,
             alias_count,
             alias_pair_offset,
             state_slots,
+            fast: Default::default(),
             rep_slots: Default::default(),
             cell_slots: Default::default(),
-        })
+        };
+        aot::reorder(&mut program)?;
+        Ok(program)
     }
 }

@@ -29,7 +29,7 @@ use crate::iop::generator::WitnessGeneratorRef;
 
 include!(concat!(env!("OUT_DIR"), "/witness_program_format.rs"));
 
-const MAGIC: &[u8; 8] = b"P2WPLAN5";
+const MAGIC: &[u8; 8] = b"P2WAOT01";
 
 /// Identity of a whole-circuit program.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -227,6 +227,8 @@ pub(crate) fn encode(program: &RegionProgram, key: &PlanKey) -> Vec<u8> {
             w.u32(group.count);
             w.u32(group.targets_offset);
             w.u32(group.argument.word());
+            w.u32(group.inputs);
+            w.u32(group.outputs);
         }
     }
     w.deltas(program.targets.iter().map(|&t| t as u64));
@@ -278,7 +280,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(PlanKey, RegionProgram)> {
     );
     let groups = (0..r.len(8)?)
         .map(|_| {
-            (0..r.len(20)?)
+            (0..r.len(28)?)
                 .map(|_| {
                     let kind = Kind::from_code(r.usize()?)?;
                     Ok(Group {
@@ -286,6 +288,8 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(PlanKey, RegionProgram)> {
                         count: r.u32()?,
                         targets_offset: r.u32()?,
                         argument: kind.argument(r.u32()?),
+                        inputs: r.u32()?,
+                        outputs: r.u32()?,
                     })
                 })
                 .collect::<Result<Vec<_>>>()
@@ -346,14 +350,15 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(PlanKey, RegionProgram)> {
     );
     let program = RegionProgram {
         groups,
-        targets,
-        coefficients,
-        representatives,
-        roots,
+        targets: targets.into(),
+        coefficients: coefficients.into(),
+        representatives: representatives.into(),
+        roots: roots.into(),
         random_count,
         alias_count,
         alias_pair_offset,
         state_slots,
+        fast: Default::default(),
         rep_slots: Default::default(),
         cell_slots: Default::default(),
     };
