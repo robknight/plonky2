@@ -1604,7 +1604,9 @@ impl Executor<'_> {
         _: u8,
     ) -> Result<()> {
         let mut k = start;
-        while k + 8 <= end {
+        // Keep the scalar-emulated eight-lane kernel out of non-AVX-512 builds.
+        // The dispatch policy already selects scalar execution on those builds.
+        while crate::hash::poseidon_trace_simd::NATIVE && k + 8 <= end {
             self.poseidon_batch::<8>(g, k, bases)?;
             k += 8;
         }

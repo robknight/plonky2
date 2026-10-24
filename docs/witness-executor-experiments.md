@@ -2,7 +2,7 @@
 
 As of 24 October 2026. The objective is to beat the existing witness executor during execution, with MainPod as the primary workload and a small set of other circuits checking whether the approach generalizes. Program generation should stay quick, and Rust build cost must remain practical. Larger files on disk are acceptable when they buy speed without expensive generation or compilation.
 
-The next sequence is: profile the final SIMD implementation; isolate the benefit of fixed slot addresses within the current execution structure; then test larger regions and scheduling with fewer global barriers. Poseidon data movement and witness preparation remain useful complementary experiments. The aim is an automatic compiler with a small set of optional policies, rather than hand-written MainPod code.
+The first batch retains the validated SIMD and arithmetic kernels, direct input binding, and optional wiped-buffer reuse. Pre-resolved arithmetic slots, affine fixed-address Rust, scheduling over existing groups, and safe Poseidon I/O changes did not establish consistent MainPod gains and are excluded from the implementation. The next architectural priority is a general region compiler supporting irregular operands and mixed descriptors, with partitioning and scheduling designed together. The aim remains an automatic compiler with a small set of optional policies.
 
 # What the experiments have established
 
@@ -27,9 +27,9 @@ The field FFT implementation is the simplest current integration candidate. It i
 | Opportunity | Status | Consequence |
 | --- | --- | --- |
 | SIMD across independent Poseidon permutations | Demonstrated on AVX-512 | Keep the gain and use it as the next baseline |
-| Larger native regions with fixed slot addresses | Substantially unexplored | First major compiler experiment |
-| Graph regions scheduled with fewer global barriers | Substantially unexplored | First major scheduling experiment |
-| Trustworthy breakdown of the final optimized executor | Incomplete | Refresh before predicting remaining headroom |
+| Larger native regions with fixed slot addresses | Affine prototype tested; broader regions remain open | Support irregular operands and mixed descriptors to improve MainPod coverage |
+| Graph regions scheduled with fewer global barriers | Existing-group schedulers tested without a consistent MainPod win | Design coarser partitioning and scheduling together |
+| Trustworthy breakdown of the final optimized executor | Stage and worker CPU attribution measured | Poseidon dominates worker CPU work; use uninstrumented controls because profiling adds overhead |
 
 The 97.6% native coverage figure described fused arithmetic operations, not the share of execution time accelerated. Native kernels still obtain operands through runtime target tables and executor access methods. High coverage therefore does not establish that indexing, checks, materialization, or scheduling are already cheap.
 
@@ -189,9 +189,9 @@ Three same-process alternating MainPod proof comparisons found execution reducti
 
 A separate prototype generates Rust for regions whose arithmetic descriptor is uniform and whose input and output slots follow constant strides. It uses fixed state-array lengths and constant offsets, preserves the existing scheduling, and matches the complete compiled topology before dispatch. Other regions retain the existing executor.
 
-For MainPod, automatic detection finds 98 eligible groups covering 6,584 arithmetic operations, only about 2.3% of fused arithmetic operations. The generated source is about 92.5 KB and the Python prototype takes about 4.3 seconds to parse and generate it. For arithmetic-deep, a roughly 262 KB body budget covers 55,296 of 65,536 arithmetic operations across 216 groups, with about 0.16 seconds of generation. These generation times describe the Python prototype, rather than a lower bound for a Rust implementation. Exact-state replay passes locally for the MainPod variant; x86 performance measurements are in progress.
+For MainPod, automatic detection finds 98 eligible groups covering 6,584 arithmetic operations, only about 2.3% of fused arithmetic operations. The generated source is about 92.5 KB and the Python prototype takes about 4.3 seconds to parse and generate it. For arithmetic-deep, a roughly 262 KB body budget covers 55,296 of 65,536 arithmetic operations across 216 groups, with about 0.16 seconds of generation. These generation times describe the Python prototype, rather than a lower bound for a Rust implementation. Exact-state replay passed; x86 results follow below.
 
-**Decision pending:** this affine-only strategy has limited MainPod coverage. Its results must be distinguished from more general fixed-address regions that support irregular operands and mixed arithmetic descriptors.
+**Decision:** reject this affine-only prototype, based on the x86 results below. More general fixed-address regions supporting irregular operands and mixed arithmetic descriptors remain open.
 
 Raw results and source snapshots for this series are retained in `.benchmark-artifacts/witness-optimization-2026-10-24/` in the shared workspace.
 
@@ -207,6 +207,17 @@ Input binding now uses the cached canonical slot map already needed for final ga
 
 Six same-process alternating comparisons reduced the full MainPod witness call by 10.8–16.6%, saving approximately 6–10.8 ms per proof. Execution arithmetic is unchanged; this is a witness-preparation improvement. The final input-mask eligibility check was confirmed in two of those processes. MainPod, recursive/nonempty Points, worklist comparisons, and concurrent proofs passed. The exact staged implementation passed all 15 witness-program tests, including agreeing noncanonical aliases, conflicting aliases, unconstrained roots, missing inputs, and extra inputs.
 
+The six paired processes measured the following full-witness medians. Each process alternated implementations over 40 proofs, discarded the first eight observations, and contributed 16 warm observations per implementation. Times from different processes show substantial machine variation; each row is its own comparison. The logged `compile` span includes input-shape discovery and cache lookup, rather than Rust compilation.
+
+| Process | Legacy binding ms | Direct binding ms | Reduction |
+| --- | ---: | ---: | ---: |
+| 1 | 38.85 | 32.65 | 16.0% |
+| 2 | 55.05 | 49.10 | 10.8% |
+| 3 | 50.25 | 42.90 | 14.6% |
+| 4 | 58.50 | 50.00 | 14.5% |
+| 5 | 64.65 | 53.90 | 16.6% |
+| 6 | 60.40 | 52.00 | 13.9% |
+
 **Decision:** retain direct binding as the default for eligible installed programs. `P2_WITNESS_INPUT_BINDING=legacy` remains available for comparison. It introduces no additional per-circuit generated code or mapping allocation.
 
 ## Poseidon input and output experiments rejected
@@ -221,6 +232,17 @@ The executor can reuse state and readiness allocations after wiping witness valu
 
 Six same-process paired runs reduced MainPod execution by 1.4–14.1%, with a median paired reduction of 5.4%. Full-witness results ranged from 0.8% slower to 8.4% faster, with a median paired reduction of 2.1%. All eight x86 replay workloads improved. The final two processes showed smaller execution gains of 2.5% and 1.9%, so the larger earlier gains should not be treated as typical. Buffer ownership, wiping, readiness reset, budget enforcement, exact-state replay, worklist checks, concurrent proofs, and Points were checked.
 
+The buffer comparisons use direct binding in both modes, the same 40-proof alternating protocol, and the same eight-observation warm-up. They must not be added to the binding percentages as a measured combined speedup.
+
+| Process | Fresh execute ms | Reused execute ms | Fresh full witness ms | Reused full witness ms |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 32.85 | 28.22 | 46.50 | 42.85 |
+| 2 | 33.44 | 32.97 | 47.35 | 47.75 |
+| 3 | 39.68 | 34.73 | 54.80 | 50.20 |
+| 4 | 38.68 | 35.49 | 53.25 | 51.70 |
+| 5 | 36.28 | 35.37 | 50.15 | 50.35 |
+| 6 | 35.33 | 34.67 | 50.30 | 49.65 |
+
 **Decision:** retain reuse as an opt-in execution optimization with `P2_WITNESS_BUFFERS=pool`. Fresh allocation remains the default. This makes the memory and latency tradeoff explicit without requiring circuit-specific tuning. It adds no circuit-specific Rust generation.
 
 ## Configuration and validation at the end of this batch
@@ -233,3 +255,29 @@ The temporary Runpod pod `samwnq8xu2z3r3` was deleted; read-back returned 404. F
 
 The next architectural investigation is a more general region compiler supporting irregular operands and mixed descriptors, followed by partitioning and scheduling designed together. Affine fixed regions and scheduling over existing groups did not establish a general MainPod win. The surrounding witness pipeline now has a useful retained improvement, but these experiments do not establish that execution is close to optimal.
 
+
+## Build cost and unused SIMD code generation
+
+CPU-only M4 release-library rebuilds used eight build jobs, native CPU targeting, incremental compilation disabled, and warm dependencies. The original repository library took 4.00 and 4.10 seconds; the retained kernel baseline took 8.82 and 8.95 seconds; adding direct binding and buffer reuse took 9.08 and 8.69 seconds. Thus the latter changes introduced no measurable marginal library build cost in this comparison. These are Cargo library-unit times, rather than clean workspace build or link times.
+
+A separate alternating comparison then guarded the eight-lane executor call with the existing compile-time native-AVX-512 capability constant. Production dispatch already selects scalar execution on other builds. The guard prevents LLVM from generating unused scalar-emulated eight-lane executor code. Unguarded rebuilds took 8.57 and 8.52 seconds; guarded rebuilds took 6.91 and 6.88 seconds, a roughly 19% reduction in the median library-unit time. This reduces the retained implementation's build overhead on M4 while preserving the native AVX-512 path. The final guarded implementation passes all 17 witness tests with both fresh and pooled buffers, plus the 122-value SIMD trace comparison including field-edge inputs.
+
+**Decision:** retain the compile-time guard. It introduces no per-circuit generation. This final build-only change was made after the Runpod machine was deleted; the native-enabled branch remains the one measured there. A matched final NVIDIA build-cost comparison remains open: the attempted shared-target comparison reused an incompatible cached field dependency after archive extraction, so those partial numbers are excluded. Future archive-based comparisons must touch every local Rust source or use isolated targets.
+
+The final candidates do not add circuit-specific generated Rust. Fresh witness-program generation and disk loading were not re-benchmarked as a complete cold/warm matrix in this batch. The retained input eligibility check runs at installation and reuses the existing canonical slot map. Future region-compiler comparisons must include generation, validation, loading, native compilation, and the number of executions required to repay preparation cost.
+
+## Remaining priorities after this batch
+
+1. Build a bounded region compiler that accepts irregular slot operands and mixed arithmetic descriptors. Measure MainPod coverage before generating large Rust bodies; compare compact resolved descriptors with fixed-address code using the same partitions. Keep prover-visible cells materialized and distinguish them from temporary values that can remain in registers.
+2. Design partitioning and scheduling together once useful regions exist. Preserve wide Poseidon batches and enough independent work, then compare larger regions under the current barriers against coarsened or dependency-driven schedules. The rejected schedulers retained the old group boundaries.
+3. Revisit Poseidon output layout and stores with region ownership information. The safe I/O prototypes show potential on hash-only graphs but do not justify a MainPod default. Any non-atomic vector-store design needs a sound ownership argument and whole-witness validation.
+4. Measure CSPRNG sampling and final gathering separately before changing them. Compare tiled CPU gathering and GPU gathering with transfers and full proof time included. Reuse the feature-gated profiler for attribution and ordinary builds for headline comparisons.
+5. Complete the generation/load and build-cost matrix for any surviving architectural candidate, including native NVIDIA builds, an AVX2-only machine, and M4. Keep the current configuration explicit until the CPU and graph-shape policy has broader evidence.
+
+## Reproduction and evidence for this batch
+
+The campaign directory is `.benchmark-artifacts/witness-optimization-2026-10-24/`. `remote/final/results/` contains the cumulative machine details, source/build logs, paired measurements, exact-state output, and proof checks retrieved from the Xeon/A40. `remote/*_measure.py` and the adjacent shell scripts retain the exact remote commands. `input-summary.json`, `io-summary.json`, `pool-summary.json`, and `pool-confirm-summary.json` retain the live samples and process medians. `build-cost-summary.json` and `native-gate-build-comparison.json` retain the local Cargo-unit measurements.
+
+For the measured live configuration, also set `P2_AOT_WITNESS_THREADS=0`, `P2_AOT_GATHER_COLUMNS=2`, `P2_AOT_GATHER_ROWS=1024`, and `P2_AOT_GPU_GATHER=0`. This uses the normal eight-thread Rayon pool and CPU gather; GPU proving remains enabled in pod2. The pod measurements pinned CPUs 24–31 on NUMA node 1. Compiler flags, CPU quota, and complete hardware details are in the retrieved logs. The experimental pod2 harness uses its `witness-executor` branch and a Cargo path override; it is preserved in the source bundles rather than committed into the original pod2 checkout.
+
+Local correctness commands, run from the new worktree, are `CARGO_TARGET_DIR=/tmp/witness-optimization-target RUSTFLAGS="-C target-cpu=native" cargo +nightly test --offline --release -p plonky2 --lib --features witness-profiling witness_program`, repeated with `P2_WITNESS_BUFFERS=pool`, and the same Cargo command with the test filter `poseidon_trace_simd::tests::all_trace_values`. The profiling replay CLI and its configuration are documented in `tools/witness-profile/README.md`.
