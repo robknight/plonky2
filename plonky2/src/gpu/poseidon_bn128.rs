@@ -7,7 +7,9 @@
 //! word for word). Multiplication is the CIOS Montgomery product without the
 //! final subtraction: since `4p < R`, operands below `2p` give a product
 //! below `2p`, and sums are brought back below `2p` with one conditional
-//! subtraction. Digests are made canonical before they are written.
+//! subtraction. The matrix rows reduce their sums of four products once
+//! rather than each product. Digests are made canonical before they are
+//! written.
 //!
 //! The rounds are loops over constants read from the uniform buffer, so the
 //! kernel holds one copy of each round's code rather than all 64 rounds
@@ -148,7 +150,8 @@ fn mac(t: u32, a: u32, b: u32, c: u32) -> vec2<u32> {
 }
 "#;
 
-/// The field arithmetic: `fr_mul`, `fr_add`, `to_mont`, `from_mont`.
+/// The field arithmetic: `fr_mul`, `fr_dot4`, `fr_add`, `to_mont`,
+/// `from_mont`.
 fn arithmetic(out: &mut String, flavor: Flavor) {
     let p = integer_words(Fr::MODULUS.0);
     let mut two_p = Fr::MODULUS;
@@ -190,6 +193,56 @@ fn arithmetic(out: &mut String, flavor: Flavor) {
         writeln!(out, "    t{} = y.y + x.y;", WORDS - 1).unwrap();
     }
     out.push_str("    return Fr(t0, t1, t2, t3, t4, t5, t6, t7);\n}\n");
+
+    // The sum of four products with one reduction: the same CIOS loop over
+    // the words of the s operands, accumulating all four products before each
+    // reduction step. With each c below p and each s below 2p, the running sum
+    // stays below 5p < 2^256 after a step and below 2^288 (the ninth word t8)
+    // before it, and the result is below 8p^2 / R + p < 2.52p, which one
+    // conditional subtraction of 2p brings below 2p. The loop over the words
+    // stays rolled: unrolled, the portable kernel ran five times slower.
+    out.push_str(
+        "\nfn fr_dot4(c0: Fr, c1: Fr, c2: Fr, c3: Fr, s0: Fr, s1: Fr, s2: Fr, s3: Fr) -> Fr {\n",
+    );
+    for j in 0..=WORDS {
+        writeln!(out, "    var t{j} = 0u;").unwrap();
+    }
+    out.push_str("    var x: vec2<u32>;\n    var y: vec2<u32>;\n    var m: u32;\n");
+    out.push_str("    var s = array<Fr, 4>(s0, s1, s2, s3);\n");
+    writeln!(out, "    for (var i = 0u; i < {WORDS}u; i++) {{").unwrap();
+    for k in 0..4 {
+        writeln!(
+            out,
+            "        x = mac(t0, c{k}[0], s[{k}][i], 0u); t0 = x.x;"
+        )
+        .unwrap();
+        for j in 1..WORDS {
+            writeln!(
+                out,
+                "        x = mac(t{j}, c{k}[{j}], s[{k}][i], x.y); t{j} = x.x;"
+            )
+            .unwrap();
+        }
+        writeln!(out, "        t{WORDS} += x.y;").unwrap();
+    }
+    writeln!(out, "        m = t0 * {ninv:#010x}u;").unwrap();
+    writeln!(out, "        y = mac(t0, m, {:#010x}u, 0u);", p[0]).unwrap();
+    for j in 1..WORDS {
+        writeln!(
+            out,
+            "        y = mac(t{j}, m, {:#010x}u, y.y); t{} = y.x;",
+            p[j],
+            j - 1
+        )
+        .unwrap();
+    }
+    writeln!(
+        out,
+        "        t{} = t{WORDS} + y.y; t{WORDS} = 0u;\n    }}",
+        WORDS - 1
+    )
+    .unwrap();
+    out.push_str("    return sub_2p_if_ge(Fr(t0, t1, t2, t3, t4, t5, t6, t7));\n}\n");
 
     // a - q if a >= q, for a below 2^256.
     let sub_if_ge = |out: &mut String, name: &str, q: [u32; WORDS]| {
@@ -252,9 +305,7 @@ fn exp5(x: Fr) -> Fr {{
 
 // The row of four matrix entries at `at` times the state.
 fn dot4(at: u32, s0: Fr, s1: Fr, s2: Fr, s3: Fr) -> Fr {{
-    return fr_add(
-        fr_add(fr_mul(rc_fr(at), s0), fr_mul(rc_fr(at + 1u), s1)),
-        fr_add(fr_mul(rc_fr(at + 2u), s2), fr_mul(rc_fr(at + 3u), s3)));
+    return fr_dot4(rc_fr(at), rc_fr(at + 1u), rc_fr(at + 2u), rc_fr(at + 3u), s0, s1, s2, s3);
 }}
 
 fn permute(input: array<Fr, 4>) -> array<Fr, 4> {{
