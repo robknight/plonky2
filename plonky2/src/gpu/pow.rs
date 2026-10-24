@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use crate::gpu::{context, field_supported, module, pipeline, shader, storage_layout, GpuContext};
 use crate::hash::hash_types::RichField;
-use crate::hash::hashing::PlonkyPermutation;
+use crate::hash::hashing::{GpuPermutation, PlonkyPermutation};
+use crate::hash::poseidon::SPONGE_WIDTH;
 use crate::plonk::config::Hasher;
 
 pub(crate) struct PowKernel {
@@ -29,36 +30,53 @@ const MAX_BATCH: u32 = 1 << 20;
 /// so it fails to find a nonce with probability about `exp(-2^BUDGET_BITS)`.
 const BUDGET_BITS: u32 = 4;
 
-/// Whether the device searches proof-of-work nonces for this field and the
-/// permutation of `H`'s sponge, which may differ from the hash its Merkle
-/// trees use.
-pub(crate) fn supported<F: RichField, H: Hasher<F>>() -> bool {
-    <H::Permutation as PlonkyPermutation<F>>::GPU_POSEIDON && field_supported::<F>()
+/// The kernel for the permutation of `H`'s sponge over this field, which may
+/// differ from the hash that builds `H`'s Merkle trees.
+pub(crate) fn permutation<F: RichField, H: Hasher<F>>() -> GpuPermutation {
+    if field_supported::<F>() {
+        <H::Permutation as PlonkyPermutation<F>>::GPU_PERMUTATION
+    } else {
+        GpuPermutation::None
+    }
 }
 
-/// The smallest candidate `c` such that the permutation of `state` with word
-/// `position` replaced by `c` has a response with at least
+/// Whether the device searches proof-of-work nonces for `H` over this field.
+pub(crate) fn supported<F: RichField, H: Hasher<F>>() -> bool {
+    permutation::<F, H>() != GpuPermutation::None
+}
+
+/// The smallest candidate `c` such that the permutation of `H`'s sponge, on
+/// `state` with word `position` replaced by `c`, has a response with at least
 /// `min_leading_zeros` leading zero bits, searched on the device. `None` when
-/// the device or field is unsupported, or no candidate was found within the
-/// bounded number of batches.
-pub(crate) fn search<F: RichField>(
+/// the device, field or permutation is unsupported, or no candidate was found
+/// within the bounded number of batches.
+pub(crate) fn search<F: RichField, H: Hasher<F>>(
     state: &[F],
     position: usize,
     min_leading_zeros: u32,
 ) -> Option<u64> {
-    if !field_supported::<F>() || state.len() != 12 || position >= 12 {
+    let permutation = permutation::<F, H>();
+    if permutation == GpuPermutation::None {
         return None;
     }
     if min_leading_zeros == 0 {
         return Some(0);
     }
     let ctx = context()?;
-    search_on(&ctx, state, position, min_leading_zeros)
+    search_on(&ctx, permutation, state, position, min_leading_zeros)
 }
 
-/// The compiled kernel, or `None` when compilation failed (the search then
-/// falls back to the CPU instead of failing the proof).
-fn kernel(ctx: &GpuContext) -> Option<&PowKernel> {
+/// The kernel of `permutation`, compiling it on first use; `None` when no
+/// kernel implements it or the device rejected it (the search then falls
+/// back to the CPU instead of failing the proof).
+fn kernel(ctx: &GpuContext, permutation: GpuPermutation) -> Option<&PowKernel> {
+    match permutation {
+        GpuPermutation::None => None,
+        GpuPermutation::Poseidon => poseidon_kernel(ctx),
+    }
+}
+
+fn poseidon_kernel(ctx: &GpuContext) -> Option<&PowKernel> {
     ctx.pow_kernel
         .get_or_init(|| {
             let validation = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -91,19 +109,23 @@ impl Drop for WarmGuard {
     }
 }
 
-/// Compiles the search kernel on a background thread while a proof runs, so
-/// its first use (about 0.2 s on the M4) is off the critical path; a later
-/// search waits for the same one-time initialisation. Hold the returned guard
-/// for the whole proof: dropping it joins the thread.
-pub(crate) fn warm(ctx: &Arc<GpuContext>) -> WarmGuard {
-    if ctx.pow_kernel.get().is_some() {
+/// Compiles the search kernel of `permutation` on a background thread while
+/// a proof runs, so its first use (about 0.2 s on the M4) is off the critical
+/// path; a later search waits for the same one-time initialisation. Hold the
+/// returned guard for the whole proof: dropping it joins the thread.
+pub(crate) fn warm(ctx: &Arc<GpuContext>, permutation: GpuPermutation) -> WarmGuard {
+    let compiled = match permutation {
+        GpuPermutation::None => true,
+        GpuPermutation::Poseidon => ctx.pow_kernel.get().is_some(),
+    };
+    if compiled {
         return WarmGuard(None);
     }
     let ctx = ctx.clone();
     let handle = std::thread::Builder::new()
         .name("plonky2-gpu-pow-compile".into())
         .spawn(move || {
-            kernel(&ctx);
+            kernel(&ctx, permutation);
         })
         .ok();
     WarmGuard(handle)
@@ -111,10 +133,18 @@ pub(crate) fn warm(ctx: &Arc<GpuContext>) -> WarmGuard {
 
 pub(crate) fn search_on<F: RichField>(
     ctx: &Arc<GpuContext>,
+    permutation: GpuPermutation,
     state: &[F],
     position: usize,
     min_leading_zeros: u32,
 ) -> Option<u64> {
+    let width = match permutation {
+        GpuPermutation::None => return None,
+        GpuPermutation::Poseidon => SPONGE_WIDTH,
+    };
+    if state.len() != width || position >= width {
+        return None;
+    }
     if min_leading_zeros == 0 {
         return Some(0);
     }
@@ -122,7 +152,7 @@ pub(crate) fn search_on<F: RichField>(
     if capacity == 0 {
         return None;
     }
-    let kernel = kernel(ctx)?;
+    let kernel = kernel(ctx, permutation)?;
     let words = state
         .iter()
         .map(|x| x.to_canonical_u64())

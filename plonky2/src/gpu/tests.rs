@@ -20,6 +20,7 @@ use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::{Field, PrimeField64};
 use crate::fri::oracle::{PolynomialBatch, ProverOracle, SALT_SIZE};
+use crate::hash::hashing::GpuPermutation;
 use crate::hash::merkle_tree::{MerkleLeaves, MerkleTree};
 use crate::hash::poseidon::{Poseidon, PoseidonHash};
 use crate::util::timing::TimingTree;
@@ -168,8 +169,14 @@ fn gpu_proof_of_work_finds_the_smallest_cpu_nonce() {
             random_fields(&mut rng, 12)
         };
         for min_zeros in [0u32, 6, 11, 16] {
-            let found = crate::gpu::pow::search_on(&ctx, &state, position, min_zeros)
-                .expect("device search finds a nonce");
+            let found = crate::gpu::pow::search_on(
+                &ctx,
+                GpuPermutation::Poseidon,
+                &state,
+                position,
+                min_zeros,
+            )
+            .expect("device search finds a nonce");
             let smallest = (0u64..)
                 .find(|&c| response_zeros(&state, position, c) >= min_zeros)
                 .unwrap();
@@ -2831,7 +2838,7 @@ fn small_workloads_do_not_initialize_gpu() {
     )
     .is_none());
     assert!(fri::try_opening_fft::<F, 2>(&coeffs).is_none());
-    assert_eq!(pow::search(&[F::ZERO; 12], 0, 0), Some(0));
+    assert_eq!(pow::search::<F, H>(&[F::ZERO; 12], 0, 0), Some(0));
     let batch = &data.prover_only.constants_sigmas_commitment;
     let zeta = QuadraticExtension::<F>::ONE;
     assert!(opening::try_opening_set::<F, C, 2>(
@@ -2930,7 +2937,10 @@ fn proof_of_work_respects_small_budgets_and_dispatch_limits() {
     ctx.max_workgroups = 1;
     let ctx = Arc::new(ctx);
     let state = [F::from_canonical_u64(17); 12];
-    assert_eq!(pow::search_on(&ctx, &state, 3, 0), Some(0));
+    assert_eq!(
+        pow::search_on(&ctx, GpuPermutation::Poseidon, &state, 3, 0),
+        Some(0)
+    );
     assert!(ctx.pow_kernel.get().is_none());
     for bits in [1u32, 3, 7, 10] {
         let budget = 1u64 << (bits + 4);
@@ -2941,9 +2951,33 @@ fn proof_of_work_respects_small_budgets_and_dispatch_limits() {
             permutation.squeeze()[7].to_canonical_u64().leading_zeros() >= bits
         });
         assert_eq!(
-            pow::search_on(&ctx, &state, 3, bits),
+            pow::search_on(&ctx, GpuPermutation::Poseidon, &state, 3, bits),
             expected,
             "bits={bits}"
         );
     }
+}
+
+/// The search follows the permutation of the hasher's sponge: it runs for
+/// Poseidon, and returns `None` (leaving the CPU search) for a permutation
+/// without a kernel or a state of another width, before touching the device.
+#[test]
+fn proof_of_work_kernel_follows_the_sponge_permutation() {
+    use crate::hash::keccak::KeccakHash;
+    assert_eq!(pow::permutation::<F, H>(), GpuPermutation::Poseidon);
+    assert_eq!(
+        pow::permutation::<F, KeccakHash<25>>(),
+        GpuPermutation::None
+    );
+    assert!(!pow::supported::<F, KeccakHash<25>>());
+    assert_eq!(pow::search::<F, KeccakHash<25>>(&[F::ZERO; 12], 0, 0), None);
+    let Some(ctx) = ctx() else { return };
+    assert_eq!(
+        pow::search_on(&ctx, GpuPermutation::None, &[F::ZERO; 12], 0, 0),
+        None
+    );
+    assert_eq!(
+        pow::search_on(&ctx, GpuPermutation::Poseidon, &[F::ZERO; 8], 0, 0),
+        None
+    );
 }

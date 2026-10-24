@@ -343,6 +343,12 @@ fn bn128_wrap_proofs_verify_on_cpu() {
         <Hb as crate::plonk::config::Hasher<F>>::GPU_HASH,
         GpuHash::PoseidonBn128
     );
+    // Its sponge is the Goldilocks Poseidon one, so the proof-of-work search
+    // runs on the device too.
+    assert_eq!(
+        crate::gpu::pow::permutation::<F, Hb>(),
+        crate::hash::hashing::GpuPermutation::Poseidon
+    );
     let (gpu_data, pw) = wrap_circuit();
     assert!(
         gpu_data.common.degree_bits() + gpu_data.common.config.fri_config.rate_bits

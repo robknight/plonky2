@@ -19,8 +19,11 @@
 //! [`Hasher::GPU_HASH`](crate::plonk::config::Hasher::GPU_HASH) names a kernel:
 //! `PoseidonHash` and, with the `poseidon_bn128` feature, `PoseidonBN128Hash`
 //! (see `poseidon_bn128`); other hashers build them on the CPU. The
-//! proof-of-work search runs on the GPU whenever the hasher's sponge uses the
-//! Goldilocks Poseidon permutation, whichever hash builds its trees.
+//! proof-of-work search runs on the GPU when the permutation of the hasher's
+//! sponge names a kernel in
+//! [`PlonkyPermutation::GPU_PERMUTATION`](crate::hash::hashing::PlonkyPermutation::GPU_PERMUTATION),
+//! as the Goldilocks Poseidon permutation does, whichever hash builds its
+//! trees.
 //! The field arithmetic and permutation run on Metal, Vulkan and DirectX 12,
 //! with a portable flavor for adapters without 64-bit shader integers.
 //!

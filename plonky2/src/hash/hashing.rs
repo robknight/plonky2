@@ -58,6 +58,17 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
     }
 }
 
+/// The GPU kernels that search proof-of-work nonces with a sponge permutation.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuPermutation {
+    /// No kernel: the search runs on the CPU.
+    None,
+    /// [`PoseidonPermutation`](crate::hash::poseidon::PoseidonPermutation) over the Goldilocks
+    /// field.
+    Poseidon,
+}
+
 /// Permutation that can be used in the sponge construction for an algebraic hash.
 pub trait PlonkyPermutation<T: Copy + Default>:
     AsRef<[T]> + Copy + Debug + Default + Eq + Sync + Send
@@ -65,11 +76,10 @@ pub trait PlonkyPermutation<T: Copy + Default>:
     const RATE: usize;
     const WIDTH: usize;
 
-    /// Whether this is the Poseidon permutation that the GPU proof-of-work kernel implements
-    /// ([`PoseidonPermutation`](crate::hash::poseidon::PoseidonPermutation)). The proof-of-work
-    /// search runs on the CPU for any other permutation.
+    /// The GPU kernel that searches proof-of-work nonces with this permutation. Only this
+    /// crate's permutations set it; the search runs on the CPU for [`GpuPermutation::None`].
     #[doc(hidden)]
-    const GPU_POSEIDON: bool = false;
+    const GPU_PERMUTATION: GpuPermutation = GpuPermutation::None;
 
     /// Initialises internal state with values from `iter` until
     /// `iter` is exhausted or `Self::WIDTH` values have been

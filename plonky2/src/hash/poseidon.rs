@@ -14,7 +14,7 @@ use crate::gates::gate::Gate;
 use crate::gates::poseidon::PoseidonGate;
 use crate::gates::poseidon_mds::PoseidonMdsGate;
 use crate::hash::hash_types::{HashOut, RichField};
-use crate::hash::hashing::{compress, hash_n_to_hash_no_pad, PlonkyPermutation};
+use crate::hash::hashing::{compress, hash_n_to_hash_no_pad, GpuPermutation, PlonkyPermutation};
 use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::target::{BoolTarget, Target};
 use crate::plonk::circuit_builder::CircuitBuilder;
@@ -835,7 +835,7 @@ impl<T: Copy + Debug + Default + Eq + Permuter + Send + Sync> PlonkyPermutation<
 {
     const RATE: usize = SPONGE_RATE;
     const WIDTH: usize = SPONGE_WIDTH;
-    const GPU_POSEIDON: bool = true;
+    const GPU_PERMUTATION: GpuPermutation = GpuPermutation::Poseidon;
 
     fn new<I: IntoIterator<Item = T>>(elts: I) -> Self {
         let mut perm = Self {

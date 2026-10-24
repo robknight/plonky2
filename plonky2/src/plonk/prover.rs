@@ -223,15 +223,19 @@ where
         "plan GPU execution",
         crate::gpu::policy::ExecutionPlan::new(common_data, prover_data)
     );
-    // Compile the GPU proof-of-work search in the background (Poseidon
-    // permutation only); the guard joins the thread before this proof returns.
+    // Compile the GPU proof-of-work search in the background when the sponge's
+    // permutation has a kernel; the guard joins the thread before this proof
+    // returns.
     #[cfg(feature = "gpu")]
     let _pow_warm = match &gpu_plan.prepared {
         Some((ctx, _))
             if crate::gpu::pow::supported::<F, C::Hasher>()
                 && common_data.config.fri_config.proof_of_work_bits > 0 =>
         {
-            Some(crate::gpu::pow::warm(ctx))
+            Some(crate::gpu::pow::warm(
+                ctx,
+                crate::gpu::pow::permutation::<F, C::Hasher>(),
+            ))
         }
         _ => None,
     };
