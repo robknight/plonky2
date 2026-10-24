@@ -88,13 +88,14 @@ fn grid(@builtin(global_invocation_id) id: vec3<u32>) {
     if (k >= params.count) { return; }
     let a = load(k / params.n);
     let b = load(k % params.n);
-    store(4u * k, from_mont(fr_mul(a, b)));
-    store(4u * k + 1u, from_mont(fr_add(a, b)));
-    store(4u * k + 2u, from_mont(exp5(a)));
+    store(5u * k, from_mont(fr_mul(a, b)));
+    store(5u * k + 1u, from_mont(fr_add(a, b)));
+    store(5u * k + 2u, from_mont(exp5(a)));
     // Matrix entries are below p, state elements below 2p.
     let ca = sub_p_if_ge(a);
     let cb = sub_p_if_ge(b);
-    store(4u * k + 3u, from_mont(fr_dot4(ca, cb, ca, cb, b, a, b, a)));
+    store(5u * k + 3u, from_mont(fr_dot4(ca, cb, ca, cb, b, a, b, a)));
+    store(5u * k + 4u, from_mont(fr_sqr(b)));
 }
 
 // Canonical integers in, canonical integers out.
@@ -206,13 +207,14 @@ fn bn128_arithmetic_matches_cpu_on_boundary_grid() {
     let expected = (0..count)
         .flat_map(|k| {
             let (a, b) = (elements[k / n], elements[k % n]);
-            [a * b, a + b, a.pow([5]), a * b * Fr::from(4u64)].map(|x| canonical_words(&x))
+            [a * b, a + b, a.pow([5]), a * b * Fr::from(4u64), b.square()]
+                .map(|x| canonical_words(&x))
         })
         .collect::<Vec<_>>();
     for flavor in flavors(&ctx) {
-        let actual = run(&ctx, flavor, "grid", &input, count, n, count * 4 * 8);
+        let actual = run(&ctx, flavor, "grid", &input, count, n, count * 5 * 8);
         for (i, (got, want)) in actual.as_chunks::<8>().0.iter().zip(&expected).enumerate() {
-            let (k, op) = (i / 4, i % 4);
+            let (k, op) = (i / 5, i % 5);
             assert_eq!(
                 got,
                 want,

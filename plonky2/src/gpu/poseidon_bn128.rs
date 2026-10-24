@@ -150,7 +150,7 @@ fn mac(t: u32, a: u32, b: u32, c: u32) -> vec2<u32> {
 }
 "#;
 
-/// The field arithmetic: `fr_mul`, `fr_dot4`, `fr_add`, `to_mont`,
+/// The field arithmetic: `fr_mul`, `fr_sqr`, `fr_dot4`, `fr_add`, `to_mont`,
 /// `from_mont`.
 fn arithmetic(out: &mut String, flavor: Flavor) {
     let p = integer_words(Fr::MODULUS.0);
@@ -193,6 +193,77 @@ fn arithmetic(out: &mut String, flavor: Flavor) {
         writeln!(out, "    t{} = y.y + x.y;", WORDS - 1).unwrap();
     }
     out.push_str("    return Fr(t0, t1, t2, t3, t4, t5, t6, t7);\n}\n");
+
+    // The square of a below 2p: the products of distinct words once, doubled,
+    // plus the squares of the words (36 word products instead of 64), then the
+    // sixteen words reduced. The result is below 4p^2 / R + p < 2p.
+    out.push_str("\nfn fr_sqr(a: Fr) -> Fr {\n");
+    for j in 0..2 * WORDS {
+        writeln!(out, "    var t{j} = 0u;").unwrap();
+    }
+    out.push_str("    var x: vec2<u32>;\n    var c = 0u;\n    var m: u32;\n");
+    for i in 0..WORDS - 1 {
+        writeln!(
+            out,
+            "    x = mac(t{}, a[{i}], a[{}], 0u); t{} = x.x;",
+            2 * i + 1,
+            i + 1,
+            2 * i + 1
+        )
+        .unwrap();
+        for j in i + 2..WORDS {
+            writeln!(
+                out,
+                "    x = mac(t{}, a[{i}], a[{j}], x.y); t{} = x.x;",
+                i + j,
+                i + j
+            )
+            .unwrap();
+        }
+        writeln!(out, "    t{} = x.y;", i + WORDS).unwrap();
+    }
+    for j in (1..2 * WORDS).rev() {
+        writeln!(out, "    t{j} = (t{j} << 1u) | (t{} >> 31u);", j - 1).unwrap();
+    }
+    for i in 0..WORDS {
+        writeln!(
+            out,
+            "    x = mac(t{}, a[{i}], a[{i}], c); t{} = x.x;",
+            2 * i,
+            2 * i
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "    t{} += x.y; c = u32(t{} < x.y);",
+            2 * i + 1,
+            2 * i + 1
+        )
+        .unwrap();
+    }
+    // c is now 0 (a^2 < 2^512) and becomes the carry into the word above
+    // each reduction step's window.
+    for i in 0..WORDS {
+        writeln!(out, "    m = t{i} * {ninv:#010x}u;").unwrap();
+        writeln!(out, "    x = mac(t{i}, m, {:#010x}u, 0u);", p[0]).unwrap();
+        for j in 1..WORDS {
+            writeln!(
+                out,
+                "    x = mac(t{}, m, {:#010x}u, x.y); t{} = x.x;",
+                i + j,
+                p[j],
+                i + j
+            )
+            .unwrap();
+        }
+        writeln!(
+            out,
+            "    {{ let s = t{w} + x.y; let c1 = u32(s < x.y); t{w} = s + c; c = c1 | u32(t{w} < s); }}",
+            w = i + WORDS
+        )
+        .unwrap();
+    }
+    out.push_str("    return Fr(t8, t9, t10, t11, t12, t13, t14, t15);\n}\n");
 
     // The sum of four products with one reduction: the same CIOS loop over
     // the words of the s operands, accumulating all four products before each
@@ -299,8 +370,7 @@ fn rc_fr(k: u32) -> Fr {{
 }}
 
 fn exp5(x: Fr) -> Fr {{
-    let x2 = fr_mul(x, x);
-    return fr_mul(fr_mul(x2, x2), x);
+    return fr_mul(fr_sqr(fr_sqr(x)), x);
 }}
 
 // The row of four matrix entries at `at` times the state.
