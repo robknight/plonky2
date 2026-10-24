@@ -578,7 +578,10 @@ fn bench_int_throughput() {
             "bench params",
             &[threads, iters, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         );
-        let bindings = ctx.bind_hash(&params, &src, &out, &ctx.dummy_rw, &ctx.dummy_rw);
+        let bindings = ctx.bind(
+            &ctx.hash_layout,
+            &[&params, &src, &out, &ctx.dummy_rw, &ctx.dummy_rw],
+        );
         let mut best = f64::MAX;
         for _ in 0..6 {
             let mut encoder = ctx.encoder(entry);
