@@ -13,6 +13,8 @@ categories.workspace = true
 [features]
 default = ["gate_testing", "parallel", "rand_chacha", "std", "timing"]
 gate_testing = []
+# Optional witness diagnostics; disabled builds contain no clocks or counters.
+witness-profiling = []
 # GPU proving through wgpu (Metal, Vulkan, DirectX 12): Merkle hashing,
 # low-degree extensions, FRI, the quotient polynomial and the openings.
 # Selected at runtime when a suitable adapter exists; otherwise the CPU paths

@@ -1,0 +1,11 @@
+[package]
+name = "witness-profile"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+plonky2 = { path = "../../plonky2", features = ["witness-profiling"] }

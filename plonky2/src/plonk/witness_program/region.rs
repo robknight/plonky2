@@ -22,6 +22,7 @@ use crate::iop::witness::{PartialWitness, PartitionWitness};
 
 pub(crate) mod aot;
 pub mod cpu;
+mod profile;
 use std::borrow::Cow;
 pub(crate) mod plan_bytes;
 
@@ -993,4 +994,8 @@ impl RegionProgram {
         aot::reorder(&mut program)?;
         Ok(program)
     }
+}
+
+pub(super) fn benchmark_profile(active: bool) {
+    profile::benchmark_override(active);
 }

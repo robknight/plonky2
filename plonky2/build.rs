@@ -16,6 +16,7 @@ const SOURCES: &[&str] = &[
     "src/plonk/witness_program/region/cpu.rs",
     "src/plonk/witness_program/region/plan_bytes.rs",
     "src/plonk/witness_program/region/aot.rs",
+    "src/plonk/witness_program/region/profile.rs",
     "src/hash/poseidon_trace_simd.rs",
     "src/plonk/witness_program/region/native_kernels.rs",
     "../field/src/arch/x86_64/avx512_goldilocks_field.rs",

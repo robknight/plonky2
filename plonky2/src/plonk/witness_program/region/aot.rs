@@ -62,7 +62,10 @@ pub(super) fn execute(executor: &Executor<'_>) -> Result<bool> {
     if std::env::var("P2_AOT_MODE").as_deref() == Ok("adaptive") {
         generated::run(executor)?;
     } else {
-        for layer in &executor.program.groups {
+        for (index, layer) in executor.program.groups.iter().enumerate() {
+            let _layer = executor
+                .profile
+                .layer(index, layer.iter().map(|g| g.count as u64).sum());
             layer
                 .par_iter()
                 .try_for_each(|g| run_dynamic(executor, g))?;
@@ -83,6 +86,9 @@ pub(super) fn run_fixed<const K: u8>(executor: &Executor<'_>, group: &Group) -> 
         return (0..group.count.div_ceil(chunk))
             .into_par_iter()
             .try_for_each(|c| {
+                let _profile = executor
+                    .profile
+                    .kind(K, (((c + 1) * chunk).min(group.count)) - c * chunk);
                 arithmetic_simplified(
                     executor,
                     group,
@@ -95,6 +101,9 @@ pub(super) fn run_fixed<const K: u8>(executor: &Executor<'_>, group: &Group) -> 
         return (0..group.count.div_ceil(chunk))
             .into_par_iter()
             .try_for_each(|c| {
+                let _profile = executor
+                    .profile
+                    .kind(K, (((c + 1) * chunk).min(group.count)) - c * chunk);
                 equality_batch(
                     executor,
                     group,
@@ -111,7 +120,7 @@ pub(super) fn run_fixed<const K: u8>(executor: &Executor<'_>, group: &Group) -> 
             .try_for_each(|c| {
                 let begin = c * chunk;
                 let end = ((c + 1) * chunk).min(group.count);
-
+                let _profile = executor.profile.kind(K, end - begin);
                 let mode = if use_simd { poseidon_mode() } else { 0 };
                 if mode != 0 {
                     return executor.step_poseidon_simd(group, begin, end, starts, mode);
@@ -134,6 +143,9 @@ pub(super) fn run_fixed<const K: u8>(executor: &Executor<'_>, group: &Group) -> 
     (0..group.count.div_ceil(chunk))
         .into_par_iter()
         .try_for_each(|c| {
+            let _profile = executor
+                .profile
+                .kind(K, (((c + 1) * chunk).min(group.count)) - c * chunk);
             for k in c * chunk..((c + 1) * chunk).min(group.count) {
                 executor.step_fixed::<K>(group, k)?;
             }
@@ -575,6 +587,7 @@ pub(super) fn run_pattern_group(
     );
     let chunk = tuned_chunk(Kind::ArithmeticChain) as usize;
     ids.par_chunks(chunk).enumerate().try_for_each(|(c, ids)| {
+        let _profile = e.profile.kind(26, ids.len() as u32);
         for (i, &id) in ids.iter().enumerate() {
             let kernel = kernels
                 .get(id as usize)
@@ -631,7 +644,10 @@ pub(super) fn run_adaptive(
         eprintln!("AOT_ADAPTIVE_MATCH covered_operations={covered} total_operations={total}");
         groups
     });
-    for layer in &e.program.groups {
+    for (index, layer) in e.program.groups.iter().enumerate() {
+        let _layer = e
+            .profile
+            .layer(index, layer.iter().map(|g| g.count as u64).sum());
         layer.par_iter().try_for_each(|g| {
             if g.kind == Kind::ArithmeticChain {
                 run_pattern_group(e, g, &tags[&g.targets_offset], kernels)

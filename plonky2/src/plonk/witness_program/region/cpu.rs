@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use anyhow::{ensure, Result};
 use plonky2_maybe_rayon::*;
 
+use super::profile::{self, Poseidon as PoseidonPart, Stage};
 use super::{Kind, RegionProgram};
 use crate::field::extension::quintic::QuinticExtension;
 use crate::field::extension::Extendable;
@@ -185,20 +186,29 @@ impl RegionProgram {
         } else {
             None
         };
+        let profile = profile::Execution::new(self.state_slots);
+        let allocation = profile.stage(Stage::Allocate);
+        let state = (0..self.state_slots).map(|_| AtomicU64::new(0)).collect();
+        let ready = (0..self.state_slots)
+            .map(|_| AtomicBool::new(false))
+            .collect();
+        drop(allocation);
         let executor = Executor {
+            profile,
             program: self,
             random: random_values,
             fast,
-            state: (0..self.state_slots).map(|_| AtomicU64::new(0)).collect(),
-            ready: (0..self.state_slots)
-                .map(|_| AtomicBool::new(false))
-                .collect(),
+            state,
+            ready,
         };
+        let seeding = executor.profile.stage(Stage::Seed);
         // The compiler places boundary roots at the start of canonical state.
         for (slot, &value) in root_values.iter().enumerate() {
             ensure!(value < G::ORDER, "boundary input {value} is not canonical");
             executor.store(slot as u32, G::from_canonical_u64(value))?;
         }
+        drop(seeding);
+        let layers = executor.profile.stage(Stage::Layers);
         // Operations in one layer are independent: every unseeded slot has
         // one writer, additional writers use private alias slots, and
         // inputs were produced by earlier layers. The Rayon join at each
@@ -253,6 +263,8 @@ impl RegionProgram {
                 layer.par_iter().try_for_each(run_group)?;
             }
         }
+        drop(layers);
+        let aliases = executor.profile.stage(Stage::Aliases);
         for i in 0..self.alias_count {
             let canonical = self.targets[(self.alias_pair_offset + 2 * i) as usize];
             let duplicate = self.targets[(self.alias_pair_offset + 2 * i + 1) as usize];
@@ -261,6 +273,8 @@ impl RegionProgram {
                 "alias slot {duplicate} disagrees with its canonical slot {canonical}"
             );
         }
+        drop(aliases);
+        let readiness = executor.profile.stage(Stage::Ready);
         // Every slot, canonical or alias, must have been written: a plan
         // that omits a writer (for example a blinding value) is rejected
         // here rather than gathered as zero.
@@ -270,11 +284,13 @@ impl RegionProgram {
             }),
             "a state slot was never written by the plan"
         );
+        drop(readiness);
         Ok(executor)
     }
 }
 
 pub(super) struct Executor<'a> {
+    pub(super) profile: profile::Execution,
     pub(super) program: &'a RegionProgram,
     random: &'a [u64],
     pub(super) state: Vec<AtomicU64>,
@@ -288,9 +304,12 @@ impl Drop for Executor<'_> {
     /// elide, rather than relaxed atomic stores.
     fn drop(&mut self) {
         use zeroize::Zeroize;
+        let wipe = self.profile.stage(Stage::Wipe);
         self.state
             .par_iter_mut()
             .for_each(|v| v.get_mut().zeroize());
+        drop(wipe);
+        self.profile.report();
     }
 }
 
@@ -1597,6 +1616,7 @@ impl Executor<'_> {
         use crate::hash::poseidon_trace_simd::{trace, Lanes};
         let mut input = [Lanes([G::ZERO; W]); 12];
         let mut swap = Lanes([G::ZERO; W]);
+        let pack = self.profile.poseidon(PoseidonPart::Input);
         for lane in 0..W {
             for i in 0..12 {
                 input[i].0[lane] =
@@ -1608,7 +1628,11 @@ impl Executor<'_> {
                 "invalid Poseidon swap flag"
             );
         }
+        drop(pack);
+        let arithmetic = self.profile.poseidon(PoseidonPart::Arithmetic);
         let out = trace(input, swap);
+        drop(arithmetic);
+        let _output = self.profile.poseidon(PoseidonPart::Output);
         for lane in 0..W {
             let values = core::array::from_fn(|i| out[i].0[lane]);
             self.store_poseidon(g, k + lane as u32, bases[k as usize + lane], &values)?;
@@ -1846,6 +1870,7 @@ pub(crate) fn generate_wires_with<
     };
 
     let started = Instant::now();
+    let input_discovery = profile::Pipeline::new("input-discovery", prover.generators.len());
     let mut initial = inputs
         .target_values
         .keys()
@@ -1863,12 +1888,14 @@ pub(crate) fn generate_wires_with<
     report.compile_cached = true;
     report.plan = "installed";
     report.compile = started.elapsed();
+    drop(input_discovery);
     report.representatives = program.representatives.len();
     report.random_values = program.random_count as usize;
     report.layers = program.layer_count();
 
     // Boundary roots straight from the inputs; duplicates must agree.
     let started = Instant::now();
+    let root_binding = profile::Pipeline::new("root-binding", prover.generators.len());
     let mut root_values = vec![0u64; program.roots.len()];
     let mut seen = vec![false; program.roots.len()];
     for (&target, &value) in &inputs.target_values {
@@ -1892,11 +1919,14 @@ pub(crate) fn generate_wires_with<
         seen.iter().all(|&set| set),
         "a boundary root has no input value"
     );
+    drop(root_binding);
+    let random_sampling = profile::Pipeline::new("random-sampling", prover.generators.len());
     let random = match random_values {
         Some(values) => zeroize::Zeroizing::new(values),
         None => sample_random_values::<F>(program.random_count as usize),
     };
     report.sample = started.elapsed();
+    drop(random_sampling);
     if let Some(directory) = std::env::var_os("P2_AOT_SNAPSHOT_DIR") {
         static SAVED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
             std::sync::OnceLock::new();

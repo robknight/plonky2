@@ -532,3 +532,9 @@ mod tests {
 pub fn replay_snapshot(stem: &std::path::Path, iterations: usize) -> anyhow::Result<()> {
     region::cpu::replay_snapshot(stem, iterations)
 }
+
+/// Benchmark-only control. Change only between proofs, with no executions active.
+#[doc(hidden)]
+pub fn benchmark_profile(active: bool) {
+    region::benchmark_profile(active);
+}
