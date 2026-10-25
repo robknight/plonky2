@@ -271,7 +271,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         &self,
         program: crate::plonk::witness_program::WitnessProgram,
     ) -> core::result::Result<(), crate::plonk::witness_program::WitnessProgramError> {
-        crate::plonk::witness_program::install(&self.prover_only, program)
+        crate::plonk::witness_program::install(&self.prover_only, &self.common, program)
     }
 
     /// Removes the installed witness program; later proofs use the worklist.
@@ -481,7 +481,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         &self,
         program: crate::plonk::witness_program::WitnessProgram,
     ) -> core::result::Result<(), crate::plonk::witness_program::WitnessProgramError> {
-        crate::plonk::witness_program::install(&self.prover_only, program)
+        crate::plonk::witness_program::install(&self.prover_only, &self.common, program)
     }
 
     /// Removes the installed witness program; later proofs use the worklist.

@@ -473,7 +473,7 @@ pub(super) fn reorder(p: &mut RegionProgram) -> Result<()> {
         .map(|&old| p.representatives[old as usize])
         .collect::<Vec<_>>()
         .into();
-    for target in p.targets.to_mut() {
+    for target in std::sync::Arc::make_mut(&mut p.targets) {
         *target = remap[*target as usize];
     }
     Ok(())
@@ -543,13 +543,9 @@ pub(super) fn run_pattern_group(
 /// Classifies each arithmetic chain once against a small bank of native kernels.
 /// Descriptor keys are compared in full; unfamiliar shapes retain the generic
 /// chain executor. This works across circuits and state layouts.
-pub(super) fn run_adaptive(
-    e: &Executor<'_>,
-    descriptors: &[&[u64]],
-    kernels: &[PatternFn],
-) -> Result<()> {
-    let fast = e.program.fast.get().expect("validated adaptive plan");
-    let tags = fast.adaptive.get_or_init(|| {
+fn adaptive_tags<'a>(p: &'a RegionProgram, descriptors: &[&[u64]]) -> &'a HashMap<u32, Vec<u8>> {
+    let fast = p.fast.get().expect("validated adaptive plan");
+    fast.adaptive.get_or_init(|| {
         let known = descriptors
             .iter()
             .enumerate()
@@ -558,8 +554,7 @@ pub(super) fn run_adaptive(
         let mut groups = HashMap::new();
         let mut covered = 0u64;
         let mut total = 0u64;
-        for g in e
-            .program
+        for g in p
             .groups
             .iter()
             .flatten()
@@ -572,7 +567,7 @@ pub(super) fn run_adaptive(
                 key.clear();
                 key.extend([g.inputs as u64, g.outputs as u64]);
                 for position in 0..5 * g.outputs as usize {
-                    key.push(e.program.coefficients[base + position * g.count as usize + k]);
+                    key.push(p.coefficients[base + position * g.count as usize + k]);
                 }
                 let tag = known.get(key.as_slice()).copied().unwrap_or(0);
                 ids.push(tag);
@@ -585,7 +580,27 @@ pub(super) fn run_adaptive(
         }
         log::debug!(target: super::COMPILE_LOG,"native arithmetic coverage: {covered}/{total}");
         groups
-    });
+    })
+}
+
+pub(super) fn prepare(p: &RegionProgram) -> Result<()> {
+    if p.fast.get().is_none() {
+        let certificate = certify(p)?;
+        let _ = p.fast.set(certificate);
+    }
+    if fast_enabled(p) {
+        let _ = poseidon_bases(p);
+        generated::prepare(p);
+    }
+    Ok(())
+}
+
+pub(super) fn run_adaptive(
+    e: &Executor<'_>,
+    descriptors: &[&[u64]],
+    kernels: &[PatternFn],
+) -> Result<()> {
+    let tags = adaptive_tags(e.program, descriptors);
     for (index, layer) in e.program.groups.iter().enumerate() {
         let _layer = e
             .profile

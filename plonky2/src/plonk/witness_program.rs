@@ -75,7 +75,7 @@ pub const FORMAT: u64 = plan_bytes::WITNESS_PROGRAM_FORMAT;
 #[derive(Clone)]
 pub struct WitnessProgram {
     program: Arc<RegionProgram>,
-    key: PlanKey,
+    key: Arc<PlanKey>,
 }
 
 impl fmt::Debug for WitnessProgram {
@@ -272,23 +272,33 @@ pub(crate) fn compile_with_config<
     }
     Ok(WitnessProgram {
         program: Arc::new(program),
-        key,
+        key: Arc::new(key),
     })
 }
 
 /// Installs `program` on the circuit, replacing any installed program.
 pub(crate) fn install<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     prover: &ProverOnlyCircuitData<F, C, D>,
+    common: &CommonCircuitData<F, D>,
     program: WitnessProgram,
 ) -> Result<(), WitnessProgramError> {
     if !same_circuit(&program.key, prover) {
         return Err(WitnessProgramError::WrongCircuit);
     }
+    program
+        .program
+        .prepare(
+            &prover.representative_map,
+            common.config.num_wires,
+            common.degree(),
+        )
+        .map_err(|e| WitnessProgramError::Invalid(format!("preparing execution: {e:#}")))?;
     prover.witness_program.install_all(
         prover.generators.len(),
-        program.key.mask,
+        program.key.mask.clone(),
         program.program,
         program.key.operations,
+        program.key,
     );
     Ok(())
 }
@@ -301,6 +311,12 @@ pub(crate) fn installed<
 >(
     prover: &ProverOnlyCircuitData<F, C, D>,
 ) -> Option<WitnessProgram> {
+    if let Some(program) = prover
+        .witness_program
+        .installed_program(prover.generators.len())
+    {
+        return Some(program);
+    }
     let (mask, program, operations) = prover
         .witness_program
         .installed_all(prover.generators.len())?;
@@ -308,10 +324,10 @@ pub(crate) fn installed<
     let compilation = program.runtime.config.compilation_key();
     Some(WitnessProgram {
         program,
-        key: PlanKey {
+        key: Arc::new(PlanKey {
             compilation,
             ..key(prover, mask, operations)
-        },
+        }),
     })
 }
 
@@ -359,7 +375,7 @@ pub(crate) fn from_bytes_with_config<
     )?);
     Ok(WitnessProgram {
         program: Arc::new(program),
-        key,
+        key: Arc::new(key),
     })
 }
 
@@ -388,6 +404,21 @@ impl WitnessProgram {
     /// Effective configuration resolved when this program was compiled or loaded.
     pub fn config(&self) -> &WitnessConfig {
         &self.program.runtime.config
+    }
+
+    /// Reuses this program and its prepared tables with different resource or
+    /// execution settings. The stored layout and fusion policy are preserved.
+    pub fn with_execution_config(
+        &self,
+        config: WitnessConfig,
+    ) -> Result<Self, WitnessProgramError> {
+        let config = config.with_compilation_key(self.key.compilation)?;
+        let mut program = (*self.program).clone();
+        program.runtime = Arc::new(config::Runtime::new(config)?);
+        Ok(Self {
+            program: Arc::new(program),
+            key: self.key.clone(),
+        })
     }
 
     /// Encodes the program for storage. Decode it with
@@ -510,7 +541,7 @@ mod tests {
         ));
         let other_format = PlanKey {
             format: program.key.format.wrapping_add(1),
-            ..program.key.clone()
+            ..(*program.key).clone()
         };
         assert_eq!(
             data.witness_program_from_bytes(&plan_bytes::encode(&program.program, &other_format))
@@ -519,7 +550,7 @@ mod tests {
         );
         let other_operations = PlanKey {
             operations: program.key.operations ^ 1,
-            ..program.key.clone()
+            ..(*program.key).clone()
         };
         assert_eq!(
             data.witness_program_from_bytes(&plan_bytes::encode(
@@ -609,6 +640,30 @@ mod tests {
             Err(WitnessProgramError::InvalidConfiguration(_))
         ));
     }
+    #[test]
+    fn installation_prepares_tables_and_program_clones_share_metadata() {
+        let fixture = circuit(false);
+        let data = &fixture.data;
+        let program = data
+            .compile_witness_program_like(&inputs(&fixture))
+            .unwrap();
+        let clone = program.clone();
+        assert!(Arc::ptr_eq(&program.key, &clone.key));
+        assert!(Arc::ptr_eq(&program.program, &clone.program));
+        let config = WitnessConfig {
+            execution: WitnessExecution::Checked,
+            ..WitnessConfig::default()
+        };
+        let checked = program.with_execution_config(config).unwrap();
+        data.install_witness_program(clone).unwrap();
+        assert!(program.program.is_prepared());
+        assert!(checked.program.is_prepared());
+        let installed = data.witness_program().unwrap();
+        assert!(Arc::ptr_eq(&program.key, &installed.key));
+        assert!(Arc::ptr_eq(&program.program, &installed.program));
+        assert!(prove_and_verify(data, inputs(&fixture)));
+    }
+
     #[test]
     fn strict_input_shape_reports_unexpected_worklist_fallback() {
         let fixture = circuit(true);

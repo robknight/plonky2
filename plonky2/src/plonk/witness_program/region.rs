@@ -23,9 +23,8 @@ use crate::iop::witness::{PartialWitness, PartitionWitness};
 pub(crate) mod aot;
 pub(super) mod buffers;
 pub mod cpu;
-mod profile;
-use std::borrow::Cow;
 pub(crate) mod plan_bytes;
+mod profile;
 
 /// Log target of the compiler's phase timings (debug level).
 pub(crate) const COMPILE_LOG: &str = "plonky2::witness_program::compile";
@@ -143,22 +142,22 @@ pub struct RegionProgram {
     /// Operation groups in dependency layers: every group in a layer depends
     /// only on earlier layers.
     groups: Vec<Vec<Group>>,
-    targets: Cow<'static, [u32]>,
-    coefficients: Cow<'static, [u64]>,
-    representatives: Cow<'static, [usize]>,
-    roots: Cow<'static, [usize]>,
+    targets: Arc<[u32]>,
+    coefficients: Arc<[u64]>,
+    representatives: Arc<[usize]>,
+    roots: Arc<[usize]>,
     random_count: u32,
     alias_count: u32,
     alias_pair_offset: u32,
     state_slots: u32,
     pub(super) runtime: Arc<super::config::Runtime>,
-    fast: std::sync::OnceLock<aot::FastLayout>,
+    fast: Arc<std::sync::OnceLock<aot::FastLayout>>,
     /// Representative index to canonical slot, `u32::MAX` when absent; built
     /// on first use by the CPU executor's gather.
-    rep_slots: std::sync::OnceLock<Vec<u32>>,
+    rep_slots: Arc<std::sync::OnceLock<Vec<u32>>>,
     /// Canonical slot of every wire cell in column-major order, `u32::MAX`
     /// where the program has no slot; built on first use by the gather.
-    cell_slots: std::sync::OnceLock<Vec<u32>>,
+    cell_slots: Arc<std::sync::OnceLock<Vec<u32>>>,
 }
 
 /// The program slot of one prover circuit: the whole-circuit program a caller
@@ -176,6 +175,7 @@ struct CachedProgram {
     program: Arc<RegionProgram>,
     /// Diagnostics that compile their own program leave this unset.
     operations: Option<u128>,
+    key: Option<Arc<super::region::plan_bytes::PlanKey>>,
 }
 
 #[derive(Debug, Default)]
@@ -217,6 +217,7 @@ impl ProgramCache {
         initial: Vec<usize>,
         program: Arc<RegionProgram>,
         operations: u128,
+        key: Arc<super::region::plan_bytes::PlanKey>,
     ) {
         let mut cached = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let roots_match_inputs = initial.as_slice() == program.roots.as_ref();
@@ -226,6 +227,7 @@ impl ProgramCache {
             generators,
             program,
             operations: Some(operations),
+            key: Some(key),
         });
         cached.warned_mismatch = false;
     }
@@ -263,6 +265,16 @@ impl ProgramCache {
             .program
             .as_ref()
             .is_some_and(|p| p.program.runtime.config.fallback == super::WitnessFallback::Error)
+    }
+
+    pub(crate) fn installed_program(&self, generators: usize) -> Option<super::WitnessProgram> {
+        let cached = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let p = cached.program.as_ref()?;
+        (p.generators == generators).then_some(())?;
+        Some(super::WitnessProgram {
+            program: p.program.clone(),
+            key: p.key.as_ref()?.clone(),
+        })
     }
 
     /// The whole-circuit program in the slot, its mask and its operation
@@ -338,6 +350,7 @@ impl ProgramCache {
             generators: generators.len(),
             program: program.clone(),
             operations: None,
+            key: None,
         });
         cached.warned_mismatch = false;
         Ok((program, false))

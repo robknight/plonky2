@@ -1734,3 +1734,5 @@ static DESCRIPTORS: &[&[u64]] = &[
 pub(super) fn run(e: &Executor<'_>) -> Result<()> {
     run_adaptive(e, DESCRIPTORS, KERNELS)
 }
+
+pub(super) fn prepare(p:&RegionProgram) {let _=adaptive_tags(p,DESCRIPTORS);}

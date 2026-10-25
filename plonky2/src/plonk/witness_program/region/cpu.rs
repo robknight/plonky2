@@ -141,6 +141,24 @@ impl RegionProgram {
         })
     }
 
+    pub(crate) fn prepare(&self, map: &[usize], num_wires: usize, degree: usize) -> Result<()> {
+        super::aot::prepare(self)?;
+        let _ = self.rep_slots(map.len());
+        let _ = self.cell_slots(map, num_wires, degree);
+        Ok(())
+    }
+
+    pub(crate) fn is_prepared(&self) -> bool {
+        self.fast.get().is_some()
+            && self.rep_slots.get().is_some()
+            && self.cell_slots.get().is_some()
+            && (!super::aot::fast_enabled(self)
+                || self
+                    .fast
+                    .get()
+                    .is_some_and(|f| f.poseidon.get().is_some() && f.adaptive.get().is_some()))
+    }
+
     /// Runs the program over `root_values`, one canonical value per boundary
     /// root in `roots` order, and returns the final slot state.
     fn execute_state<'a>(
@@ -2623,7 +2641,8 @@ pub(crate) mod tests {
             .find(|g| g.kind == Kind::RandomValue)
             .cloned()
             .expect("blinded circuit has random writers");
-        tampered.targets.to_mut()[group.targets_offset as usize] = tampered.state_slots;
+        std::sync::Arc::make_mut(&mut tampered.targets)[group.targets_offset as usize] =
+            tampered.state_slots;
         tampered.state_slots += 1;
         tampered.fast = Default::default();
         let error = tampered
@@ -2698,7 +2717,7 @@ pub(crate) mod tests {
             .coefficients_offset()
             .expect("random group coefficient storage")
             as usize];
-        duplicate.coefficients.to_mut()[group
+        std::sync::Arc::make_mut(&mut duplicate.coefficients)[group
             .coefficients_offset()
             .expect("random group coefficient storage")
             as usize
@@ -2709,7 +2728,7 @@ pub(crate) mod tests {
         assert!(error.contains("random"), "{error}");
         // Roots must occupy the prefix of canonical state: reject a changed root.
         let mut roots = (*program).clone();
-        roots.roots.to_mut()[0] = roots.representatives[0].wrapping_add(1);
+        std::sync::Arc::make_mut(&mut roots.roots)[0] = roots.representatives[0].wrapping_add(1);
         assert!(plan_bytes::decode(&plan_bytes::encode(&roots, &key)).is_err());
         // A flipped byte: rejected by the checksum.
         let mut damaged = bytes.clone();
