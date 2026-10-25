@@ -319,3 +319,7 @@ All 20 witness tests passed, including prepared-table checks and sharing across 
 All 23 witness tests passed, including cache reload, alias-equivalent schemas, additional input classes, corrupt-entry repair, unavailable cache, concurrent same-object preparation/proofs and independent-object disk misses. Same-object and independent-object races each compiled once. The complete public example verified two proofs with memory-only preparation and with a real environment-configured cold and warm cache. GPU-feature compilation also passed locally on M4. No non-M4 measurements were run in this phase.
 
 Consumer lifecycle, environment precedence, cache compatibility, fallback policy, resource ownership, custom generators and a complete example are documented in `docs/witness-executor.md` and `plonky2/examples/witness_program.rs`.
+
+## Application configuration validation
+
+`WitnessConfig::validate` is public so application/POD2 configuration can fail before threads or circuit preparation are started. Empty explicit cache directories and unsupported serial-build thread requests are rejected. `from_env` now resolves an absent cache directory to a definite disabled policy, allowing a consumer to capture process defaults once. Two focused tests passed, including precedence checks in a subprocess that does not mutate the parent test environment.

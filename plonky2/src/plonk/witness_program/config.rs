@@ -277,15 +277,24 @@ impl WitnessConfig {
                 _ => return Err(invalid("arithmetic simplification must be true or false")),
             };
         }
-        if let Some(dir) = std::env::var_os("PLONKY2_EXECUTOR_CACHE_DIR") {
-            if !dir.is_empty() {
-                c.cache = WitnessCache::Directory(dir.into());
-            }
-        }
+        c.cache = std::env::var_os("PLONKY2_EXECUTOR_CACHE_DIR")
+            .filter(|dir| !dir.is_empty())
+            .map_or(WitnessCache::Disabled, |dir| {
+                WitnessCache::Directory(dir.into())
+            });
         c.validate()?;
         Ok(c)
     }
-    pub(crate) fn validate(&self) -> Result<(), WitnessProgramError> {
+    /// Checks options without allocating execution buffers or creating threads.
+    /// Preparation and compilation also validate configuration automatically.
+    pub fn validate(&self) -> Result<(), WitnessProgramError> {
+        if matches!(&self.cache,WitnessCache::Directory(path) if path.as_os_str().is_empty()) {
+            return Err(invalid("executor cache directory must not be empty"));
+        }
+        #[cfg(not(feature = "parallel"))]
+        if self.threads != 0 {
+            return Err(invalid("executor threads require the parallel feature"));
+        }
         if self.chain_length == 1 || self.chain_length > 8 {
             return Err(invalid("chain_length must be zero or 2..=8"));
         }
@@ -364,5 +373,53 @@ impl Runtime {
 impl Default for Runtime {
     fn default() -> Self {
         Self::new(WitnessConfig::default()).expect("valid default witness configuration")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn validates_application_options_before_resource_creation() {
+        let options = WitnessConfig::default();
+        options.validate().unwrap();
+        let invalid = WitnessConfig {
+            cache: WitnessCache::Directory(PathBuf::new()),
+            ..options.clone()
+        };
+        assert!(invalid.validate().is_err());
+        let invalid = WitnessConfig {
+            chain_length: 1,
+            ..options.clone()
+        };
+        assert!(invalid.validate().is_err());
+        let invalid = WitnessConfig {
+            gather_columns: 0,
+            ..options.clone()
+        };
+        assert!(invalid.validate().is_err());
+        let invalid = WitnessConfig {
+            buffers: WitnessBuffers::Reuse { max_bytes: 0 },
+            ..options
+        };
+        assert!(invalid.validate().is_err());
+    }
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn environment_precedence_is_resolved_without_mutating_the_test_process() {
+        const CHILD: &str = "PLONKY2_EXECUTOR_CONFIG_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let config = WitnessConfig::from_env().unwrap();
+            assert_eq!(config.threads, 2);
+            assert_eq!(config.chain_length, 0);
+            assert_eq!(config.cache, WitnessCache::Disabled);
+            return;
+        }
+        let status=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","plonk::witness_program::config::tests::environment_precedence_is_resolved_without_mutating_the_test_process"])
+            .env(CHILD,"1").env("P2_AOT_WITNESS_THREADS","7").env("PLONKY2_EXECUTOR_THREADS","2")
+            .env("P2_AOT_CHAIN_LEN","8").env("PLONKY2_EXECUTOR_CHAIN_LENGTH","0")
+            .env_remove("PLONKY2_EXECUTOR_CACHE_DIR").status().unwrap();
+        assert!(status.success());
     }
 }
