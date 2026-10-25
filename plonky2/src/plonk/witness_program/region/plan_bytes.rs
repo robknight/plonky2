@@ -29,7 +29,7 @@ use crate::iop::generator::WitnessGeneratorRef;
 
 include!(concat!(env!("OUT_DIR"), "/witness_program_format.rs"));
 
-const MAGIC: &[u8; 8] = b"P2WAOT02";
+const MAGIC: &[u8; 8] = b"P2WAOT03";
 
 /// Identity of a whole-circuit program.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,6 +50,23 @@ fn fnv1a(bytes: &[u8], mut hash: u64) -> u64 {
     for &byte in bytes {
         hash ^= byte as u64;
         hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Deterministic chunked damage checksum. Independent chunks can be checked in
+/// parallel, avoiding a serial pass over tens of megabytes during cache load.
+/// This retains the format's accidental-damage contract, not authentication.
+fn checksum(bytes: &[u8]) -> u64 {
+    const BASIS: u64 = 0xcbf29ce484222325;
+    const CHUNK: usize = 128 * 1024;
+    let chunks = bytes
+        .par_chunks(CHUNK)
+        .map(|chunk| fnv1a(chunk, BASIS))
+        .collect::<Vec<_>>();
+    let mut hash = fnv1a(&(bytes.len() as u64).to_le_bytes(), BASIS);
+    for chunk in chunks {
+        hash = fnv1a(&chunk.to_le_bytes(), hash);
     }
     hash
 }
@@ -179,8 +196,9 @@ impl Reader<'_> {
         );
         Ok(n)
     }
-    /// Reads what `Writer::deltas` wrote, rejecting values above `max`.
-    fn deltas(&mut self, max: u64) -> Result<Vec<u64>> {
+    /// Decode directly into the destination word type, avoiding a temporary
+    /// wide target array and a second conversion pass.
+    fn deltas<T: TryFrom<u64>>(&mut self) -> Result<Vec<T>> {
         // Every value takes at least one byte.
         let n = self.len(1)?;
         let mut values = Vec::with_capacity(n);
@@ -202,8 +220,10 @@ impl Reader<'_> {
             }
             let delta = ((v >> 1) as i64) ^ -((v & 1) as i64);
             previous = previous.wrapping_add(delta as u64);
-            ensure!(previous <= max, "witness program index out of range");
-            values.push(previous);
+            values.push(
+                T::try_from(previous)
+                    .map_err(|_| anyhow::anyhow!("witness program index out of range"))?,
+            );
         }
         Ok(values)
     }
@@ -241,16 +261,9 @@ pub(crate) fn encode(program: &RegionProgram, key: &PlanKey) -> Vec<u8> {
     w.u32(program.alias_count);
     w.u32(program.alias_pair_offset);
     w.u32(program.state_slots);
-    let checksum = fnv1a(&w.0, 0xcbf29ce484222325);
+    let checksum = checksum(&w.0);
     w.u64(checksum);
     w.0
-}
-
-fn to_usizes(values: Vec<u64>) -> Result<Vec<usize>> {
-    values
-        .into_iter()
-        .map(|v| usize::try_from(v).context("witness program value exceeds usize"))
-        .collect()
 }
 
 /// Decodes a program and the key it was encoded with. The caller checks the
@@ -259,7 +272,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(PlanKey, RegionProgram)> {
     ensure!(bytes.len() >= 16, "witness program is truncated");
     let (payload, tail) = bytes.split_at(bytes.len() - 8);
     ensure!(
-        u64::from_le_bytes(tail.try_into().unwrap()) == fnv1a(payload, 0xcbf29ce484222325),
+        u64::from_le_bytes(tail.try_into().unwrap()) == checksum(payload),
         "witness program checksum mismatch"
     );
     let mut r = Reader {
@@ -272,7 +285,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(PlanKey, RegionProgram)> {
         digest: r.take(n)?.to_vec(),
         generators: r.usize()?,
         map_len: r.usize()?,
-        mask: to_usizes(r.deltas(u64::MAX)?)?,
+        mask: r.deltas()?,
         format: r.u64()?,
         operations: r.u64()? as u128 | (r.u64()? as u128) << 64,
         compilation: r.u32()?,
@@ -298,14 +311,10 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(PlanKey, RegionProgram)> {
                 .collect::<Result<Vec<_>>>()
         })
         .collect::<Result<Vec<_>>>()?;
-    let targets = r
-        .deltas(u32::MAX as u64)?
-        .into_iter()
-        .map(|t| t as u32)
-        .collect::<Vec<_>>();
-    let coefficients = r.deltas(u64::MAX)?;
-    let representatives = to_usizes(r.deltas(u64::MAX)?)?;
-    let roots = to_usizes(r.deltas(u64::MAX)?)?;
+    let targets: Vec<u32> = r.deltas()?;
+    let coefficients: Vec<u64> = r.deltas()?;
+    let representatives: Vec<usize> = r.deltas()?;
+    let roots: Vec<usize> = r.deltas()?;
     let random_count = r.u32()?;
     let alias_count = r.u32()?;
     let alias_pair_offset = r.u32()?;
@@ -374,6 +383,31 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(PlanKey, RegionProgram)> {
 pub(crate) fn reseal(bytes: &[u8]) -> Vec<u8> {
     let payload = &bytes[..bytes.len() - 8];
     let mut out = payload.to_vec();
-    out.extend_from_slice(&fnv1a(payload, 0xcbf29ce484222325).to_le_bytes());
+    out.extend_from_slice(&checksum(payload).to_le_bytes());
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::checksum;
+
+    #[test]
+    fn checksum_covers_chunk_boundaries_and_is_independent_of_threads() {
+        let mut bytes = (0..(256 * 1024 + 7)).map(|i| i as u8).collect::<Vec<_>>();
+        let expected = checksum(&bytes);
+        #[cfg(feature = "parallel")]
+        for threads in [1, 3] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            assert_eq!(pool.install(|| checksum(&bytes)), expected);
+        }
+        for index in [0, 128 * 1024 - 1, 128 * 1024, bytes.len() - 1] {
+            bytes[index] ^= 1;
+            assert_ne!(checksum(&bytes), expected);
+            bytes[index] ^= 1;
+        }
+        assert_ne!(checksum(&bytes[..bytes.len() - 1]), expected);
+    }
 }
