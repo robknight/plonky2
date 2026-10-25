@@ -161,10 +161,11 @@ impl RegionProgram {
             && self.rep_slots.get().is_some()
             && self.cell_slots.get().is_some()
             && (!super::aot::fast_enabled(self)
-                || self
-                    .fast
-                    .get()
-                    .is_some_and(|f| f.poseidon.get().is_some() && f.adaptive.get().is_some()))
+                || self.fast.get().is_some_and(|f| {
+                    f.poseidon.get().is_some()
+                        && f.adaptive.get().is_some()
+                        && f.random_spans.get().is_some()
+                }))
     }
 
     /// Runs the program over `root_values`, one canonical value per boundary
@@ -532,6 +533,33 @@ impl Executor<'_> {
     ) -> Result<()> {
         let slot = self.target(offset, position, count, k)?;
         self.store(slot, value)
+    }
+
+    /// Preparation certifies contiguous, exclusive, non-root destinations.
+    /// Keep random-word validation even for benchmark-supplied streams.
+    pub(super) fn step_random_span(
+        &self,
+        source: u32,
+        destination: u32,
+        start: u32,
+        end: u32,
+    ) -> Result<()> {
+        let source = self
+            .random
+            .get(source as usize + start as usize..source as usize + end as usize)
+            .ok_or_else(|| anyhow::anyhow!("random span outside supplied values"))?;
+        let destination = self
+            .state
+            .get(destination as usize + start as usize..destination as usize + end as usize)
+            .ok_or_else(|| anyhow::anyhow!("random span outside state"))?;
+        ensure!(
+            source.iter().all(|&v| v < G::ORDER),
+            "random value is not canonical"
+        );
+        for (cell, &value) in destination.iter().zip(source) {
+            cell.store(value, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Coefficient of lane `k` at `position` in a group's coefficient block,
@@ -2667,6 +2695,58 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn contiguous_random_copies_match_checked_execution_with_extreme_words() {
+        let mut builder = CircuitBuilder::<G, 2>::new(CircuitConfig::standard_recursion_config());
+        for _ in 0..1024 {
+            let target = builder.add_virtual_target();
+            builder.add_simple_generator(crate::iop::generator::RandomValueGenerator { target });
+        }
+        let data = builder.build::<C>();
+        let pw = PartialWitness::new();
+        let entry =
+            crate::iop::generator::initial_witness(&pw, &data.prover_only, &data.common).unwrap();
+        let program = data.compile_witness_program_like(&pw).unwrap();
+        let program = &*program.program;
+        let roots = program
+            .roots
+            .iter()
+            .map(|&r| entry.values[r].unwrap().to_canonical_u64())
+            .collect::<Vec<_>>();
+        let random = (0..program.random_count as usize)
+            .map(|i| [0, 1, G::ORDER - 1, G::ORDER - 2][i % 4])
+            .collect::<Vec<_>>();
+        for irregular in [false, true] {
+            let mut program = program.clone();
+            if irregular {
+                let group = program
+                    .groups
+                    .iter()
+                    .flatten()
+                    .find(|g| g.kind == Kind::RandomValue && g.count >= 2)
+                    .unwrap();
+                let co = group.coefficients_offset().unwrap() as usize;
+                std::sync::Arc::make_mut(&mut program.coefficients).swap(co, co + 1);
+            }
+            program.fast = Default::default();
+            let expected = program.execute_state_inner(&roots, &random, true).unwrap();
+            let actual = program.execute_state(&roots, &random).unwrap();
+            for (a, b) in actual.state.iter().zip(&expected.state) {
+                assert_eq!(a.load(Ordering::Relaxed), b.load(Ordering::Relaxed));
+            }
+            for invalid in [G::ORDER, u64::MAX] {
+                let mut bad = random.clone();
+                bad[0] = invalid;
+                assert!(program.execute_state_inner(&roots, &bad, true).is_err());
+                assert!(program.execute_state(&roots, &bad).is_err());
+            }
+            let spans = program.fast.get().unwrap().random_spans.get().unwrap();
+            if !irregular {
+                assert!(!spans.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn plan_bytes_reject_malformed_programs() {
         use super::super::plan_bytes::{self, PlanKey};
         let fixture = circuit(true);
@@ -2793,7 +2873,10 @@ pub(crate) fn replay_snapshot(stem: &std::path::Path, iterations: usize) -> Resu
         program.layer_count(),
         program.state_slots
     );
+    let paired = std::env::var_os("P2_BENCH_RANDOM_SPANS_PAIR").is_some();
     for iteration in 0..iterations {
+        let spans = !paired || ((iteration ^ (iteration >> 1)) & 1) != 0;
+        super::aot::benchmark_random_spans(spans);
         let started = Instant::now();
         let actual = program.execute_state(&roots, &random)?;
         let ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -2804,7 +2887,7 @@ pub(crate) fn replay_snapshot(stem: &std::path::Path, iterations: usize) -> Resu
             );
         }
         eprintln!(
-            "AOT_EXECUTE generators={} layers={} slots={} iteration={} ms={ms:.6} equal=true",
+            "AOT_EXECUTE generators={} layers={} slots={} iteration={} ms={ms:.6} equal=true random_spans={spans}",
             key.generators,
             program.layer_count(),
             program.state_slots,

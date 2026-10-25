@@ -20,6 +20,7 @@ pub(super) struct FastLayout {
     pub single: Cow<'static, [u8]>,
     pub poseidon: OnceLock<HashMap<u32, Vec<u32>>>,
     pub adaptive: OnceLock<HashMap<u32, Vec<u8>>>,
+    pub random_spans: OnceLock<HashMap<u32, (u32, u32)>>,
     #[cfg(feature = "gpu")]
     pub gpu_gather: OnceLock<Arc<GpuGather>>,
 }
@@ -60,6 +61,20 @@ pub(super) fn run_fixed<const K: u8>(executor: &Executor<'_>, group: &Group) -> 
     } else {
         tuned_chunk(executor, kind)
     };
+    if K == 17 && group.count >= 512 && random_spans_enabled() {
+        if let Some(&(source, destination)) =
+            random_spans(executor.program).get(&group.targets_offset)
+        {
+            return (0..group.count.div_ceil(chunk))
+                .into_par_iter()
+                .try_for_each(|c| {
+                    let start = c * chunk;
+                    let end = ((c + 1) * chunk).min(group.count);
+                    let _profile = executor.profile.kind(K, end - start);
+                    executor.step_random_span(source, destination, start, end)
+                });
+        }
+    }
     if K == 1 && executor.program.runtime.config.simplify_arithmetic {
         return (0..group.count.div_ceil(chunk))
             .into_par_iter()
@@ -129,6 +144,49 @@ pub(super) fn run_fixed<const K: u8>(executor: &Executor<'_>, group: &Group) -> 
             }
             Ok(())
         })
+}
+
+#[cfg(feature = "witness-benchmarks")]
+static RANDOM_SPANS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+#[cfg(feature = "witness-benchmarks")]
+pub(crate) fn benchmark_random_spans(enabled: bool) {
+    RANDOM_SPANS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+fn random_spans_enabled() -> bool {
+    #[cfg(feature = "witness-benchmarks")]
+    {
+        RANDOM_SPANS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(feature = "witness-benchmarks"))]
+    true
+}
+fn random_spans(p: &RegionProgram) -> &HashMap<u32, (u32, u32)> {
+    let fast = p.fast.get().expect("certified plan");
+    fast.random_spans.get_or_init(|| {
+        let mut spans = HashMap::new();
+        let mut eligible = 0u64;
+        for group in p.groups.iter().flatten().filter(|g| g.kind == Kind::RandomValue && g.count >= 512) {
+            let co = group.coefficients_offset().expect("random coefficient storage") as usize;
+            let Some(coefficients) = p.coefficients.get(co..).and_then(|s| s.get(..group.count as usize)) else {
+                continue;
+            };
+            let targets = &p.targets[group.targets_offset as usize..][..group.count as usize];
+            let source = coefficients[0];
+            let destination = targets[0];
+            if source + group.count as u64 <= p.random_count as u64
+                && targets.iter().enumerate().all(|(i, &slot)| {
+                    slot as u64 == destination as u64 + i as u64
+                        && fast.single[slot as usize] != 0
+                        && coefficients[i] == source + i as u64
+                })
+            {
+                spans.insert(group.targets_offset, (source as u32, destination));
+                eligible += group.count as u64;
+            }
+        }
+        log::debug!(target: super::COMPILE_LOG, "contiguous random copies: {eligible}/{}", p.random_count);
+        spans
+    })
 }
 
 fn tuned_chunk(e: &Executor<'_>, kind: Kind) -> u32 {
@@ -419,6 +477,7 @@ pub(super) fn certify(p: &RegionProgram) -> Result<FastLayout> {
         single: single.into(),
         poseidon: Default::default(),
         adaptive: Default::default(),
+        random_spans: Default::default(),
         #[cfg(feature = "gpu")]
         gpu_gather: Default::default(),
     })
@@ -592,6 +651,7 @@ pub(super) fn prepare(p: &RegionProgram) -> Result<()> {
     }
     if fast_enabled(p) {
         let _ = poseidon_bases(p);
+        let _ = random_spans(p);
         generated::prepare(p);
     }
     Ok(())

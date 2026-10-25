@@ -929,3 +929,9 @@ pub fn benchmark_input_binding(direct: bool) {
 pub fn benchmark_buffer_reuse(enabled: bool) {
     region::buffers::benchmark_override(enabled);
 }
+
+#[doc(hidden)]
+#[cfg(feature = "witness-benchmarks")]
+pub fn benchmark_random_spans(enabled: bool) {
+    region::aot::benchmark_random_spans(enabled);
+}

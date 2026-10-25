@@ -357,3 +357,14 @@ All 26 witness-program tests passed for the compact decoder, including damaged b
 A new opt-in `witness-benchmarks` feature contains snapshot export, replay, and process-wide profiling/input/buffer/Poseidon comparison controls. Ordinary application builds no longer read the snapshot/export or input-comparison environment variables, nor load benchmark override atomics in execution dispatch. Internal region structures are crate-private; the supported configuration, lifecycle and worklist-comparison APIs remain public. The profiling CLI explicitly enables development tooling. Disabled profiling guards retain their explicit-drop interface with no work.
 
 All 27 witness-program tests passed in a normal build, and the separate profiling/replay CLI compiled with both development features enabled. This cleanup defines the supported consumer surface and keeps experiment controls out of application execution.
+
+
+## Automatically copy contiguous random-padding spans
+
+Preparation now recognizes random-value groups whose source indices and exclusive output slots are both contiguous. For groups of at least 512 values, execution checks canonical words in a slice and copies them to the certified atomic output range. It preserves the existing chunk schedule, random-value validation, error cleanup and checked fallback. Irregular or small groups retain the normal kernel. No circuit-specific settings or generated Rust are needed. MainPod's 741,181 random outputs are all eligible.
+
+The initial three paired exact-state replay processes measured MainPod execution reductions of 3.2%, 5.1% and 6.5%; padding-heavy empty and mixed fixtures improved more, while the 131-random-value graph fixtures changed little. Two further replay processes with the small-group cutoff confirmed MainPod gains and checked all eight fixtures exactly. In total, 2,816 optimized/control replay executions were compared slot-for-slot against the checked executor.
+
+Four 40-proof Metal processes alternated controls in ABBA order, discarded eight warm-up proofs each, and verified all 160 MainPod proofs. Paired median execution reductions were 3.1%, 3.6%, 9.8% and 2.2%; full-witness reductions were 0.7%, 6.1%, 3.6% and 3.4%. Total proof medians varied from about 0.9% slower to 1.5% faster, so no reliable total-proof percentage is claimed. All 28 witness tests passed. A focused 1,024-random-output test compares checked/optimized state, exercises irregular random ordering, and requires both paths to reject noncanonical words.
+
+**Decision:** retain the automatic span kernel with the small-group cutoff. Source lookup and metadata validation are bounded at preparation; it adds no per-circuit build work. The benchmark control and paired replay flag are available only with `witness-benchmarks`. Raw data are `random-span-*` in the completion campaign artifacts.
