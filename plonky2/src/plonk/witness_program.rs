@@ -88,10 +88,19 @@ pub enum WitnessProgramStatus {
     Unsupported,
 }
 
+/// Validation belongs to an immutable circuit and its current preparation epoch.
+/// A weak handle avoids keeping circuit resources alive through program handles.
+#[derive(Clone)]
+pub(crate) struct ProgramOrigin {
+    slot: std::sync::Weak<std::sync::Mutex<()>>,
+    generation: u64,
+}
+
 /// A compiled witness program for one circuit and one set of input targets.
 /// Cheap to clone; clones share the compiled program.
 #[derive(Clone)]
 pub struct WitnessProgram {
+    origin: ProgramOrigin,
     program: Arc<RegionProgram>,
     key: Arc<PlanKey>,
 }
@@ -303,6 +312,7 @@ fn compile_with_identity<
             .map_err(|e| WitnessProgramError::Invalid(format!("export: {e:#}")))?;
     }
     Ok(WitnessProgram {
+        origin: prover.witness_program.origin(),
         program: Arc::new(program),
         key: Arc::new(key),
     })
@@ -314,8 +324,25 @@ pub(crate) fn install<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, 
     common: &CommonCircuitData<F, D>,
     program: WitnessProgram,
 ) -> Result<(), WitnessProgramError> {
+    let _preparation = prover.witness_program.preparation_guard();
+    install_inner(prover, common, program)
+}
+
+fn install_inner<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
+    prover: &ProverOnlyCircuitData<F, C, D>,
+    common: &CommonCircuitData<F, D>,
+    program: WitnessProgram,
+) -> Result<(), WitnessProgramError> {
+    if !WitnessOperation::field_supported::<F>() {
+        return Err(WitnessProgramError::UnsupportedField);
+    }
     if !same_circuit(&program.key, prover) {
         return Err(WitnessProgramError::WrongCircuit);
+    }
+    if !prover.witness_program.has_origin(&program.origin)
+        && plan_bytes::operation_digest(&prover.generators) != program.key.operations
+    {
+        return Err(WitnessProgramError::ChangedOperations);
     }
     program
         .program
@@ -355,6 +382,7 @@ pub(crate) fn installed<
     let operations = operations.unwrap_or_else(|| plan_bytes::operation_digest(&prover.generators));
     let compilation = program.runtime.config.compilation_key();
     Some(WitnessProgram {
+        origin: prover.witness_program.origin(),
         program,
         key: Arc::new(PlanKey {
             compilation,
@@ -367,6 +395,7 @@ pub(crate) fn installed<
 pub(crate) fn remove<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     prover: &ProverOnlyCircuitData<F, C, D>,
 ) {
+    let _preparation = prover.witness_program.preparation_guard();
     prover.witness_program.clear();
 }
 
@@ -423,6 +452,7 @@ fn from_bytes_with_identity<
         config.with_compilation_key(key.compilation)?,
     )?);
     Ok(WitnessProgram {
+        origin: prover.witness_program.origin(),
         program: Arc::new(program),
         key: Arc::new(key),
     })
@@ -484,7 +514,7 @@ pub(crate) fn prepare<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, 
         if program.config().cache == config.cache {
             let host = std::time::Instant::now();
             let configured = program.with_execution_config(config)?;
-            install(prover, common, configured.clone())?;
+            install_inner(prover, common, configured.clone())?;
             return Ok(WitnessPreparation {
                 source: WitnessProgramSource::Installed,
                 elapsed: start.elapsed(),
@@ -530,7 +560,7 @@ pub(crate) fn prepare<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, 
         outcome.source = WitnessProgramSource::Installed;
     }
     let host = std::time::Instant::now();
-    install(prover, common, outcome.program.clone())?;
+    install_inner(prover, common, outcome.program.clone())?;
     let host_prepare = host.elapsed();
     if let Some(warning) = &outcome.warning {
         log::warn!("{warning}; witness preparation succeeded in memory");
@@ -589,6 +619,7 @@ impl WitnessProgram {
         let mut program = (*self.program).clone();
         program.runtime = Arc::new(config::Runtime::new(config)?);
         Ok(Self {
+            origin: self.origin.clone(),
             program: Arc::new(program),
             key: self.key.clone(),
         })

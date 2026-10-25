@@ -368,3 +368,10 @@ The initial three paired exact-state replay processes measured MainPod execution
 Four 40-proof Metal processes alternated controls in ABBA order, discarded eight warm-up proofs each, and verified all 160 MainPod proofs. Paired median execution reductions were 3.1%, 3.6%, 9.8% and 2.2%; full-witness reductions were 0.7%, 6.1%, 3.6% and 3.4%. Total proof medians varied from about 0.9% slower to 1.5% faster, so no reliable total-proof percentage is claimed. All 28 witness tests passed. A focused 1,024-random-output test compares checked/optimized state, exercises irregular random ordering, and requires both paths to reject noncanonical words.
 
 **Decision:** retain the automatic span kernel with the small-group cutoff. Source lookup and metadata validation are bounded at preparation; it adds no per-circuit build work. The benchmark control and paired replay flag are available only with `witness-benchmarks`. Raw data are `random-span-*` in the completion campaign artifacts.
+
+
+## Validate explicit installation across circuit owners
+
+Explicit installation now checks typed generator identity when a handle comes from an independent circuit or predates `remove_witness_program`. A circuit digest alone does not identify generator semantics. Same-circuit, current-lifecycle handles carry a weak validation token, so compiling/loading followed by installation, or resource reconfiguration, does not introduce another generator scan. The token retains no circuit resources. Removal invalidates old tokens, and public install/remove operations use the same preparation lock as cache-aware preparation.
+
+All 28 witness tests passed, including concurrent preparation and proofs. The application-generator test now also rejects direct installation across identical circuit digests with changed generator values; checks that same-origin and reconfigured handles cause zero descriptor calls; and rejects a stale handle after removal and a generator change. This closes an API compatibility gap without adding steady-state witness work.

@@ -165,7 +165,11 @@ pub struct RegionProgram {
 /// key because it determines boundary roots and writer ownership. Clones
 /// share the slot.
 #[derive(Clone, Debug)]
-pub struct ProgramCache(Arc<Mutex<CacheState>>, Arc<Mutex<()>>);
+pub struct ProgramCache(
+    Arc<Mutex<CacheState>>,
+    Arc<Mutex<()>>,
+    Arc<std::sync::atomic::AtomicU64>,
+);
 
 #[derive(Debug)]
 struct CachedProgram {
@@ -201,6 +205,7 @@ impl Default for ProgramCache {
         Self(
             Arc::new(Mutex::new(CacheState::default())),
             Arc::new(Mutex::new(())),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
         )
     }
 }
@@ -213,6 +218,17 @@ impl PartialEq for ProgramCache {
 impl Eq for ProgramCache {}
 
 impl ProgramCache {
+    pub(crate) fn origin(&self) -> super::ProgramOrigin {
+        super::ProgramOrigin {
+            slot: Arc::downgrade(&self.1),
+            generation: self.2.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+    pub(crate) fn has_origin(&self, origin: &super::ProgramOrigin) -> bool {
+        origin.slot.as_ptr() == Arc::as_ptr(&self.1)
+            && origin.generation == self.2.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(crate) fn preparation_guard(&self) -> std::sync::MutexGuard<'_, ()> {
         self.1.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -275,6 +291,7 @@ impl ProgramCache {
     /// Empties the slot.
     pub(crate) fn clear(&self) {
         let mut cached = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        self.2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         cached.program = None;
         cached.warned_mismatch = false;
         cached.unsupported = None;
@@ -313,6 +330,7 @@ impl ProgramCache {
         let p = cached.program.as_ref()?;
         (p.generators == generators).then_some(())?;
         Some(super::WitnessProgram {
+            origin: self.origin(),
             program: p.program.clone(),
             key: p.key.as_ref()?.clone(),
         })

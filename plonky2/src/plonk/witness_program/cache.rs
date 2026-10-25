@@ -300,6 +300,8 @@ mod tests {
         }
         data.verify(data.prove(pw).unwrap()).unwrap();
     }
+    static APPLICATION_DESCRIPTIONS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
     #[derive(Clone, Debug)]
     struct ApplicationValue {
         target: Target,
@@ -313,6 +315,7 @@ mod tests {
             Vec::new()
         }
         fn witness_operation(&self) -> Option<crate::iop::generator::WitnessOperation> {
+            APPLICATION_DESCRIPTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Some(crate::iop::generator::WitnessOperation::Constant {
                 output: self.target,
                 value: self.value.to_canonical_u64(),
@@ -367,6 +370,42 @@ mod tests {
         let dir = Directory::new();
         let first = original
             .prepare_witness_program_with_config(&[], dir.config())
+            .unwrap();
+        use std::sync::atomic::Ordering::Relaxed;
+        APPLICATION_DESCRIPTIONS.store(0, Relaxed);
+        original
+            .install_witness_program(first.program().clone())
+            .unwrap();
+        original
+            .install_witness_program(
+                first
+                    .program()
+                    .with_execution_config(WitnessConfig::default())
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            APPLICATION_DESCRIPTIONS.load(Relaxed),
+            0,
+            "same-origin handles must not rescan generators"
+        );
+        assert_eq!(
+            changed
+                .install_witness_program(first.program().clone())
+                .unwrap_err(),
+            WitnessProgramError::ChangedOperations
+        );
+        assert!(APPLICATION_DESCRIPTIONS.load(Relaxed) > 0);
+        let mut edited = make(7);
+        let old = edited.compile_witness_program(&[]).unwrap();
+        edited.remove_witness_program();
+        edited.prover_only.generators = changed.prover_only.generators.clone();
+        assert_eq!(
+            edited.install_witness_program(old).unwrap_err(),
+            WitnessProgramError::ChangedOperations
+        );
+        original
+            .install_witness_program(first.program().clone())
             .unwrap();
         assert_eq!(
             changed
