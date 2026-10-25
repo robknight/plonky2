@@ -165,7 +165,7 @@ pub struct RegionProgram {
 /// key because it determines boundary roots and writer ownership. Clones
 /// share the slot.
 #[derive(Clone, Debug)]
-pub struct ProgramCache(Arc<Mutex<CacheState>>);
+pub struct ProgramCache(Arc<Mutex<CacheState>>, Arc<Mutex<()>>);
 
 #[derive(Debug)]
 struct CachedProgram {
@@ -183,6 +183,7 @@ struct CacheState {
     // Only complete circuit programs are installed in this cache.
     program: Option<CachedProgram>,
     warned_mismatch: bool,
+    unsupported: Option<super::WitnessProgramError>,
 }
 
 /// What a proof's inputs find in the program slot.
@@ -197,7 +198,10 @@ pub(crate) enum Installed {
 
 impl Default for ProgramCache {
     fn default() -> Self {
-        Self(Arc::new(Mutex::new(CacheState::default())))
+        Self(
+            Arc::new(Mutex::new(CacheState::default())),
+            Arc::new(Mutex::new(())),
+        )
     }
 }
 
@@ -209,6 +213,41 @@ impl PartialEq for ProgramCache {
 impl Eq for ProgramCache {}
 
 impl ProgramCache {
+    pub(crate) fn preparation_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.1.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    pub(crate) fn unsupported(&self) -> Option<super::WitnessProgramError> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unsupported
+            .clone()
+    }
+    pub(crate) fn record_unsupported(&self, error: &super::WitnessProgramError) {
+        if matches!(
+            error,
+            super::WitnessProgramError::UnsupportedField
+                | super::WitnessProgramError::Lookups
+                | super::WitnessProgramError::UnsupportedGenerator { .. }
+        ) {
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).unsupported = Some(error.clone());
+            log::info!("compiled witness execution unavailable: {error}");
+        }
+    }
+    pub(crate) fn status(&self, generators: usize) -> super::WitnessProgramStatus {
+        let c = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if c.program
+            .as_ref()
+            .is_some_and(|p| p.generators == generators)
+        {
+            super::WitnessProgramStatus::Ready
+        } else if c.unsupported.is_some() {
+            super::WitnessProgramStatus::Unsupported
+        } else {
+            super::WitnessProgramStatus::Unprepared
+        }
+    }
+
     /// Installs a whole-circuit program for proofs whose inputs set exactly
     /// the representatives in `initial`, replacing any program in the slot.
     pub(crate) fn install_all(
@@ -230,6 +269,7 @@ impl ProgramCache {
             key: Some(key),
         });
         cached.warned_mismatch = false;
+        cached.unsupported = None;
     }
 
     /// Empties the slot.
@@ -237,6 +277,7 @@ impl ProgramCache {
         let mut cached = self.0.lock().unwrap_or_else(|e| e.into_inner());
         cached.program = None;
         cached.warned_mismatch = false;
+        cached.unsupported = None;
     }
 
     /// Whether the slot holds a whole-circuit program, without computing a

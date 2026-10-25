@@ -241,6 +241,58 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         )
     }
 
+    /// Prepare, cache and install an executor with process-default settings.
+    /// `PLONKY2_EXECUTOR_CACHE_DIR` enables persistent program caching. This
+    /// completes host lookup tables before returning; it does not generate a witness.
+    #[cfg(all(feature = "std", feature = "rand_chacha"))]
+    pub fn prepare_witness_program(
+        &self,
+        input_targets: &[crate::iop::target::Target],
+    ) -> core::result::Result<
+        crate::plonk::witness_program::WitnessPreparation,
+        crate::plonk::witness_program::WitnessProgramError,
+    > {
+        self.prepare_witness_program_with_config(
+            input_targets,
+            crate::plonk::witness_program::WitnessConfig::from_env()?,
+        )
+    }
+    /// Prepare with explicit settings, overriding process defaults.
+    #[cfg(all(feature = "std", feature = "rand_chacha"))]
+    pub fn prepare_witness_program_with_config(
+        &self,
+        input_targets: &[crate::iop::target::Target],
+        config: crate::plonk::witness_program::WitnessConfig,
+    ) -> core::result::Result<
+        crate::plonk::witness_program::WitnessPreparation,
+        crate::plonk::witness_program::WitnessProgramError,
+    > {
+        crate::plonk::witness_program::prepare(
+            &self.prover_only,
+            &self.common,
+            input_targets,
+            config,
+        )
+    }
+    /// Prepare for the same input targets; their values are not inspected.
+    #[cfg(all(feature = "std", feature = "rand_chacha"))]
+    pub fn prepare_witness_program_like(
+        &self,
+        inputs: &PartialWitness<F>,
+    ) -> core::result::Result<
+        crate::plonk::witness_program::WitnessPreparation,
+        crate::plonk::witness_program::WitnessProgramError,
+    > {
+        self.prepare_witness_program(&inputs.target_values.keys().copied().collect::<Vec<_>>())
+    }
+    /// Preparation status without copying a compiled program's metadata.
+    #[cfg(all(feature = "std", feature = "rand_chacha"))]
+    pub fn witness_program_status(&self) -> crate::plonk::witness_program::WitnessProgramStatus {
+        self.prover_only
+            .witness_program
+            .status(self.prover_only.generators.len())
+    }
+
     /// Whether a program is installed, without cloning its input metadata.
     #[cfg(all(feature = "std", feature = "rand_chacha"))]
     pub fn has_witness_program(&self) -> bool {
@@ -449,6 +501,58 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             input_targets,
             config,
         )
+    }
+
+    /// Prepare, cache and install an executor with process-default settings.
+    /// `PLONKY2_EXECUTOR_CACHE_DIR` enables persistent program caching. This
+    /// completes host lookup tables before returning; it does not generate a witness.
+    #[cfg(all(feature = "std", feature = "rand_chacha"))]
+    pub fn prepare_witness_program(
+        &self,
+        input_targets: &[crate::iop::target::Target],
+    ) -> core::result::Result<
+        crate::plonk::witness_program::WitnessPreparation,
+        crate::plonk::witness_program::WitnessProgramError,
+    > {
+        self.prepare_witness_program_with_config(
+            input_targets,
+            crate::plonk::witness_program::WitnessConfig::from_env()?,
+        )
+    }
+    /// Prepare with explicit settings, overriding process defaults.
+    #[cfg(all(feature = "std", feature = "rand_chacha"))]
+    pub fn prepare_witness_program_with_config(
+        &self,
+        input_targets: &[crate::iop::target::Target],
+        config: crate::plonk::witness_program::WitnessConfig,
+    ) -> core::result::Result<
+        crate::plonk::witness_program::WitnessPreparation,
+        crate::plonk::witness_program::WitnessProgramError,
+    > {
+        crate::plonk::witness_program::prepare(
+            &self.prover_only,
+            &self.common,
+            input_targets,
+            config,
+        )
+    }
+    /// Prepare for the same input targets; their values are not inspected.
+    #[cfg(all(feature = "std", feature = "rand_chacha"))]
+    pub fn prepare_witness_program_like(
+        &self,
+        inputs: &PartialWitness<F>,
+    ) -> core::result::Result<
+        crate::plonk::witness_program::WitnessPreparation,
+        crate::plonk::witness_program::WitnessProgramError,
+    > {
+        self.prepare_witness_program(&inputs.target_values.keys().copied().collect::<Vec<_>>())
+    }
+    /// Preparation status without copying a compiled program's metadata.
+    #[cfg(all(feature = "std", feature = "rand_chacha"))]
+    pub fn witness_program_status(&self) -> crate::plonk::witness_program::WitnessProgramStatus {
+        self.prover_only
+            .witness_program
+            .status(self.prover_only.generators.len())
     }
 
     /// Whether a program is installed, without cloning its input metadata.

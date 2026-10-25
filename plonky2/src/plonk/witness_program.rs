@@ -15,14 +15,16 @@
 //! without `gpu`; with `gpu` the executor gathers wires into a mapped staging
 //! buffer and uploads them when the GPU prover applies.
 //!
-//! Nothing here happens implicitly: [`CircuitData::prove`] never compiles,
-//! stores or loads a program. The caller compiles with
-//! [`CircuitData::compile_witness_program`], installs with
-//! [`CircuitData::install_witness_program`], and may keep the program across
-//! processes with [`WitnessProgram::to_bytes`] and
-//! [`CircuitData::witness_program_from_bytes`]. Stored programs are a
-//! trusted input, like serialized circuit data: a checksum detects damage,
-//! not tampering.
+//! Preparation is explicit: [`CircuitData::prove`] never compiles or loads a
+//! program. [`CircuitData::prepare_witness_program`] loads a compatible cached
+//! executor or compiles one, prepares its host tables, and installs it. Set
+//! `PLONKY2_EXECUTOR_CACHE_DIR` to enable persistent executor caching; without
+//! it preparation is in memory. Cache read/write failure is reported in
+//! [`WitnessPreparation`] and does not prevent in-memory execution.
+//!
+//! Advanced callers can separately compile, encode, decode and install a
+//! [`WitnessProgram`]. Stored programs are trusted input like serialized
+//! circuit data: their checksum detects damage, not deliberate tampering.
 //!
 //! A program applies to proofs whose
 //! [`PartialWitness`](crate::iop::witness::PartialWitness) sets targets in
@@ -32,6 +34,7 @@
 //! (see [`WitnessGenerator::witness_operation`]), cannot be compiled; check with
 //! [`CircuitData::witness_program_support`].
 //!
+//! [`CircuitData::prepare_witness_program`]: crate::plonk::circuit_data::CircuitData::prepare_witness_program
 //! [`CircuitData::prove`]: crate::plonk::circuit_data::CircuitData::prove
 //! [`CircuitData::compile_witness_program`]: crate::plonk::circuit_data::CircuitData::compile_witness_program
 //! [`CircuitData::install_witness_program`]: crate::plonk::circuit_data::CircuitData::install_witness_program
@@ -39,6 +42,8 @@
 //! [`CircuitData::witness_program_support`]: crate::plonk::circuit_data::CircuitData::witness_program_support
 //! [`WitnessGenerator::witness_operation`]: crate::iop::generator::WitnessGenerator::witness_operation
 
+mod cache;
+pub use cache::{WitnessPreparation, WitnessProgramSource};
 mod config;
 pub use config::{
     WitnessBuffers, WitnessCache, WitnessConfig, WitnessExecution, WitnessFallback, WitnessGather,
@@ -69,6 +74,19 @@ use crate::plonk::config::{GenericConfig, GenericHashOut};
 ///
 /// [`CircuitData::witness_program_from_bytes`]: crate::plonk::circuit_data::CircuitData::witness_program_from_bytes
 pub const FORMAT: u64 = plan_bytes::WITNESS_PROGRAM_FORMAT;
+
+/// Cheap preparation state for integrations that prepare on first use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WitnessProgramStatus {
+    /// No preparation has completed.
+    Unprepared,
+    /// A program is installed. Individual input shapes are still checked.
+    Ready,
+    /// This circuit has an unsupported field, lookup table or generator.
+    /// Removing the program clears this memoized result if a circuit is changed.
+    Unsupported,
+}
 
 /// A compiled witness program for one circuit and one set of input targets.
 /// Cheap to clone; clones share the compiled program.
@@ -223,6 +241,19 @@ pub(crate) fn compile_with_config<
     input_targets: &[Target],
     config: WitnessConfig,
 ) -> Result<WitnessProgram, WitnessProgramError> {
+    compile_with_identity(prover, common, input_targets, config, None)
+}
+fn compile_with_identity<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    prover: &ProverOnlyCircuitData<F, C, D>,
+    common: &CommonCircuitData<F, D>,
+    input_targets: &[Target],
+    config: WitnessConfig,
+    operations: Option<u128>,
+) -> Result<WitnessProgram, WitnessProgramError> {
     let runtime = Arc::new(config::Runtime::new(config)?);
     let started = std::time::Instant::now();
     support(prover, common)?;
@@ -253,7 +284,7 @@ pub(crate) fn compile_with_config<
         RegionProgram::compile_with_runtime(&prover.generators, &entry, &indices, runtime.clone())
             .map_err(|e| WitnessProgramError::Invalid(format!("{e:#}")))?;
     let started = std::time::Instant::now();
-    let operations = plan_bytes::operation_digest(&prover.generators);
+    let operations = operations.unwrap_or_else(|| plan_bytes::operation_digest(&prover.generators));
     log::debug!(target: COMPILE_LOG, "compile phase operation_digest {:?}", started.elapsed());
     let mut key = key(prover, mask, operations);
     key.compilation = runtime.config.compilation_key();
@@ -359,6 +390,21 @@ pub(crate) fn from_bytes_with_config<
     prover: &ProverOnlyCircuitData<F, C, D>,
     config: WitnessConfig,
 ) -> Result<WitnessProgram, WitnessProgramError> {
+    from_bytes_with_identity(bytes, prover, config, None)
+}
+fn from_bytes_with_identity<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    bytes: &[u8],
+    prover: &ProverOnlyCircuitData<F, C, D>,
+    config: WitnessConfig,
+    operations: Option<u128>,
+) -> Result<WitnessProgram, WitnessProgramError> {
+    if !WitnessOperation::field_supported::<F>() {
+        return Err(WitnessProgramError::UnsupportedField);
+    }
     let (key, mut program) =
         plan_bytes::decode(bytes).map_err(|e| WitnessProgramError::Invalid(e.to_string()))?;
     if !same_circuit(&key, prover) {
@@ -367,7 +413,9 @@ pub(crate) fn from_bytes_with_config<
     if key.format != plan_bytes::WITNESS_PROGRAM_FORMAT {
         return Err(WitnessProgramError::WrongFormat);
     }
-    if key.operations != plan_bytes::operation_digest(&prover.generators) {
+    if key.operations
+        != operations.unwrap_or_else(|| plan_bytes::operation_digest(&prover.generators))
+    {
         return Err(WitnessProgramError::ChangedOperations);
     }
     program.runtime = Arc::new(config::Runtime::new(
@@ -376,6 +424,125 @@ pub(crate) fn from_bytes_with_config<
     Ok(WitnessProgram {
         program: Arc::new(program),
         key: Arc::new(key),
+    })
+}
+
+pub(crate) fn prepare<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
+    prover: &ProverOnlyCircuitData<F, C, D>,
+    common: &CommonCircuitData<F, D>,
+    input_targets: &[Target],
+    mut config: WitnessConfig,
+) -> Result<WitnessPreparation, WitnessProgramError> {
+    let start = std::time::Instant::now();
+    config.validate()?;
+    let directory = cache::directory(&mut config);
+    let _preparation = prover.witness_program.preparation_guard();
+    if let Some(error) = prover.witness_program.unsupported() {
+        return Err(error);
+    }
+    let unsupported = if !WitnessOperation::field_supported::<F>() {
+        Some(WitnessProgramError::UnsupportedField)
+    } else if !common.luts.is_empty() || common.num_lookup_polys != 0 {
+        Some(WitnessProgramError::Lookups)
+    } else {
+        None
+    };
+    if let Some(error) = unsupported {
+        prover.witness_program.record_unsupported(&error);
+        return Err(error);
+    }
+    let mut mask = input_targets
+        .iter()
+        .map(|&t| {
+            prover
+                .representative_map
+                .get(t.index(common.config.num_wires, common.degree()))
+                .copied()
+                .ok_or(WitnessProgramError::InputOutsideCircuit(t))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    mask.sort_unstable();
+    mask.dedup();
+    let known = prover
+        .witness_program
+        .installed_program(prover.generators.len())
+        .filter(|p| p.key.mask == mask && p.key.compilation == config.compilation_key());
+    if let Some(program) = &known {
+        if program.config().same_settings(&config) {
+            return Ok(WitnessPreparation {
+                source: WitnessProgramSource::Installed,
+                elapsed: start.elapsed(),
+                cache_read: std::time::Duration::ZERO,
+                compile: std::time::Duration::ZERO,
+                cache_write: std::time::Duration::ZERO,
+                host_prepare: std::time::Duration::ZERO,
+                cache_warning: None,
+                program: program.clone(),
+            });
+        }
+        if program.config().cache == config.cache {
+            let host = std::time::Instant::now();
+            let configured = program.with_execution_config(config)?;
+            install(prover, common, configured.clone())?;
+            return Ok(WitnessPreparation {
+                source: WitnessProgramSource::Installed,
+                elapsed: start.elapsed(),
+                cache_read: std::time::Duration::ZERO,
+                compile: std::time::Duration::ZERO,
+                cache_write: std::time::Duration::ZERO,
+                host_prepare: host.elapsed(),
+                cache_warning: None,
+                program: configured,
+            });
+        }
+    }
+    let operations = known.as_ref().map_or_else(
+        || plan_bytes::operation_digest(&prover.generators),
+        |p| p.key.operations,
+    );
+    let mut expected = key(prover, mask, operations);
+    expected.compilation = config.compilation_key();
+    let reused = known.is_some();
+    let outcome = cache::obtain(
+        directory.as_deref(),
+        &expected,
+        |bytes| from_bytes_with_identity(bytes, prover, config.clone(), Some(operations)),
+        || match known {
+            Some(program) => program.with_execution_config(config.clone()),
+            None => compile_with_identity(
+                prover,
+                common,
+                input_targets,
+                config.clone(),
+                Some(operations),
+            ),
+        },
+    );
+    let mut outcome = match outcome {
+        Ok(o) => o,
+        Err(e) => {
+            prover.witness_program.record_unsupported(&e);
+            return Err(e);
+        }
+    };
+    if reused && outcome.source == WitnessProgramSource::Compiled {
+        outcome.source = WitnessProgramSource::Installed;
+    }
+    let host = std::time::Instant::now();
+    install(prover, common, outcome.program.clone())?;
+    let host_prepare = host.elapsed();
+    if let Some(warning) = &outcome.warning {
+        log::warn!("{warning}; witness preparation succeeded in memory");
+    }
+    Ok(WitnessPreparation {
+        source: outcome.source,
+        elapsed: start.elapsed(),
+        cache_read: outcome.read,
+        compile: outcome.compile,
+        cache_write: outcome.cache_write,
+        host_prepare,
+        cache_warning: outcome.warning,
+        program: outcome.program,
     })
 }
 
@@ -404,6 +571,11 @@ impl WitnessProgram {
     /// Effective configuration resolved when this program was compiled or loaded.
     pub fn config(&self) -> &WitnessConfig {
         &self.program.runtime.config
+    }
+
+    /// Whether all host execution tables have been initialized.
+    pub fn is_prepared(&self) -> bool {
+        self.program.is_prepared()
     }
 
     /// Reuses this program and its prepared tables with different resource or
@@ -706,6 +878,21 @@ mod tests {
         };
         assert!(id.contains("BaseSumGenerator"), "{id}");
         assert_eq!(data.compile_witness_program(&[]).unwrap_err(), error);
+        assert_eq!(
+            data.witness_program_status(),
+            WitnessProgramStatus::Unprepared
+        );
+        assert_eq!(data.prepare_witness_program(&[]).unwrap_err(), error);
+        assert_eq!(
+            data.witness_program_status(),
+            WitnessProgramStatus::Unsupported
+        );
+        assert_eq!(data.prepare_witness_program(&[]).unwrap_err(), error);
+        data.remove_witness_program();
+        assert_eq!(
+            data.witness_program_status(),
+            WitnessProgramStatus::Unprepared
+        );
         // The worklist can prove a circuit with an unsupported generator.
         let mut pw = PartialWitness::new();
         for (i, bit) in bits.iter().enumerate() {

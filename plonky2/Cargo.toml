@@ -117,3 +117,7 @@ rustdoc-args = ["--html-in-header", ".cargo/katex-header.html"]
 
 [lints]
 workspace = true
+
+[[example]]
+name = "witness_program"
+required-features = ["std", "rand_chacha"]

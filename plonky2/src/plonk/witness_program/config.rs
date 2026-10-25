@@ -299,6 +299,27 @@ impl WitnessConfig {
         }
         Ok(())
     }
+    pub(crate) fn same_settings(&self, other: &Self) -> bool {
+        #[cfg(feature = "parallel")]
+        let pool = self.thread_pool.as_ref().map(Arc::as_ptr)
+            == other.thread_pool.as_ref().map(Arc::as_ptr);
+        #[cfg(not(feature = "parallel"))]
+        let pool = true;
+        self.compilation_key() == other.compilation_key()
+            && self.execution == other.execution
+            && self.poseidon == other.poseidon
+            && self.fallback == other.fallback
+            && self.buffers == other.buffers
+            && self.gather == other.gather
+            && self.threads == other.threads
+            && pool
+            && self.cache == other.cache
+            && self.chunk_scale == other.chunk_scale
+            && self.simplify_arithmetic == other.simplify_arithmetic
+            && self.gather_columns == other.gather_columns
+            && self.gather_rows == other.gather_rows
+    }
+
     pub(crate) fn compilation_key(&self) -> u32 {
         self.layout.code() | (u32::from(self.chain_length) << 3)
     }
