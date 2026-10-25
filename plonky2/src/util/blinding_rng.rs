@@ -9,7 +9,7 @@ use rand::rngs::OsRng;
 use rand::{CryptoRng, RngCore};
 use zeroize::Zeroizing;
 
-use crate::field::types::Field;
+use crate::field::types::{Field, PrimeField64};
 
 /// Bridges rand 0.8's field sampler to RustCrypto's zeroizing ChaCha20 RNG.
 /// The dependency clears both the key/counter state and buffered output on
@@ -22,6 +22,19 @@ impl BlindingRng {
         // OS failure must stop proving, never produce predictable padding.
         OsRng.fill_bytes(&mut *seed);
         Self(chacha20::ChaCha20Rng::from_seed(*seed))
+    }
+}
+
+/// One independently OS-seeded, zeroizing RNG per witness work chunk. The
+/// direct sampler avoids a TLS/RefCell lookup for every field element while
+/// preserving the existing field sampler and seed lifetime.
+pub(crate) fn fill_field_words<F: PrimeField64>(words: &mut [u64]) {
+    let mut rng = BlindingRng::new();
+    fill_with_rng::<F>(&mut rng, words);
+}
+fn fill_with_rng<F: PrimeField64>(rng: &mut BlindingRng, words: &mut [u64]) {
+    for word in words {
+        *word = F::sample(rng).to_canonical_u64();
     }
 }
 
@@ -114,6 +127,20 @@ mod tests {
         }
         fn zeroizes<T: zeroize::ZeroizeOnDrop>() {}
         zeroizes::<chacha20::ChaCha20Rng>();
+    }
+
+    #[test]
+    fn direct_word_fill_preserves_the_reference_field_stream() {
+        for count in [0, 1, 127, 4096, 8193] {
+            let seed = [37; 32];
+            let mut rng = BlindingRng(chacha20::ChaCha20Rng::from_seed(seed));
+            let mut reference = <rand_chacha::ChaCha20Rng as rand::SeedableRng>::from_seed(seed);
+            let mut words = Zeroizing::new(vec![0; count]);
+            fill_with_rng::<F>(&mut rng, &mut words);
+            for &word in words.iter() {
+                assert_eq!(word, F::sample(&mut reference).to_canonical_u64());
+            }
+        }
     }
 
     fn idle() {

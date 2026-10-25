@@ -323,3 +323,12 @@ Consumer lifecycle, environment precedence, cache compatibility, fallback policy
 ## Application configuration validation
 
 `WitnessConfig::validate` is public so application/POD2 configuration can fail before threads or circuit preparation are started. Empty explicit cache directories and unsupported serial-build thread requests are rejected. `from_env` now resolves an absent cache directory to a definite disabled policy, allowing a consumer to capture process defaults once. Two focused tests passed, including precedence checks in a subprocess that does not mutate the parent test environment.
+
+
+## Direct chunk-local randomness sampling
+
+Witness padding now samples directly from one independently OS-seeded, zeroizing ChaCha20 RNG per work chunk. It uses the same field sampler and seed lifetime as before, removing the per-value thread-local/RefCell lookup and deferred boxed RNG. Reference-stream, nested-scope, cleanup and independent-job tests passed. No seed or deterministic-seeding interface is exposed.
+
+An alternating M4 microbenchmark over MainPod's 741,181 random values measured roughly 1.05 ms for the TLS path and 0.73 ms for direct field sampling. A raw bulk/rejection variant measured about 0.70 ms; its extra sampling implementation is not retained for that small additional gain. Three pairs of 16-proof Metal processes completed 96 verified MainPod proofs. After four warm-up proofs per process, the combined root-binding/sampling span improved in all three pairs. Execution and total-proof results varied substantially, so this experiment establishes reduced sampling overhead rather than a reliable total-proof percentage. The simple direct sampler is retained.
+
+The first sandboxed proof measurement could not enumerate Metal and used CPU proving; it was interrupted and retained under `sandbox-cpu-fallback/` as correctness evidence only. Headline M4 GPU comparisons run with native Metal access. POD2's adapter tests and its MainPod preparation/worklist-comparison test passed through the new public API. Local test dependency setup used the actual macOS SCIP binary after identifying Linux binaries in an existing build cache.

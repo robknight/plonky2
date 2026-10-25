@@ -1761,11 +1761,7 @@ const SAMPLE_CHUNK: usize = 4096;
 fn sample_random_values<F: PrimeField64>(count: usize) -> zeroize::Zeroizing<Vec<u64>> {
     let mut words = zeroize::Zeroizing::new(vec![0u64; count]);
     words.par_chunks_mut(SAMPLE_CHUNK).for_each(|chunk| {
-        crate::iop::generator::with_randomness(|| {
-            for word in chunk {
-                *word = crate::iop::generator::random_value::<F>().to_canonical_u64();
-            }
-        });
+        crate::util::blinding_rng::fill_field_words::<F>(chunk);
     });
     words
 }
