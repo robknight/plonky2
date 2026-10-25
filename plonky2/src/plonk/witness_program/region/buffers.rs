@@ -1,6 +1,8 @@
 //! Bounded reuse of already-wiped witness buffers. No values or readiness
 //! flags survive release, including executions that return an error.
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+#[cfg(any(test, feature = "witness-benchmarks"))]
+use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Mutex;
 
 use plonky2_maybe_rayon::*;
@@ -9,7 +11,9 @@ use zeroize::Zeroize;
 use super::super::WitnessBuffers;
 
 const LIMIT: usize = 64 * 1024 * 1024;
-static OVERRIDE: AtomicU8 = AtomicU8::new(255);
+#[cfg(feature = "witness-benchmarks")]
+static OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
+#[cfg(feature = "witness-benchmarks")]
 pub(crate) fn benchmark_override(enabled: bool) {
     OVERRIDE.store(u8::from(enabled), Ordering::Relaxed);
 }
@@ -96,12 +100,15 @@ impl Buffers {
         }
     }
     fn enabled(&self) -> bool {
+        #[cfg(feature = "witness-benchmarks")]
         match OVERRIDE.load(Ordering::Relaxed) {
-            255 => self.reuse,
-            0 => false,
-            _ => true,
+            0 => return false,
+            255 => {}
+            _ => return true,
         }
+        self.reuse
     }
+
     pub(super) fn acquire(&self, len: usize) -> (Vec<AtomicU64>, Vec<AtomicBool>) {
         if self.enabled() {
             if let Some(entry) = self

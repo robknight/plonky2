@@ -51,7 +51,7 @@ pub use config::{
 };
 
 #[doc(hidden)]
-pub mod region;
+pub(crate) mod region;
 
 use std::fmt;
 use std::sync::Arc;
@@ -288,6 +288,7 @@ fn compile_with_identity<
     log::debug!(target: COMPILE_LOG, "compile phase operation_digest {:?}", started.elapsed());
     let mut key = key(prover, mask, operations);
     key.compilation = runtime.config.compilation_key();
+    #[cfg(feature = "witness-benchmarks")]
     if let Some(directory) = std::env::var_os("P2_AOT_EXPORT_DIR") {
         std::fs::create_dir_all(&directory)
             .and_then(|_| {
@@ -903,24 +904,28 @@ mod tests {
 }
 
 #[doc(hidden)]
+#[cfg(feature = "witness-benchmarks")]
 pub fn replay_snapshot(stem: &std::path::Path, iterations: usize) -> anyhow::Result<()> {
     region::cpu::replay_snapshot(stem, iterations)
 }
 
 /// Benchmark-only control. Change only between proofs, with no executions active.
 #[doc(hidden)]
+#[cfg(feature = "witness-benchmarks")]
 pub fn benchmark_profile(active: bool) {
     region::benchmark_profile(active);
 }
 
 /// Benchmark-only input binding control. Change only between serial proofs.
 #[doc(hidden)]
+#[cfg(feature = "witness-benchmarks")]
 pub fn benchmark_input_binding(direct: bool) {
     region::cpu::benchmark_input_binding(direct);
 }
 
 /// Benchmark-only buffer reuse control. Change only between serial proofs.
 #[doc(hidden)]
+#[cfg(feature = "witness-benchmarks")]
 pub fn benchmark_buffer_reuse(enabled: bool) {
     region::buffers::benchmark_override(enabled);
 }

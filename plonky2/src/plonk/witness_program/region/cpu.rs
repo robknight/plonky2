@@ -36,17 +36,25 @@ use crate::plonk::config::GenericConfig;
 
 type Q = QuinticExtension<G>;
 
+#[cfg(feature = "witness-benchmarks")]
 static INPUT_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
+#[cfg(feature = "witness-benchmarks")]
 pub(crate) fn benchmark_input_binding(direct: bool) {
     INPUT_OVERRIDE.store(u8::from(direct), Ordering::Relaxed);
 }
 fn direct_binding() -> bool {
-    let mode = INPUT_OVERRIDE.load(Ordering::Relaxed);
-    if mode != 255 {
-        return mode != 0;
+    #[cfg(feature = "witness-benchmarks")]
+    {
+        let mode = INPUT_OVERRIDE.load(Ordering::Relaxed);
+        if mode != 255 {
+            return mode != 0;
+        }
+        static MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        return *MODE
+            .get_or_init(|| std::env::var("P2_WITNESS_INPUT_BINDING").as_deref() != Ok("legacy"));
     }
-    static MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| std::env::var("P2_WITNESS_INPUT_BINDING").as_deref() != Ok("legacy"))
+    #[cfg(not(feature = "witness-benchmarks"))]
+    true
 }
 
 impl RegionProgram {
@@ -1780,7 +1788,6 @@ pub struct CpuExecutorReport {
     pub execute: Duration,
     pub merge: Duration,
     pub gather: Duration,
-    pub worklist: Duration,
     /// "installed" for a program the caller installed; diagnostics that
     /// compile their own program report "cached".
     pub plan: &'static str,
@@ -2052,6 +2059,7 @@ pub(crate) fn generate_wires_with<
     };
     report.sample = started.elapsed();
     drop(random_sampling);
+    #[cfg(feature = "witness-benchmarks")]
     if let Some(directory) = std::env::var_os("P2_AOT_SNAPSHOT_DIR") {
         static SAVED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
             std::sync::OnceLock::new();
@@ -2252,7 +2260,6 @@ pub(crate) fn generate_with_report<
             execute,
             merge: started.elapsed(),
             gather: Duration::ZERO,
-            worklist: Duration::ZERO,
             mode: "partition",
             plan: "cached",
             gather_mode: "none",
@@ -2292,9 +2299,7 @@ pub fn check_against_worklist<
     prover: &ProverOnlyCircuitData<F, C, D>,
     common: &CommonCircuitData<F, D>,
 ) -> Result<CpuExecutorReport> {
-    let started = Instant::now();
     let worklist = crate::iop::generator::generate_partial_witness(inputs.clone(), prover, common)?;
-    let worklist_time = started.elapsed();
     let entry = crate::iop::generator::initial_witness(inputs, prover, common)?;
     let started = Instant::now();
     let (program, cached) =
@@ -2386,7 +2391,6 @@ pub fn check_against_worklist<
         execute,
         merge: Duration::ZERO,
         gather: wires_report.gather,
-        worklist: worklist_time,
         mode: wires_report.mode,
         plan: wires_report.plan,
         gather_mode: wires_report.gather_mode,
@@ -2735,6 +2739,7 @@ pub(crate) mod tests {
 
 /// Replays locally generated benchmark fixtures, excluding decode and input I/O.
 /// Both executors use the identical slot topology, inputs, and randomness.
+#[cfg(feature = "witness-benchmarks")]
 pub(crate) fn replay_snapshot(stem: &std::path::Path, iterations: usize) -> Result<()> {
     let started = Instant::now();
     let (key, program) = super::plan_bytes::decode(&std::fs::read(stem.with_extension("p2w"))?)?;

@@ -75,3 +75,8 @@ The explicit `compile_witness_program`, `WitnessProgram::to_bytes`, `witness_pro
 `WitnessPreparation` reports source, total elapsed time, cache reading, compilation, writing, host preparation and any nonfatal cache warning. Total elapsed time also includes identity calculation and synchronization. GPU device/context creation and prover-wide shader warm-up belong to the GPU prover lifecycle and should be measured separately. Report preparation, first proof, warm witness generation and total proof time separately; moving work into preparation does not make it disappear.
 
 `tools/witness-profile` documents optional diagnostic attribution. Use ordinary builds for performance claims. The experiment history and retained/rejected candidates are in `docs/witness-executor-experiments.md`.
+
+Development tooling uses a separate `witness-benchmarks` feature. Snapshot
+export, replay and process-wide comparison overrides are unavailable in normal
+application builds; see `tools/witness-profile/README.md`. Consumer code uses
+`WitnessConfig` and preparation methods rather than internal region structures.

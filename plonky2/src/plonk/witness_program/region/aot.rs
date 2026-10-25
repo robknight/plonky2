@@ -24,12 +24,14 @@ pub(super) struct FastLayout {
     pub gpu_gather: OnceLock<Arc<GpuGather>>,
 }
 
+#[cfg(feature = "witness-benchmarks")]
 pub(crate) fn layout() -> u8 {
     super::super::WitnessConfig::from_env()
         .unwrap_or_default()
         .compilation_key() as u8
 }
 
+#[cfg(feature = "witness-benchmarks")]
 pub(crate) fn file_stem(digest: &[u8]) -> String {
     let hex = digest
         .iter()
@@ -774,10 +776,13 @@ fn gather(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups)
 }
 
 fn poseidon_mode(e: &Executor<'_>) -> u8 {
-    let override_mode =
-        crate::hash::poseidon_trace_simd::BENCH_MODE.load(std::sync::atomic::Ordering::Relaxed);
-    if override_mode != 255 {
-        return override_mode;
+    #[cfg(feature = "witness-benchmarks")]
+    {
+        let override_mode =
+            crate::hash::poseidon_trace_simd::BENCH_MODE.load(std::sync::atomic::Ordering::Relaxed);
+        if override_mode != 255 {
+            return override_mode;
+        }
     }
     if e.program.runtime.config.poseidon == super::super::WitnessPoseidon::Auto
         && crate::hash::poseidon_trace_simd::NATIVE

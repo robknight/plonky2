@@ -28,12 +28,16 @@ cargo +nightly run --release --manifest-path tools/witness-profile/Cargo.toml \
   -- /path/to/circuit_snapshot 24
 ```
 
-The stem identifies `.p2w`, `.roots`, and `.random` files. A prover using an
-installed program can export them with `P2_AOT_SNAPSHOT_DIR=/path/to/output`.
+The stem identifies `.p2w`, `.roots`, and `.random` files. Enable the development-only `witness-benchmarks` feature in the prover to
+export an installed program with `P2_AOT_SNAPSHOT_DIR=/path/to/output`.
 Replay checks every state slot against the checked executor after each run.
 Its execute timer excludes decode, input I/O, comparison, and state wiping;
 wiping has a separate diagnostic span. Replay does not measure live input
 binding, sampling, or GPU proving.
+
+Snapshot/export environment variables and process-wide benchmark overrides are
+compiled only with `witness-benchmarks`; ordinary applications ignore them.
+The replay CLI enables this feature itself.
 
 For same-process instrumented controls, `benchmark_profile(bool)` changes
 profiling between proofs. Call it only while no witness execution is active.

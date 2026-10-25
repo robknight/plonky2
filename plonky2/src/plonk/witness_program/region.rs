@@ -1084,6 +1084,7 @@ impl RegionProgram {
     }
 }
 
+#[cfg(feature = "witness-benchmarks")]
 pub(super) fn benchmark_profile(active: bool) {
     profile::benchmark_override(active);
 }

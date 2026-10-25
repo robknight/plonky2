@@ -350,3 +350,10 @@ MainPod comparisons each decoded a real executor 20 times, discarded four warm-u
 **Rejected:** fixed-width little-endian arrays. The prototype passed all 26 witness-program tests and verified MainPod, and reduced decode-only time to 48.2 ms. However, its program grew from 18.76 MB to 84.10 MB. With file I/O it measured 57.9 ms read-to-decoded and 108.4 ms read-to-ready, slower than the final compact candidate. Serialization measured 31.8 ms versus 17.0 ms for compact; writing measured 25.6 ms versus 4.1 ms. Thus it loses the speed/generation tradeoff as well as consuming more disk space. Its implementation remains only in the campaign artifacts.
 
 All 26 witness-program tests passed for the compact decoder, including damaged bytes, malformed plans, operation changes, proof generation, cache repair and concurrent preparation. A focused checksum test additionally checks chunk boundaries, length changes and independence from thread count. Benchmark sources, logs and summaries are in `witness-completion-2026-10-25/startup-*`.
+
+
+## Separate consumer APIs from development overrides
+
+A new opt-in `witness-benchmarks` feature contains snapshot export, replay, and process-wide profiling/input/buffer/Poseidon comparison controls. Ordinary application builds no longer read the snapshot/export or input-comparison environment variables, nor load benchmark override atomics in execution dispatch. Internal region structures are crate-private; the supported configuration, lifecycle and worklist-comparison APIs remain public. The profiling CLI explicitly enables development tooling. Disabled profiling guards retain their explicit-drop interface with no work.
+
+All 27 witness-program tests passed in a normal build, and the separate profiling/replay CLI compiled with both development features enabled. This cleanup defines the supported consumer surface and keeps experiment controls out of application execution.

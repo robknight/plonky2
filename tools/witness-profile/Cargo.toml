@@ -8,4 +8,4 @@ publish = false
 
 [dependencies]
 anyhow = "1"
-plonky2 = { path = "../../plonky2", features = ["witness-profiling"] }
+plonky2 = { path = "../../plonky2", features = ["witness-profiling", "witness-benchmarks"] }

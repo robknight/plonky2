@@ -27,15 +27,20 @@ mod enabled {
 
     use super::{Poseidon, Stage};
 
+    #[cfg(feature = "witness-benchmarks")]
     static OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+    #[cfg(feature = "witness-benchmarks")]
     pub(crate) fn benchmark_override(active: bool) {
         OVERRIDE.store(i8::from(active), Ordering::Relaxed);
     }
 
     pub(super) fn enabled() -> bool {
-        let mode = OVERRIDE.load(Ordering::Relaxed);
-        if mode >= 0 {
-            return mode != 0;
+        #[cfg(feature = "witness-benchmarks")]
+        {
+            let mode = OVERRIDE.load(Ordering::Relaxed);
+            if mode >= 0 {
+                return mode != 0;
+            }
         }
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var("P2_WITNESS_PROFILE").as_deref() == Ok("1"))
@@ -175,8 +180,10 @@ mod enabled {
     }
 }
 
+#[cfg(all(feature = "witness-profiling", feature = "witness-benchmarks"))]
+pub(super) use enabled::benchmark_override;
 #[cfg(feature = "witness-profiling")]
-pub(super) use enabled::{benchmark_override, Execution, Pipeline};
+pub(super) use enabled::{Execution, Pipeline};
 
 #[cfg(not(feature = "witness-profiling"))]
 pub(super) struct Execution;
@@ -217,5 +224,15 @@ impl Pipeline {
     }
 }
 
-#[cfg(not(feature = "witness-profiling"))]
+#[cfg(all(not(feature = "witness-profiling"), feature = "witness-benchmarks"))]
 pub(super) fn benchmark_override(_: bool) {}
+
+// Match the enabled guards' explicit-drop API while compiling to no work.
+#[cfg(not(feature = "witness-profiling"))]
+impl Drop for Span {
+    fn drop(&mut self) {}
+}
+#[cfg(not(feature = "witness-profiling"))]
+impl Drop for Pipeline {
+    fn drop(&mut self) {}
+}
