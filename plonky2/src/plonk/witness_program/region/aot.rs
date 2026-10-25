@@ -824,25 +824,29 @@ fn gather(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups)
     });
     let state_bytes = e.state.len() * 8;
     let staging = ctx.upload_staging(state_bytes as u64);
-    e.state
-        .par_chunks(16384)
-        .enumerate()
-        .for_each(|(block, state)| {
-            let begin = block * 16384 * 8;
-            let mut view = staging
-                .buffer
-                .slice(begin as u64..(begin + state.len() * 8) as u64)
-                .get_mapped_range_mut()
-                .expect("state upload mapping");
-            let (words, _) = view.slice(..).into_chunks::<8>();
-            for (word, value) in words.into_iter().zip(state) {
-                word.write(
-                    value
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .to_le_bytes(),
-                );
-            }
-        });
+    e.program.runtime.run(|| {
+        #[cfg(test)]
+        e.program.runtime.assert_active_pool();
+        e.state
+            .par_chunks(16384)
+            .enumerate()
+            .for_each(|(block, state)| {
+                let begin = block * 16384 * 8;
+                let mut view = staging
+                    .buffer
+                    .slice(begin as u64..(begin + state.len() * 8) as u64)
+                    .get_mapped_range_mut()
+                    .expect("state upload mapping");
+                let (words, _) = view.slice(..).into_chunks::<8>();
+                for (word, value) in words.into_iter().zip(state) {
+                    word.write(
+                        value
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            .to_le_bytes(),
+                    );
+                }
+            });
+    });
     let state = ctx.storage("compact witness state", state_bytes as u64);
     ctx.finish_upload(staging, &state, state_bytes as u64);
     let out = ctx.storage("GPU gathered proving wires", (slots.len() * 8) as u64);

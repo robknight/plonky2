@@ -2852,12 +2852,17 @@ pub(crate) mod tests {
                 .flatten()
                 .map(|v| v.to_canonical_u64())
                 .collect::<Vec<_>>();
-            for (columns, rows) in [(2, 1024), (16, 256), (7, 123)] {
+            for (gather, columns, rows) in [
+                (WitnessGather::Cpu, 2, 1024),
+                (WitnessGather::Cpu, 16, 256),
+                (WitnessGather::Cpu, 7, 123),
+                (WitnessGather::Gpu, 16, 256),
+            ] {
                 let mut config = program.config().clone();
-                config.gather = WitnessGather::Cpu;
+                config.gather = gather;
                 config.gather_columns = columns;
                 config.gather_rows = rows;
-                if columns == 7 && cfg!(feature = "parallel") {
+                if (columns == 7 || gather == WitnessGather::Gpu) && cfg!(feature = "parallel") {
                     config.threads = 2;
                 }
                 data.install_witness_program(program.with_execution_config(config).unwrap())
@@ -2871,7 +2876,14 @@ pub(crate) mod tests {
                 )
                 .unwrap()
                 .unwrap();
-                assert_eq!(report.gather_mode, "reused");
+                assert_eq!(
+                    report.gather_mode,
+                    if gather == WitnessGather::Gpu {
+                        "gpu"
+                    } else {
+                        "reused"
+                    }
+                );
                 let Wires::Resident(resident) = &wires else {
                     panic!("native resident wires required")
                 };

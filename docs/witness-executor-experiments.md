@@ -438,3 +438,8 @@ All 32 parallel witness tests passed, including a new variable-depth fork/join c
 ## Keep configured chunk endpoints bounded
 
 Layered, checked and dependency scheduling now compute a final chunk endpoint with saturating addition before clamping to the group count. The prior `(chunk_index + 1) * chunk_size` expression could wrap for a near-`u32::MAX` count and large tuning multiplier. A focused release test covers first/final chunks across small, half-range and maximum counts/sizes, comparing endpoints with wider arithmetic without allocating enormous circuits. Normal-size partitioning is unchanged; this is configuration correctness rather than a performance claim.
+
+
+## Honor CPU pools while staging explicit GPU gathering
+
+The optional GPU gather also packs compact state on the CPU. That packing now uses the configured execution pool, while GPU buffer allocation, mapping and submissions remain on the caller to preserve the backend's submission tracking. The native Metal wire-matrix test now covers both CPU and explicit GPU gathering at two circuit sizes, with two-thread pools for the irregular CPU tile and the GPU path. Every wire matched the worklist and all eight proofs verified. This closes the resource-scope audit without changing the recommended CPU gather policy.
