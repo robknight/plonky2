@@ -23,10 +23,10 @@ struct Storage {
     ready: Vec<AtomicBool>,
 }
 impl Storage {
-    fn fresh(len: usize) -> Self {
+    fn fresh(len: usize, ready_len: usize) -> Self {
         Self {
             state: (0..len).map(|_| AtomicU64::new(0)).collect(),
-            ready: (0..len).map(|_| AtomicBool::new(false)).collect(),
+            ready: (0..ready_len).map(|_| AtomicBool::new(false)).collect(),
         }
     }
     fn bytes(&self) -> usize {
@@ -57,11 +57,11 @@ impl Pool {
             limit,
         }
     }
-    fn take(&mut self, len: usize) -> Option<Storage> {
+    fn take(&mut self, len: usize, ready_len: usize) -> Option<Storage> {
         let index = self
             .entries
             .iter()
-            .position(|x| x.state.len() == len && x.ready.len() == len)?;
+            .position(|x| x.state.len() == len && x.ready.len() == ready_len)?;
         let entry = self.entries.remove(index);
         self.bytes -= entry.bytes();
         Some(entry)
@@ -109,18 +109,22 @@ impl Buffers {
         self.reuse
     }
 
-    pub(super) fn acquire(&self, len: usize) -> (Vec<AtomicU64>, Vec<AtomicBool>) {
+    pub(super) fn acquire(
+        &self,
+        len: usize,
+        ready_len: usize,
+    ) -> (Vec<AtomicU64>, Vec<AtomicBool>) {
         if self.enabled() {
             if let Some(entry) = self
                 .pool
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .take(len)
+                .take(len, ready_len)
             {
                 return (entry.state, entry.ready);
             }
         }
-        let entry = Storage::fresh(len);
+        let entry = Storage::fresh(len, ready_len);
         (entry.state, entry.ready)
     }
     pub(super) fn release(&self, state: Vec<AtomicU64>, ready: Vec<AtomicBool>) {
@@ -142,7 +146,7 @@ mod tests {
     use super::*;
     #[test]
     fn reused_buffers_have_no_values_or_readiness_and_have_one_owner() {
-        let entry = Storage::fresh(8);
+        let entry = Storage::fresh(8, 8);
         let pointer = entry.state.as_ptr();
         for v in &entry.state {
             v.store(0xdeadbeef, Ordering::Relaxed);
@@ -152,23 +156,24 @@ mod tests {
         }
         let mut pool = Pool::new(1024);
         assert!(pool.put(entry.scrub(true)));
-        assert!(pool.take(7).is_none());
-        let entry = pool.take(8).unwrap();
+        assert!(pool.take(7, 7).is_none());
+        assert!(pool.take(8, 0).is_none());
+        let entry = pool.take(8, 8).unwrap();
         assert_eq!(entry.state.as_ptr(), pointer);
-        assert!(pool.take(8).is_none());
+        assert!(pool.take(8, 8).is_none());
         assert!(entry.state.iter().all(|v| v.load(Ordering::Relaxed) == 0));
         assert!(entry.ready.iter().all(|r| !r.load(Ordering::Relaxed)));
     }
     #[test]
     fn retention_is_bounded_and_recent_sizes_can_replace_old_sizes() {
         let mut pool = Pool::new(27);
-        assert!(pool.put(Storage::fresh(3).scrub(true)));
-        assert!(!pool.put(Storage::fresh(4).scrub(true)));
+        assert!(pool.put(Storage::fresh(3, 3).scrub(true)));
+        assert!(!pool.put(Storage::fresh(4, 4).scrub(true)));
         assert_eq!(pool.bytes, 27);
-        assert!(pool.put(Storage::fresh(2).scrub(true)));
-        assert!(pool.take(3).is_none());
+        assert!(pool.put(Storage::fresh(2, 2).scrub(true)));
+        assert!(pool.take(3, 3).is_none());
         assert_eq!(pool.bytes, 18);
-        assert!(pool.take(2).is_some());
+        assert!(pool.take(2, 2).is_some());
         assert_eq!(pool.bytes, 0);
     }
 }

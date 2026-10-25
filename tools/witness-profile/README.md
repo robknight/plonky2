@@ -49,7 +49,7 @@ their input mask matches the full boundary-root set. Set
 
 `P2_WITNESS_BUFFERS=pool` enables bounded reuse of wiped witness buffers. The
 default uses fresh allocations. The pool retains at most 64 MiB of buffer
-capacity; MainPod uses about 35.5 MiB for one state/readiness pair. Values are
+capacity; MainPod uses about 31.5 MiB for one state/sparse-readiness pair. Values are
 wiped and readiness reset before retention. Profile allocation and wiping
 together with full witness calls: execution savings can be larger than the
 end-to-end improvement. `benchmark_buffer_reuse(bool)` is for serial paired

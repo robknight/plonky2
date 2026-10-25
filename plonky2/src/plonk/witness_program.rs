@@ -966,3 +966,9 @@ pub fn benchmark_buffer_reuse(enabled: bool) {
 pub fn benchmark_random_spans(enabled: bool) {
     region::aot::benchmark_random_spans(enabled);
 }
+
+#[doc(hidden)]
+#[cfg(feature = "witness-benchmarks")]
+pub fn benchmark_compact_readiness(enabled: bool) {
+    region::cpu::benchmark_compact_readiness(enabled);
+}

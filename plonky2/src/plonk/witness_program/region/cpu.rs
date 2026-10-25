@@ -57,6 +57,21 @@ fn direct_binding() -> bool {
     true
 }
 
+#[cfg(feature = "witness-benchmarks")]
+static COMPACT_READINESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+#[cfg(feature = "witness-benchmarks")]
+pub(crate) fn benchmark_compact_readiness(enabled: bool) {
+    COMPACT_READINESS.store(enabled, Ordering::Relaxed);
+}
+fn compact_readiness_enabled() -> bool {
+    #[cfg(feature = "witness-benchmarks")]
+    {
+        COMPACT_READINESS.load(Ordering::Relaxed)
+    }
+    #[cfg(not(feature = "witness-benchmarks"))]
+    true
+}
+
 impl RegionProgram {
     /// State slot written by each random value, indexed by the random index
     /// the program assigns. Slots below the representative count are
@@ -214,12 +229,22 @@ impl RegionProgram {
         };
         let profile = profile::Execution::new(self.state_slots);
         let allocation = profile.stage(Stage::Allocate);
-        let (state, ready) = self.runtime.buffers.acquire(self.state_slots as usize);
+        let compact_readiness =
+            fast.is_some_and(|f| f.sparse_ready.is_some()) && compact_readiness_enabled();
+        let (state, ready) = self.runtime.buffers.acquire(
+            self.state_slots as usize,
+            if compact_readiness {
+                fast.unwrap().sparse_ready.as_ref().unwrap().len()
+            } else {
+                self.state_slots as usize
+            },
+        );
         drop(allocation);
         let executor = Executor {
             profile,
             program: self,
             random: random_values,
+            compact_readiness,
             fast,
             state,
             ready,
@@ -228,7 +253,11 @@ impl RegionProgram {
         // The compiler places boundary roots at the start of canonical state.
         for (slot, &value) in root_values.iter().enumerate() {
             ensure!(value < G::ORDER, "boundary input {value} is not canonical");
-            executor.store(slot as u32, G::from_canonical_u64(value))?;
+            if compact_readiness {
+                executor.state[slot].store(value, Ordering::Relaxed);
+            } else {
+                executor.store(slot as u32, G::from_canonical_u64(value))?;
+            }
         }
         drop(seeding);
         let layers = executor.profile.stage(Stage::Layers);
@@ -298,15 +327,17 @@ impl RegionProgram {
         }
         drop(aliases);
         let readiness = executor.profile.stage(Stage::Ready);
-        // Every slot, canonical or alias, must have been written: a plan
-        // that omits a writer (for example a blinding value) is rejected
-        // here rather than gathered as zero.
-        ensure!(
+        // Certification covers all non-roots, roots were seeded above, and
+        // sparse flags cover every repeated non-root writer. Dense/checked
+        // execution retains its original complete slot check.
+        let complete = if compact_readiness {
+            executor.ready.par_iter().all(|r| r.load(Ordering::Relaxed))
+        } else {
             executor.ready.par_iter().enumerate().all(|(i, r)| {
                 executor.fast.is_some_and(|f| f.single[i] != 0) || r.load(Ordering::Relaxed)
-            }),
-            "a state slot was never written by the plan"
-        );
+            })
+        };
+        ensure!(complete, "a state slot was never written by the plan");
         drop(readiness);
         Ok(executor)
     }
@@ -318,6 +349,7 @@ pub(super) struct Executor<'a> {
     random: &'a [u64],
     pub(super) state: Vec<AtomicU64>,
     ready: Vec<AtomicBool>,
+    compact_readiness: bool,
     fast: Option<&'a super::aot::FastLayout>,
 }
 
@@ -496,7 +528,25 @@ impl Executor<'_> {
             self.state[slot].store(value, Ordering::Relaxed);
             return Ok(());
         }
-        if self.ready[slot].load(Ordering::Relaxed) {
+        if self.compact_readiness && slot < self.program.roots.len() {
+            ensure!(
+                self.state[slot].load(Ordering::Relaxed) == value,
+                "conflicting write to state slot {slot}"
+            );
+            return Ok(());
+        }
+        let flag = if self.compact_readiness {
+            self.fast
+                .unwrap()
+                .sparse_ready
+                .as_ref()
+                .unwrap()
+                .binary_search(&(slot as u32))
+                .map_err(|_| anyhow::anyhow!("uncertified repeated write to slot {slot}"))?
+        } else {
+            slot
+        };
+        if self.ready[flag].load(Ordering::Relaxed) {
             ensure!(
                 self.state[slot].load(Ordering::Relaxed) == value,
                 "conflicting write to state slot {slot}"
@@ -504,7 +554,7 @@ impl Executor<'_> {
             return Ok(());
         }
         self.state[slot].store(value, Ordering::Relaxed);
-        self.ready[slot].store(true, Ordering::Relaxed);
+        self.ready[flag].store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -2695,6 +2745,110 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn sparse_flags_preserve_repeated_output_agreement_and_failure_cleanup() {
+        let mut config = crate::plonk::witness_program::WitnessConfig::default();
+        config.buffers = crate::plonk::witness_program::WitnessBuffers::Reuse { max_bytes: 4096 };
+        let mut targets = vec![0, 1, 1];
+        targets.extend(2..128);
+        let program = RegionProgram {
+            groups: vec![vec![
+                super::super::Group {
+                    kind: Kind::BaseSplit,
+                    count: 1,
+                    targets_offset: 0,
+                    argument: Kind::BaseSplit.argument((2 << 8) | 1),
+                    inputs: 1,
+                    outputs: 2,
+                },
+                super::super::Group {
+                    kind: Kind::Constant,
+                    count: 126,
+                    targets_offset: 3,
+                    argument: Kind::Constant.argument(0),
+                    inputs: 0,
+                    outputs: 1,
+                },
+            ]],
+            targets: targets.into(),
+            coefficients: vec![0; 126].into(),
+            representatives: (0..128).collect::<Vec<_>>().into(),
+            roots: vec![0].into(),
+            random_count: 0,
+            alias_count: 0,
+            alias_pair_offset: 0,
+            state_slots: 128,
+            runtime: std::sync::Arc::new(
+                crate::plonk::witness_program::config::Runtime::new(config).unwrap(),
+            ),
+            fast: Default::default(),
+            rep_slots: Default::default(),
+            cell_slots: Default::default(),
+        };
+        for _ in 0..3 {
+            for checked in [false, true] {
+                assert!(program
+                    .execute_state_inner(&[1], &[], checked)
+                    .err()
+                    .expect("conflicting split outputs")
+                    .to_string()
+                    .contains("conflicting write"));
+                for root in [0, 3] {
+                    let actual = program.execute_state_inner(&[root], &[], checked).unwrap();
+                    assert_eq!(actual.state[1].load(Ordering::Relaxed), root & 1);
+                    assert_eq!(actual.ready.len(), if checked { 128 } else { 1 });
+                }
+            }
+        }
+        assert_eq!(
+            program.fast.get().unwrap().sparse_ready.as_deref(),
+            Some(&[1][..])
+        );
+    }
+
+    #[test]
+    fn flagless_execution_checks_seeded_outputs_and_reuses_both_buffer_shapes() {
+        let mut config = crate::plonk::witness_program::WitnessConfig::default();
+        config.buffers = crate::plonk::witness_program::WitnessBuffers::Reuse { max_bytes: 64 };
+        let program = RegionProgram {
+            groups: vec![vec![super::super::Group {
+                kind: Kind::Constant,
+                count: 1,
+                targets_offset: 0,
+                argument: Kind::Constant.argument(0),
+                inputs: 0,
+                outputs: 1,
+            }]],
+            targets: vec![0].into(),
+            coefficients: vec![5].into(),
+            representatives: vec![0].into(),
+            roots: vec![0].into(),
+            random_count: 0,
+            alias_count: 0,
+            alias_pair_offset: 0,
+            state_slots: 1,
+            runtime: std::sync::Arc::new(
+                crate::plonk::witness_program::config::Runtime::new(config).unwrap(),
+            ),
+            fast: Default::default(),
+            rep_slots: Default::default(),
+            cell_slots: Default::default(),
+        };
+        for _ in 0..3 {
+            for checked in [false, true] {
+                assert!(program
+                    .execute_state_inner(&[7], &[], checked)
+                    .err()
+                    .expect("conflicting seeded output")
+                    .to_string()
+                    .contains("conflicting write"));
+                let actual = program.execute_state_inner(&[5], &[], checked).unwrap();
+                assert_eq!(actual.state[0].load(Ordering::Relaxed), 5);
+                assert_eq!(actual.ready.len(), usize::from(checked));
+            }
+        }
+    }
+
+    #[test]
     fn contiguous_random_copies_match_checked_execution_with_extreme_words() {
         let mut builder = CircuitBuilder::<G, 2>::new(CircuitConfig::standard_recursion_config());
         for _ in 0..1024 {
@@ -2874,9 +3028,12 @@ pub(crate) fn replay_snapshot(stem: &std::path::Path, iterations: usize) -> Resu
         program.state_slots
     );
     let paired = std::env::var_os("P2_BENCH_RANDOM_SPANS_PAIR").is_some();
+    let ready_paired = std::env::var_os("P2_BENCH_READINESS_PAIR").is_some();
     for iteration in 0..iterations {
         let spans = !paired || ((iteration ^ (iteration >> 1)) & 1) != 0;
         super::aot::benchmark_random_spans(spans);
+        let compact = !ready_paired || ((iteration ^ (iteration >> 1)) & 1) != 0;
+        benchmark_compact_readiness(compact);
         let started = Instant::now();
         let actual = program.execute_state(&roots, &random)?;
         let ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -2887,7 +3044,7 @@ pub(crate) fn replay_snapshot(stem: &std::path::Path, iterations: usize) -> Resu
             );
         }
         eprintln!(
-            "AOT_EXECUTE generators={} layers={} slots={} iteration={} ms={ms:.6} equal=true random_spans={spans}",
+            "AOT_EXECUTE generators={} layers={} slots={} iteration={} ms={ms:.6} equal=true random_spans={spans} compact_readiness={compact}",
             key.generators,
             program.layer_count(),
             program.state_slots,

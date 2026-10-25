@@ -18,6 +18,7 @@ mod generated {
 #[derive(Clone, Debug)]
 pub(super) struct FastLayout {
     pub single: Cow<'static, [u8]>,
+    pub sparse_ready: Option<Vec<u32>>,
     pub poseidon: OnceLock<HashMap<u32, Vec<u32>>>,
     pub adaptive: OnceLock<HashMap<u32, Vec<u8>>>,
     pub random_spans: OnceLock<HashMap<u32, (u32, u32)>>,
@@ -473,7 +474,19 @@ pub(super) fn certify(p: &RegionProgram) -> Result<FastLayout> {
         .enumerate()
         .map(|(i, n)| u8::from(i >= p.roots.len() && n == 1))
         .collect::<Vec<_>>();
+    // Keep sparse indexing small. Dense/repeated-output circuits retain the
+    // ordinary per-slot flags; the common case stores only a few exceptions.
+    let limit = n / 64;
+    let repeated = single
+        .iter()
+        .enumerate()
+        .skip(p.roots.len())
+        .filter_map(|(slot, &flag)| (flag == 0).then_some(slot as u32))
+        .take(limit + 1)
+        .collect::<Vec<_>>();
+    let sparse_ready = (repeated.len() <= limit).then_some(repeated);
     Ok(FastLayout {
+        sparse_ready,
         single: single.into(),
         poseidon: Default::default(),
         adaptive: Default::default(),
@@ -739,7 +752,9 @@ mod tests {
     #[test]
     fn certificate_preserves_checks_for_roots_and_repeated_lane_outputs() {
         let roots = plan(vec![vec![copy(0, 2)]], vec![0, 0, 0, 0], 1);
-        assert_eq!(certify(&roots).unwrap().single.as_ref(), &[0]);
+        let roots_cert = certify(&roots).unwrap();
+        assert_eq!(roots_cert.single.as_ref(), &[0]);
+        assert_eq!(roots_cert.sparse_ready.as_deref(), Some(&[][..]));
         let split = Group {
             kind: Kind::BaseSplit,
             count: 1,
@@ -749,7 +764,9 @@ mod tests {
             outputs: 2,
         };
         let repeated = plan(vec![vec![split]], vec![0, 1, 1], 2);
-        assert_eq!(certify(&repeated).unwrap().single.as_ref(), &[0, 0]);
+        let repeated_cert = certify(&repeated).unwrap();
+        assert_eq!(repeated_cert.single.as_ref(), &[0, 0]);
+        assert!(repeated_cert.sparse_ready.is_none());
     }
 }
 
