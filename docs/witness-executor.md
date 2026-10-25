@@ -36,6 +36,8 @@ config.fallback = WitnessFallback::Error;
 let prepared = circuit.prepare_witness_program_with_config(&input_targets, config)?;
 ```
 
+The default scheduler lets independent branches advance as soon as their inputs are ready. It retains global layers on single-thread pools and builds without `parallel`. `WitnessSchedule::Layers` selects the old scheduling model; `Dependencies` explicitly requests parallel dependency scheduling. Checked execution always uses the checked layer interpreter. Preparation builds dependency metadata once per execution-resource configuration; no generated Rust or external compiler is involved.
+
 Settings are resolved during preparation. The following environment settings are supported; historical `P2_AOT_*` tuning names remain migration aliases, with the new names taking precedence.
 
 | Variable | Meaning | Default |
@@ -45,6 +47,7 @@ Settings are resolved during preparation. The following environment settings are
 | `PLONKY2_EXECUTOR_BUFFER_BYTES` | Retained capacity for wiped buffers; zero uses fresh allocations | `0` |
 | `PLONKY2_EXECUTOR_FALLBACK` | Input-shape/failure policy: `worklist` or `error` | `worklist` |
 | `PLONKY2_EXECUTOR_MODE` | Validated adaptive execution or checked control: `auto` or `checked` | `auto` |
+| `PLONKY2_EXECUTOR_SCHEDULE` | Ready chunk dependencies or layer barriers: `auto`, `dependencies`, `layers` | `auto` |
 | `PLONKY2_EXECUTOR_POSEIDON` | Hardware-eligible batching or individual permutations: `auto` or `scalar` | `auto` |
 | `PLONKY2_EXECUTOR_LAYOUT` | Value placement: `outputs`, `canonical`, `representative`, `block4`, `block8` | `outputs` |
 | `PLONKY2_EXECUTOR_CHAIN_LENGTH` | Fused arithmetic-chain limit; zero disables, otherwise 2–8 | `4` |

@@ -21,6 +21,7 @@ const SOURCES: &[&str] = &[
     "src/plonk/witness_program/region/cpu.rs",
     "src/plonk/witness_program/region/plan_bytes.rs",
     "src/plonk/witness_program/region/aot.rs",
+    "src/plonk/witness_program/region/schedule.rs",
     "src/plonk/witness_program/region/profile.rs",
     "src/plonk/witness_program/region/buffers.rs",
     "src/hash/poseidon_trace_simd.rs",

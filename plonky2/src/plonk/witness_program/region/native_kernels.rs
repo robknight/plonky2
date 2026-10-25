@@ -1736,3 +1736,9 @@ pub(super) fn run(e: &Executor<'_>) -> Result<()> {
 }
 
 pub(super) fn prepare(p:&RegionProgram) {let _=adaptive_tags(p,DESCRIPTORS);}
+
+#[cfg(feature="parallel")]
+pub(super) fn sequential(e:&Executor<'_>,g:&Group,lanes:impl Iterator<Item=u32>)->Result<()> {
+    let tags=&adaptive_tags(e.program,DESCRIPTORS)[&g.targets_offset];
+    for k in lanes {KERNELS[tags[k as usize] as usize](e,g,k)?;}Ok(())
+}

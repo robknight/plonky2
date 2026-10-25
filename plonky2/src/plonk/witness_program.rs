@@ -47,7 +47,7 @@ pub use cache::{WitnessPreparation, WitnessProgramSource};
 mod config;
 pub use config::{
     WitnessBuffers, WitnessCache, WitnessConfig, WitnessExecution, WitnessFallback, WitnessGather,
-    WitnessLayout, WitnessPoseidon,
+    WitnessLayout, WitnessPoseidon, WitnessSchedule,
 };
 
 #[doc(hidden)]
@@ -666,6 +666,62 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "parallel")]
+    fn dependency_schedules_support_concurrent_fork_join_witnesses_and_reconfiguration() {
+        use crate::hash::poseidon::PoseidonHash;
+        use crate::iop::witness::WitnessWrite;
+        let mut builder = CircuitBuilder::<G, 2>::new(CircuitConfig::standard_recursion_config());
+        let a = builder.add_virtual_target();
+        let b = builder.add_virtual_target();
+        let mut branches = Vec::new();
+        for i in 0..257 {
+            let constant = builder.constant(G::from_canonical_usize(i + 1));
+            let mut x = a;
+            for _ in 0..(i % 16 + 1) {
+                x = builder.mul_add(x, b, constant);
+            }
+            branches.push(x);
+        }
+        let sum = builder.add_many(branches);
+        let hash = builder.hash_n_to_hash_no_pad::<PoseidonHash>(vec![sum, a, b]);
+        builder.register_public_inputs(&hash.elements);
+        let data = builder.build::<C>();
+        let mut config = WitnessConfig::default();
+        config.schedule = WitnessSchedule::Dependencies;
+        config.threads = 2;
+        config.buffers = WitnessBuffers::Reuse {
+            max_bytes: 8 * 1024 * 1024,
+        };
+        data.prepare_witness_program_with_config(&[a, b], config.clone())
+            .unwrap();
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let data = &data;
+                scope.spawn(move || {
+                    for case in 0..3 {
+                        let mut pw = PartialWitness::new();
+                        pw.set_target(a, G::from_canonical_usize(worker + case))
+                            .unwrap();
+                        pw.set_target(b, G::from_canonical_usize(case + 1)).unwrap();
+                        check_against_worklist(&pw, &data.prover_only, &data.common).unwrap();
+                    }
+                });
+            }
+        });
+        config.schedule = WitnessSchedule::Layers;
+        data.prepare_witness_program_with_config(&[a, b], config)
+            .unwrap();
+        assert_eq!(
+            data.witness_program().unwrap().config().schedule,
+            WitnessSchedule::Layers
+        );
+        let mut pw = PartialWitness::new();
+        pw.set_target(a, G::ONE).unwrap();
+        pw.set_target(b, G::TWO).unwrap();
+        assert!(prove_and_verify(&data, pw));
+    }
+
+    #[test]
     fn external_target_coordinates_are_rejected_without_wrapping_or_aliasing() {
         let mut builder = CircuitBuilder::<G, 2>::new(CircuitConfig::standard_recursion_config());
         let a = builder.add_virtual_target();
@@ -1023,4 +1079,10 @@ pub fn benchmark_compact_readiness(enabled: bool) {
 #[cfg(all(feature = "gpu", feature = "witness-benchmarks"))]
 pub fn benchmark_gather_tiling(current: bool) {
     region::cpu::benchmark_gather_tiling(current);
+}
+
+#[doc(hidden)]
+#[cfg(all(feature = "parallel", feature = "witness-benchmarks"))]
+pub fn benchmark_dependency_schedule(enabled: bool) {
+    region::schedule::benchmark_enabled(enabled);
 }

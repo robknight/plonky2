@@ -25,6 +25,8 @@ pub(super) mod buffers;
 pub mod cpu;
 pub(crate) mod plan_bytes;
 mod profile;
+#[cfg(feature = "parallel")]
+pub(crate) mod schedule;
 
 /// Log target of the compiler's phase timings (debug level).
 pub(crate) const COMPILE_LOG: &str = "plonky2::witness_program::compile";

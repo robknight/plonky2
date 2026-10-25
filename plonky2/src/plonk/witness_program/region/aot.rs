@@ -666,6 +666,10 @@ pub(super) fn prepare(p: &RegionProgram) -> Result<()> {
         let _ = poseidon_bases(p);
         let _ = random_spans(p);
         generated::prepare(p);
+        #[cfg(feature = "parallel")]
+        if p.runtime.config.schedule != super::super::WitnessSchedule::Layers {
+            let _ = super::schedule::prepare(p)?;
+        }
     }
     Ok(())
 }
@@ -675,6 +679,10 @@ pub(super) fn run_adaptive(
     descriptors: &[&[u64]],
     kernels: &[PatternFn],
 ) -> Result<()> {
+    #[cfg(feature = "parallel")]
+    if super::schedule::run(e)? {
+        return Ok(());
+    }
     let tags = adaptive_tags(e.program, descriptors);
     for (index, layer) in e.program.groups.iter().enumerate() {
         let _layer = e
@@ -874,4 +882,46 @@ fn poseidon_min_group() -> u32 {
 }
 fn poseidon_chunk() -> u32 {
     8
+}
+
+#[cfg(feature = "parallel")]
+pub(super) fn run_range(e: &Executor<'_>, g: &Group, start: u32, end: u32) -> Result<()> {
+    match g.kind {
+        Kind::Arithmetic if e.program.runtime.config.simplify_arithmetic => {
+            return arithmetic_simplified(e, g, start, end)
+        }
+        Kind::Equality => return equality_batch(e, g, start, end),
+        Kind::Poseidon => {
+            let starts = &poseidon_bases(e.program)[&g.targets_offset];
+            let mode = if g.count >= poseidon_min_group() {
+                poseidon_mode(e)
+            } else {
+                0
+            };
+            if mode != 0 {
+                return e.step_poseidon_simd(g, start, end, starts, mode);
+            }
+            for k in start..end {
+                if starts[k as usize] != u32::MAX {
+                    e.step_poseidon_bulk(k, g.count, g.targets_offset, starts[k as usize])?
+                } else {
+                    e.step_fixed::<0>(g, k)?
+                }
+            }
+            return Ok(());
+        }
+        Kind::RandomValue if g.count >= 512 && random_spans_enabled() => {
+            if let Some(&(src, dst)) = random_spans(e.program).get(&g.targets_offset) {
+                return e.step_random_span(src, dst, start, end);
+            }
+        }
+        Kind::ArithmeticChain => return generated::sequential(e, g, start..end),
+        _ => {}
+    }
+    macro_rules! run {($($k:literal),*)=>{match g.kind.code(){$($k=>{for k in start..end{e.step_fixed::<$k>(g,k)?;}},)*_=>unreachable!()}}}
+    run!(
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+        25, 26
+    );
+    Ok(())
 }

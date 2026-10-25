@@ -190,6 +190,18 @@ impl RegionProgram {
         self.fast.get().is_some()
             && self.rep_slots.get().is_some()
             && self.cell_slots.get().is_some()
+            && {
+                #[cfg(feature = "parallel")]
+                {
+                    self.runtime.config.execution == super::super::WitnessExecution::Checked
+                        || self.runtime.config.schedule == super::super::WitnessSchedule::Layers
+                        || matches!(self.runtime.schedule.get(), Some(Ok(_)))
+                }
+                #[cfg(not(feature = "parallel"))]
+                {
+                    true
+                }
+            }
             && (!super::aot::fast_enabled(self)
                 || self.fast.get().is_some_and(|f| {
                     f.poseidon.get().is_some()
@@ -3146,6 +3158,11 @@ pub(crate) fn replay_snapshot(stem: &std::path::Path, iterations: usize) -> Resu
     let paired = std::env::var_os("P2_BENCH_RANDOM_SPANS_PAIR").is_some();
     let ready_paired = std::env::var_os("P2_BENCH_READINESS_PAIR").is_some();
     for iteration in 0..iterations {
+        #[cfg(feature = "parallel")]
+        let dependencies = std::env::var_os("P2_BENCH_SCHEDULE_PAIR").is_none()
+            || ((iteration ^ (iteration >> 1)) & 1) != 0;
+        #[cfg(feature = "parallel")]
+        super::schedule::benchmark_enabled(dependencies);
         let spans = !paired || ((iteration ^ (iteration >> 1)) & 1) != 0;
         super::aot::benchmark_random_spans(spans);
         let compact = !ready_paired || ((iteration ^ (iteration >> 1)) & 1) != 0;
@@ -3166,6 +3183,8 @@ pub(crate) fn replay_snapshot(stem: &std::path::Path, iterations: usize) -> Resu
             program.state_slots,
             iteration
         );
+        #[cfg(feature = "parallel")]
+        eprintln!("DEPENDENCY_EXEC iteration={iteration} dependencies={dependencies} ms={ms:.6}");
     }
     Ok(())
 }

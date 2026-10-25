@@ -54,6 +54,19 @@ pub enum WitnessExecution {
     Checked,
 }
 
+/// Dependency scheduling is prepared once and does not change the stored graph.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WitnessSchedule {
+    /// Advance ready chunks independently; use layers on a single-thread pool.
+    #[default]
+    Auto,
+    /// Retain global dependency-layer barriers.
+    Layers,
+    /// Schedule ready chunks without global barriers (requires `parallel`).
+    Dependencies,
+}
+
 /// Poseidon selection, independent of the serialized circuit program.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -124,6 +137,7 @@ pub struct WitnessConfig {
     /// Maximum fused arithmetic-chain length: zero disables fusion; otherwise 2..=8.
     pub chain_length: u8,
     pub execution: WitnessExecution,
+    pub schedule: WitnessSchedule,
     pub poseidon: WitnessPoseidon,
     pub fallback: WitnessFallback,
     pub buffers: WitnessBuffers,
@@ -148,6 +162,7 @@ impl Default for WitnessConfig {
             layout: WitnessLayout::Outputs,
             chain_length: 4,
             execution: WitnessExecution::Auto,
+            schedule: WitnessSchedule::Auto,
             poseidon: WitnessPoseidon::Auto,
             fallback: WitnessFallback::Worklist,
             buffers: WitnessBuffers::Fresh,
@@ -217,6 +232,14 @@ impl WitnessConfig {
                 "auto" | "adaptive" | "fast" | "fast-batch" | "bulk" => WitnessExecution::Auto,
                 "checked" => WitnessExecution::Checked,
                 _ => return Err(invalid(format!("unknown witness execution mode {v:?}"))),
+            };
+        }
+        if let Some(v) = setting("PLONKY2_EXECUTOR_SCHEDULE", "PLONKY2_EXECUTOR_SCHEDULE")? {
+            c.schedule = match v.as_str() {
+                "auto" => WitnessSchedule::Auto,
+                "layers" => WitnessSchedule::Layers,
+                "dependencies" => WitnessSchedule::Dependencies,
+                _ => return Err(invalid(format!("unknown witness schedule {v:?}"))),
             };
         }
         if let Some(v) = setting("PLONKY2_EXECUTOR_POSEIDON", "P2_POSEIDON_MODE")? {
@@ -290,6 +313,12 @@ impl WitnessConfig {
     /// Checks options without allocating execution buffers or creating threads.
     /// Preparation and compilation also validate configuration automatically.
     pub fn validate(&self) -> Result<(), WitnessProgramError> {
+        #[cfg(not(feature = "parallel"))]
+        if self.schedule == WitnessSchedule::Dependencies {
+            return Err(invalid(
+                "dependency scheduling requires the parallel feature",
+            ));
+        }
         if matches!(&self.cache,WitnessCache::Directory(path) if path.as_os_str().is_empty()) {
             return Err(invalid("executor cache directory must not be empty"));
         }
@@ -317,6 +346,7 @@ impl WitnessConfig {
         #[cfg(not(feature = "parallel"))]
         let pool = true;
         self.compilation_key() == other.compilation_key()
+            && self.schedule == other.schedule
             && self.execution == other.execution
             && self.poseidon == other.poseidon
             && self.fallback == other.fallback
@@ -345,6 +375,8 @@ impl WitnessConfig {
 
 #[derive(Debug)]
 pub(crate) struct Runtime {
+    #[cfg(feature = "parallel")]
+    pub schedule: super::region::schedule::PreparedSchedule,
     pub config: WitnessConfig,
     pub buffers: Buffers,
     #[cfg(feature = "parallel")]
@@ -383,6 +415,8 @@ impl Runtime {
             None => None,
         };
         Ok(Self {
+            #[cfg(feature = "parallel")]
+            schedule: Default::default(),
             buffers: Buffers::new(config.buffers),
             config,
             #[cfg(feature = "parallel")]
