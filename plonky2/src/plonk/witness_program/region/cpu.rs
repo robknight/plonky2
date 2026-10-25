@@ -150,21 +150,7 @@ impl RegionProgram {
     ) -> Result<Executor<'a>> {
         #[cfg(feature = "parallel")]
         {
-            static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> =
-                std::sync::OnceLock::new();
-            let pool = POOL.get_or_init(|| {
-                std::env::var("P2_AOT_WITNESS_THREADS")
-                    .ok()
-                    .and_then(|x| x.parse::<usize>().ok())
-                    .filter(|&n| n > 0)
-                    .map(|n| {
-                        rayon::ThreadPoolBuilder::new()
-                            .num_threads(n)
-                            .build()
-                            .expect("witness thread pool")
-                    })
-            });
-            if let Some(pool) = pool {
+            if let Some(pool) = &self.runtime.pool {
                 return pool
                     .install(|| self.execute_state_inner(root_values, random_values, false));
             }
@@ -190,7 +176,7 @@ impl RegionProgram {
             self.roots.len(),
             root_values.len()
         );
-        let fast = if !reference && super::aot::fast_enabled() {
+        let fast = if !reference && super::aot::fast_enabled(self) {
             if self.fast.get().is_none() {
                 let certificate = super::aot::certify(self)?;
                 let _ = self.fast.set(certificate);
@@ -201,7 +187,7 @@ impl RegionProgram {
         };
         let profile = profile::Execution::new(self.state_slots);
         let allocation = profile.stage(Stage::Allocate);
-        let (state, ready) = super::buffers::acquire(self.state_slots as usize);
+        let (state, ready) = self.runtime.buffers.acquire(self.state_slots as usize);
         drop(allocation);
         let executor = Executor {
             profile,
@@ -314,7 +300,7 @@ impl Drop for Executor<'_> {
     /// elide, rather than relaxed atomic stores.
     fn drop(&mut self) {
         let wipe = self.profile.stage(Stage::Wipe);
-        super::buffers::release(
+        self.program.runtime.buffers.release(
             core::mem::take(&mut self.state),
             core::mem::take(&mut self.ready),
         );
@@ -1911,6 +1897,10 @@ fn report_input_mismatch<
     let _ = prover
         .witness_program
         .lookup_all(prover.generators.len(), &initial);
+    ensure!(
+        !prover.witness_program.strict_inputs(),
+        "proof inputs do not match the prepared witness program"
+    );
     Ok(())
 }
 
@@ -1966,7 +1956,14 @@ pub(crate) fn generate_wires_with<
                 .lookup_all(prover.generators.len(), &initial)
             {
                 super::Installed::Program(p) => Some(p),
-                super::Installed::OtherInputs | super::Installed::None => None,
+                super::Installed::OtherInputs => {
+                    ensure!(
+                        !prover.witness_program.strict_inputs(),
+                        "proof inputs do not match the prepared witness program"
+                    );
+                    None
+                }
+                super::Installed::None => None,
             },
         )
     };
@@ -2125,8 +2122,8 @@ pub(crate) fn generate_wires_with<
         #[cfg(feature = "gpu")]
         Some(ctx) => {
             let cell_slots = program.cell_slots(map, num_wires, degree);
-            let gpu_gather =
-                std::env::var("P2_AOT_GPU_GATHER").as_deref() == Ok("1") && executor.fast.is_some();
+            let gpu_gather = program.runtime.config.gather == super::super::WitnessGather::Gpu
+                && executor.fast.is_some();
             let wire_values = if gpu_gather {
                 report.gather_mode = "gpu";
                 super::aot::gather_on_gpu(&executor, &ctx, cell_slots)?
@@ -2136,16 +2133,8 @@ pub(crate) fn generate_wires_with<
                 // filled in parallel, then copied into a pooled device buffer.
                 report.gather_mode = "reused";
                 let staging = ctx.upload_staging(bytes as u64);
-                let columns = std::env::var("P2_AOT_GATHER_COLUMNS")
-                    .ok()
-                    .and_then(|x| x.parse::<usize>().ok())
-                    .unwrap_or(1)
-                    .clamp(1, num_wires);
-                let rows = std::env::var("P2_AOT_GATHER_ROWS")
-                    .ok()
-                    .and_then(|x| x.parse::<usize>().ok())
-                    .unwrap_or(if columns == 1 { degree } else { 64 })
-                    .clamp(1, degree);
+                let columns = program.runtime.config.gather_columns.clamp(1, num_wires);
+                let rows = program.runtime.config.gather_rows.clamp(1, degree);
                 let fill = |columns: usize, rows: usize| {
                     cell_slots
                         .par_chunks(degree * columns)
@@ -2678,6 +2667,7 @@ pub(crate) mod tests {
             mask: vec![],
             format: 7,
             operations: 9 << 64 | 3,
+            compilation: program.runtime.config.compilation_key(),
         };
         let bytes = plan_bytes::encode(&program, &key);
         let (decoded_key, decoded) = plan_bytes::decode(&bytes).unwrap();

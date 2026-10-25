@@ -39,6 +39,12 @@
 //! [`CircuitData::witness_program_support`]: crate::plonk::circuit_data::CircuitData::witness_program_support
 //! [`WitnessGenerator::witness_operation`]: crate::iop::generator::WitnessGenerator::witness_operation
 
+mod config;
+pub use config::{
+    WitnessBuffers, WitnessCache, WitnessConfig, WitnessExecution, WitnessFallback, WitnessGather,
+    WitnessLayout, WitnessPoseidon,
+};
+
 #[doc(hidden)]
 pub mod region;
 
@@ -88,6 +94,8 @@ impl fmt::Debug for WitnessProgram {
 pub enum WitnessProgramError {
     /// The executor runs over the Goldilocks field only.
     UnsupportedField,
+    /// A supplied configuration or environment override is invalid.
+    InvalidConfiguration(String),
     /// The circuit uses lookup tables, which the executor does not support.
     Lookups,
     /// A generator does not describe its operation; the first one found.
@@ -110,6 +118,9 @@ pub enum WitnessProgramError {
 impl fmt::Display for WitnessProgramError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidConfiguration(reason) => {
+                write!(f, "invalid witness configuration: {reason}")
+            }
             Self::UnsupportedField => write!(f, "the witness executor supports Goldilocks only"),
             Self::Lookups => write!(f, "the circuit uses lookup tables"),
             Self::UnsupportedGenerator { index, id } => {
@@ -177,6 +188,7 @@ fn key<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         mask,
         format: plan_bytes::WITNESS_PROGRAM_FORMAT,
         operations,
+        compilation: 0,
     }
 }
 
@@ -198,6 +210,20 @@ pub(crate) fn compile<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, 
     common: &CommonCircuitData<F, D>,
     input_targets: &[Target],
 ) -> Result<WitnessProgram, WitnessProgramError> {
+    compile_with_config(prover, common, input_targets, WitnessConfig::from_env()?)
+}
+
+pub(crate) fn compile_with_config<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    prover: &ProverOnlyCircuitData<F, C, D>,
+    common: &CommonCircuitData<F, D>,
+    input_targets: &[Target],
+    config: WitnessConfig,
+) -> Result<WitnessProgram, WitnessProgramError> {
+    let runtime = Arc::new(config::Runtime::new(config)?);
     let started = std::time::Instant::now();
     support(prover, common)?;
     log::debug!(target: COMPILE_LOG, "compile phase support {:?}", started.elapsed());
@@ -223,12 +249,14 @@ pub(crate) fn compile<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, 
         .collect::<Vec<_>>();
     let indices = (0..prover.generators.len() as u32).collect::<Vec<_>>();
     log::debug!(target: COMPILE_LOG, "compile phase entry {:?}", started.elapsed());
-    let program = RegionProgram::compile(&prover.generators, &entry, &indices)
-        .map_err(|e| WitnessProgramError::Invalid(format!("{e:#}")))?;
+    let program =
+        RegionProgram::compile_with_runtime(&prover.generators, &entry, &indices, runtime.clone())
+            .map_err(|e| WitnessProgramError::Invalid(format!("{e:#}")))?;
     let started = std::time::Instant::now();
     let operations = plan_bytes::operation_digest(&prover.generators);
     log::debug!(target: COMPILE_LOG, "compile phase operation_digest {:?}", started.elapsed());
-    let key = key(prover, mask, operations);
+    let mut key = key(prover, mask, operations);
+    key.compilation = runtime.config.compilation_key();
     if let Some(directory) = std::env::var_os("P2_AOT_EXPORT_DIR") {
         std::fs::create_dir_all(&directory)
             .and_then(|_| {
@@ -277,9 +305,13 @@ pub(crate) fn installed<
         .witness_program
         .installed_all(prover.generators.len())?;
     let operations = operations.unwrap_or_else(|| plan_bytes::operation_digest(&prover.generators));
+    let compilation = program.runtime.config.compilation_key();
     Some(WitnessProgram {
         program,
-        key: key(prover, mask, operations),
+        key: PlanKey {
+            compilation,
+            ..key(prover, mask, operations)
+        },
     })
 }
 
@@ -300,7 +332,18 @@ pub(crate) fn from_bytes<
     bytes: &[u8],
     prover: &ProverOnlyCircuitData<F, C, D>,
 ) -> Result<WitnessProgram, WitnessProgramError> {
-    let (key, program) =
+    from_bytes_with_config(bytes, prover, WitnessConfig::from_env()?)
+}
+pub(crate) fn from_bytes_with_config<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    bytes: &[u8],
+    prover: &ProverOnlyCircuitData<F, C, D>,
+    config: WitnessConfig,
+) -> Result<WitnessProgram, WitnessProgramError> {
+    let (key, mut program) =
         plan_bytes::decode(bytes).map_err(|e| WitnessProgramError::Invalid(e.to_string()))?;
     if !same_circuit(&key, prover) {
         return Err(WitnessProgramError::WrongCircuit);
@@ -311,6 +354,9 @@ pub(crate) fn from_bytes<
     if key.operations != plan_bytes::operation_digest(&prover.generators) {
         return Err(WitnessProgramError::ChangedOperations);
     }
+    program.runtime = Arc::new(config::Runtime::new(
+        config.with_compilation_key(key.compilation)?,
+    )?);
     Ok(WitnessProgram {
         program: Arc::new(program),
         key,
@@ -339,6 +385,11 @@ pub fn check_against_worklist<
 }
 
 impl WitnessProgram {
+    /// Effective configuration resolved when this program was compiled or loaded.
+    pub fn config(&self) -> &WitnessConfig {
+        &self.program.runtime.config
+    }
+
     /// Encodes the program for storage. Decode it with
     /// [`CircuitData::witness_program_from_bytes`] (or the same method on
     /// [`ProverCircuitData`]), which checks that it belongs to the circuit,
@@ -500,6 +551,87 @@ mod tests {
         again.data.install_witness_program(loaded).unwrap();
         assert!(prove_and_verify(&again.data, inputs(&again)));
         assert_eq!(again.data.witness_program().unwrap().to_bytes(), bytes);
+    }
+
+    #[test]
+    fn explicit_configuration_is_per_program_and_survives_storage() {
+        let fast = circuit(true);
+        let checked = circuit(true);
+        let targets = inputs(&fast)
+            .target_values
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut config = WitnessConfig {
+            buffers: WitnessBuffers::Reuse {
+                max_bytes: 4 * 1024 * 1024,
+            },
+            ..WitnessConfig::default()
+        };
+        #[cfg(feature = "parallel")]
+        {
+            config.thread_pool = Some(Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(2)
+                    .build()
+                    .unwrap(),
+            ));
+        }
+        let program = fast
+            .data
+            .compile_witness_program_with_config(&targets, config.clone())
+            .unwrap();
+        assert_eq!(program.config().execution, WitnessExecution::Auto);
+        let bytes = program.to_bytes();
+        fast.data.install_witness_program(program).unwrap();
+        config.execution = WitnessExecution::Checked;
+        let loaded = checked
+            .data
+            .witness_program_from_bytes_with_config(&bytes, config)
+            .unwrap();
+        assert_eq!(loaded.config().execution, WitnessExecution::Checked);
+        assert_eq!(loaded.config().chain_length, 4);
+        checked.data.install_witness_program(loaded).unwrap();
+        assert!(prove_and_verify(&fast.data, inputs(&fast)));
+        assert!(prove_and_verify(&checked.data, inputs(&checked)));
+        assert!(fast.data.has_witness_program());
+        assert_eq!(
+            fast.data.witness_program().unwrap().config().execution,
+            WitnessExecution::Auto
+        );
+        let invalid = WitnessConfig {
+            chain_length: 1,
+            ..WitnessConfig::default()
+        };
+        assert!(matches!(
+            fast.data
+                .compile_witness_program_with_config(&targets, invalid),
+            Err(WitnessProgramError::InvalidConfiguration(_))
+        ));
+    }
+    #[test]
+    fn strict_input_shape_reports_unexpected_worklist_fallback() {
+        let fixture = circuit(true);
+        let pw = inputs(&fixture);
+        let targets = pw
+            .target_values
+            .keys()
+            .copied()
+            .filter(|&t| t != fixture.index)
+            .collect::<Vec<_>>();
+        let config = WitnessConfig {
+            fallback: WitnessFallback::Error,
+            ..WitnessConfig::default()
+        };
+        let program = fixture
+            .data
+            .compile_witness_program_with_config(&targets, config)
+            .unwrap();
+        fixture.data.install_witness_program(program).unwrap();
+        let Err(error) = fixture.data.prove(pw) else {
+            panic!("strict execution must reject a mismatched input shape")
+        };
+        assert!(format!("{error:#}").contains("inputs do not match"));
     }
 
     #[test]

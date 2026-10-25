@@ -25,19 +25,9 @@ pub(super) struct FastLayout {
 }
 
 pub(crate) fn layout() -> u8 {
-    let placement = match std::env::var("P2_AOT_LAYOUT").as_deref() {
-        Ok("aos") => 1,
-        Ok("representative") => 2,
-        Ok("block4") => 3,
-        Ok("block8") => 4,
-        _ => 0,
-    };
-    let chain = std::env::var("P2_AOT_CHAIN_LEN")
-        .ok()
-        .and_then(|x| x.parse::<u8>().ok())
-        .unwrap_or(8)
-        .clamp(2, 8);
-    placement | if fusion_enabled() { chain * 8 } else { 0 }
+    super::super::WitnessConfig::from_env()
+        .unwrap_or_default()
+        .compilation_key() as u8
 }
 
 pub(crate) fn file_stem(digest: &[u8]) -> String {
@@ -48,41 +38,27 @@ pub(crate) fn file_stem(digest: &[u8]) -> String {
     format!("circuit_{}_{hex}", layout())
 }
 
-pub(super) fn fast_enabled() -> bool {
-    matches!(
-        std::env::var("P2_AOT_MODE").as_deref(),
-        Ok("fast") | Ok("fast-batch") | Ok("bulk") | Ok("adaptive")
-    )
+pub(super) fn fast_enabled(p: &RegionProgram) -> bool {
+    p.runtime.config.execution != super::super::WitnessExecution::Checked
 }
 
 pub(super) fn execute(executor: &Executor<'_>) -> Result<bool> {
-    if !fast_enabled() {
+    if !fast_enabled(executor.program) {
         return Ok(false);
     }
-    if std::env::var("P2_AOT_MODE").as_deref() == Ok("adaptive") {
-        generated::run(executor)?;
-    } else {
-        for (index, layer) in executor.program.groups.iter().enumerate() {
-            let _layer = executor
-                .profile
-                .layer(index, layer.iter().map(|g| g.count as u64).sum());
-            layer
-                .par_iter()
-                .try_for_each(|g| run_dynamic(executor, g))?;
-        }
-    }
+    generated::run(executor)?;
     Ok(true)
 }
 
 pub(super) fn run_fixed<const K: u8>(executor: &Executor<'_>, group: &Group) -> Result<()> {
     let kind = Kind::from_code(K as usize)?;
-    let use_simd = K == 0 && poseidon_mode() != 0 && group.count >= poseidon_min_group();
+    let use_simd = K == 0 && poseidon_mode(executor) != 0 && group.count >= poseidon_min_group();
     let chunk = if use_simd {
         poseidon_chunk()
     } else {
-        tuned_chunk(kind)
+        tuned_chunk(executor, kind)
     };
-    if K == 1 && simplify_enabled() {
+    if K == 1 && executor.program.runtime.config.simplify_arithmetic {
         return (0..group.count.div_ceil(chunk))
             .into_par_iter()
             .try_for_each(|c| {
@@ -97,7 +73,7 @@ pub(super) fn run_fixed<const K: u8>(executor: &Executor<'_>, group: &Group) -> 
                 )
             });
     }
-    if K == 4 && batch_enabled() {
+    if K == 4 {
         return (0..group.count.div_ceil(chunk))
             .into_par_iter()
             .try_for_each(|c| {
@@ -112,7 +88,7 @@ pub(super) fn run_fixed<const K: u8>(executor: &Executor<'_>, group: &Group) -> 
                 )
             });
     }
-    if K == 0 && bulk_enabled() {
+    if K == 0 {
         let bases = poseidon_bases(executor.program);
         let starts = &bases[&group.targets_offset];
         return (0..group.count.div_ceil(chunk))
@@ -121,7 +97,7 @@ pub(super) fn run_fixed<const K: u8>(executor: &Executor<'_>, group: &Group) -> 
                 let begin = c * chunk;
                 let end = ((c + 1) * chunk).min(group.count);
                 let _profile = executor.profile.kind(K, end - begin);
-                let mode = if use_simd { poseidon_mode() } else { 0 };
+                let mode = if use_simd { poseidon_mode(executor) } else { 0 };
                 if mode != 0 {
                     return executor.step_poseidon_simd(group, begin, end, starts, mode);
                 }
@@ -153,31 +129,10 @@ pub(super) fn run_fixed<const K: u8>(executor: &Executor<'_>, group: &Group) -> 
         })
 }
 
-fn tuned_chunk(kind: Kind) -> u32 {
-    static SCALE: OnceLock<u32> = OnceLock::new();
-    let scale = *SCALE.get_or_init(|| {
-        std::env::var("P2_AOT_CHUNK_SCALE")
-            .ok()
-            .and_then(|x| x.parse::<u32>().ok())
-            .unwrap_or(1)
-            .max(1)
-    });
-    super::cpu::lane_chunk(kind).saturating_mul(scale).max(1)
-}
-
-fn batch_enabled() -> bool {
-    static VALUE: OnceLock<bool> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        matches!(
-            std::env::var("P2_AOT_MODE").as_deref(),
-            Ok("fast-batch") | Ok("bulk") | Ok("adaptive")
-        )
-    })
-}
-
-fn simplify_enabled() -> bool {
-    static VALUE: OnceLock<bool> = OnceLock::new();
-    *VALUE.get_or_init(|| std::env::var("P2_AOT_SIMPLIFY_ARITH").as_deref() == Ok("1"))
+fn tuned_chunk(e: &Executor<'_>, kind: Kind) -> u32 {
+    super::cpu::lane_chunk(kind)
+        .saturating_mul(e.program.runtime.config.chunk_scale)
+        .max(1)
 }
 
 fn arithmetic_simplified(e: &Executor<'_>, g: &Group, start: u32, end: u32) -> Result<()> {
@@ -215,16 +170,6 @@ fn arithmetic_simplified(e: &Executor<'_>, g: &Group, start: u32, end: u32) -> R
         e.output(g.targets_offset, 3, g.count, k, product + addend)?;
     }
     Ok(())
-}
-
-fn bulk_enabled() -> bool {
-    static VALUE: OnceLock<bool> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        matches!(
-            std::env::var("P2_AOT_MODE").as_deref(),
-            Ok("bulk") | Ok("adaptive")
-        )
-    })
 }
 
 fn equality_batch(e: &Executor<'_>, g: &Group, start: u32, end: u32) -> Result<()> {
@@ -284,7 +229,7 @@ fn poseidon_bases(p: &RegionProgram) -> &HashMap<u32, Vec<u32>> {
                 }
                 groups.insert(g.targets_offset, starts);
             }
-            eprintln!("AOT_POSEIDON_BLOCKS eligible={eligible} total={total}");
+            log::debug!(target: super::COMPILE_LOG,"Poseidon contiguous outputs: {eligible}/{total}");
             groups
         })
 }
@@ -479,7 +424,7 @@ pub(super) fn certify(p: &RegionProgram) -> Result<FastLayout> {
 
 /// Changes value placement while retaining operand and group ordering.
 pub(super) fn reorder(p: &mut RegionProgram) -> Result<()> {
-    let mode = layout() & 7;
+    let mode = p.runtime.config.layout.code();
     if mode == 0 {
         return Ok(());
     }
@@ -534,9 +479,6 @@ pub(super) fn reorder(p: &mut RegionProgram) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn fusion_enabled() -> bool {
-    std::env::var("P2_AOT_FUSE").as_deref() == Ok("1")
-}
 fn run_dynamic(e: &Executor<'_>, g: &Group) -> Result<()> {
     match g.kind {
         Kind::Poseidon => run_fixed::<0>(e, g),
@@ -585,7 +527,7 @@ pub(super) fn run_pattern_group(
         ids.len() == g.count as usize,
         "native pattern lane count mismatch"
     );
-    let chunk = tuned_chunk(Kind::ArithmeticChain) as usize;
+    let chunk = tuned_chunk(e, Kind::ArithmeticChain) as usize;
     ids.par_chunks(chunk).enumerate().try_for_each(|(c, ids)| {
         let _profile = e.profile.kind(26, ids.len() as u32);
         for (i, &id) in ids.iter().enumerate() {
@@ -641,7 +583,7 @@ pub(super) fn run_adaptive(
             }
             groups.insert(g.targets_offset, ids);
         }
-        eprintln!("AOT_ADAPTIVE_MATCH covered_operations={covered} total_operations={total}");
+        log::debug!(target: super::COMPILE_LOG,"native arithmetic coverage: {covered}/{total}");
         groups
     });
     for (index, layer) in e.program.groups.iter().enumerate() {
@@ -684,6 +626,7 @@ mod tests {
             alias_count: 0,
             alias_pair_offset: 0,
             state_slots: slots,
+            runtime: Default::default(),
             fast: Default::default(),
             rep_slots: Default::default(),
             cell_slots: Default::default(),
@@ -815,23 +758,19 @@ fn gather(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups)
     Ok(out)
 }
 
-fn poseidon_mode() -> u8 {
+fn poseidon_mode(e: &Executor<'_>) -> u8 {
     let override_mode =
         crate::hash::poseidon_trace_simd::BENCH_MODE.load(std::sync::atomic::Ordering::Relaxed);
     if override_mode != 255 {
         return override_mode;
     }
-    static MODE: OnceLock<u8> = OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("P2_POSEIDON_MODE").as_deref() {
-        Ok("batch8-fft") => {
-            if crate::hash::poseidon_trace_simd::NATIVE {
-                5
-            } else {
-                0
-            }
-        }
-        _ => 0,
-    })
+    if e.program.runtime.config.poseidon == super::super::WitnessPoseidon::Auto
+        && crate::hash::poseidon_trace_simd::NATIVE
+    {
+        5
+    } else {
+        0
+    }
 }
 fn poseidon_min_group() -> u32 {
     64

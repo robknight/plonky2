@@ -1,24 +1,19 @@
 //! Bounded reuse of already-wiped witness buffers. No values or readiness
 //! flags survive release, including executions that return an error.
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use plonky2_maybe_rayon::*;
 use zeroize::Zeroize;
+
+use super::super::WitnessBuffers;
 
 const LIMIT: usize = 64 * 1024 * 1024;
 static OVERRIDE: AtomicU8 = AtomicU8::new(255);
 pub(crate) fn benchmark_override(enabled: bool) {
     OVERRIDE.store(u8::from(enabled), Ordering::Relaxed);
 }
-fn enabled() -> bool {
-    let mode = OVERRIDE.load(Ordering::Relaxed);
-    if mode != 255 {
-        return mode != 0;
-    }
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("P2_WITNESS_BUFFERS").as_deref() == Ok("pool"))
-}
+#[derive(Debug)]
 struct Storage {
     state: Vec<AtomicU64>,
     ready: Vec<AtomicBool>,
@@ -44,6 +39,7 @@ impl Storage {
         self
     }
 }
+#[derive(Debug)]
 struct Pool {
     entries: Vec<Storage>,
     bytes: usize,
@@ -82,26 +78,55 @@ impl Pool {
         true
     }
 }
-fn pool() -> &'static Mutex<Pool> {
-    static POOL: OnceLock<Mutex<Pool>> = OnceLock::new();
-    POOL.get_or_init(|| Mutex::new(Pool::new(LIMIT)))
+/// Shared only by clones of this program; memory is released with its last owner.
+#[derive(Debug)]
+pub(crate) struct Buffers {
+    reuse: bool,
+    pool: Mutex<Pool>,
 }
-
-pub(super) fn acquire(len: usize) -> (Vec<AtomicU64>, Vec<AtomicBool>) {
-    if enabled() {
-        if let Some(entry) = pool().lock().unwrap_or_else(|e| e.into_inner()).take(len) {
-            return (entry.state, entry.ready);
+impl Buffers {
+    pub fn new(policy: WitnessBuffers) -> Self {
+        let (reuse, limit) = match policy {
+            WitnessBuffers::Fresh => (false, LIMIT),
+            WitnessBuffers::Reuse { max_bytes } => (true, max_bytes),
+        };
+        Self {
+            reuse,
+            pool: Mutex::new(Pool::new(limit)),
         }
     }
-    let entry = Storage::fresh(len);
-    (entry.state, entry.ready)
-}
-pub(super) fn release(state: Vec<AtomicU64>, ready: Vec<AtomicBool>) {
-    let entry = Storage { state, ready };
-    let retain = enabled() && entry.bytes() <= LIMIT;
-    let entry = entry.scrub(retain);
-    if retain {
-        pool().lock().unwrap_or_else(|e| e.into_inner()).put(entry);
+    fn enabled(&self) -> bool {
+        match OVERRIDE.load(Ordering::Relaxed) {
+            255 => self.reuse,
+            0 => false,
+            _ => true,
+        }
+    }
+    pub(super) fn acquire(&self, len: usize) -> (Vec<AtomicU64>, Vec<AtomicBool>) {
+        if self.enabled() {
+            if let Some(entry) = self
+                .pool
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(len)
+            {
+                return (entry.state, entry.ready);
+            }
+        }
+        let entry = Storage::fresh(len);
+        (entry.state, entry.ready)
+    }
+    pub(super) fn release(&self, state: Vec<AtomicU64>, ready: Vec<AtomicBool>) {
+        let entry = Storage { state, ready };
+        let retain = self.enabled()
+            && entry.bytes() <= self.pool.lock().unwrap_or_else(|e| e.into_inner()).limit;
+        let entry = entry.scrub(retain);
+        if retain {
+            self.pool
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .put(entry);
+        }
     }
 }
 

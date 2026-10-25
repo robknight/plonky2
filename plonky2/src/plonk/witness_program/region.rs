@@ -151,6 +151,7 @@ pub struct RegionProgram {
     alias_count: u32,
     alias_pair_offset: u32,
     state_slots: u32,
+    pub(super) runtime: Arc<super::config::Runtime>,
     fast: std::sync::OnceLock<aot::FastLayout>,
     /// Representative index to canonical slot, `u32::MAX` when absent; built
     /// on first use by the CPU executor's gather.
@@ -253,6 +254,15 @@ impl ProgramCache {
         let program = cached.program.as_ref()?;
         (program.generators == generators && program.roots_match_inputs)
             .then(|| program.program.clone())
+    }
+
+    pub(crate) fn strict_inputs(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .program
+            .as_ref()
+            .is_some_and(|p| p.program.runtime.config.fallback == super::WitnessFallback::Error)
     }
 
     /// The whole-circuit program in the slot, its mask and its operation
@@ -472,15 +482,12 @@ impl Lane {
 fn fuse_arithmetic<F: RichField>(
     nodes: Vec<Lane>,
     entry: &PartitionWitness<F>,
+    config: &super::WitnessConfig,
 ) -> Result<Vec<Lane>> {
-    if !aot::fusion_enabled() {
+    if config.chain_length == 0 {
         return Ok(nodes);
     }
-    let limit = std::env::var("P2_AOT_CHAIN_LEN")
-        .ok()
-        .and_then(|x| x.parse::<usize>().ok())
-        .unwrap_or(8)
-        .clamp(2, 8);
+    let limit = config.chain_length as usize;
     const MANY: u32 = u32::MAX - 1;
     let mut producer = vec![NONE; entry.values.len()];
     let mut consumer = vec![NONE; entry.values.len()];
@@ -580,7 +587,7 @@ fn fuse_arithmetic<F: RichField>(
     }
     // Any cyclic component remains intact for the existing cycle diagnostic.
     result.extend(remaining.into_iter().flatten());
-    eprintln!("AOT_FUSION before={before} after={} chains={chain_count} operations={fused_nodes} limit={limit}", result.len());
+    log::debug!(target:COMPILE_LOG,"arithmetic fusion: {before} -> {}, chains={chain_count}, operations={fused_nodes}, limit={limit}", result.len());
     Ok(result)
 }
 
@@ -600,6 +607,17 @@ impl RegionProgram {
         generators: &[WitnessGeneratorRef<F, D>],
         entry: &PartitionWitness<F>,
         indices: &[u32],
+    ) -> Result<Self> {
+        let runtime = Arc::new(super::config::Runtime::new(
+            super::WitnessConfig::from_env()?,
+        )?);
+        Self::compile_with_runtime(generators, entry, indices, runtime)
+    }
+    pub(super) fn compile_with_runtime<F: RichField + Extendable<D>, const D: usize>(
+        generators: &[WitnessGeneratorRef<F, D>],
+        entry: &PartitionWitness<F>,
+        indices: &[u32],
+        runtime: Arc<super::config::Runtime>,
     ) -> Result<Self> {
         ensure!(Op::field_supported::<F>(), "unsupported witness field");
         // Phase timings at debug level under COMPILE_LOG.
@@ -644,7 +662,7 @@ impl RegionProgram {
                 Ok(Lane::new(index, &op, input, output))
             })
             .collect::<Result<Vec<_>>>()?;
-        let nodes = fuse_arithmetic(nodes, entry)?;
+        let nodes = fuse_arithmetic(nodes, entry, &runtime.config)?;
         let mut produced = vec![false; reps];
         for lane in &nodes {
             for &r in &lane.outputs {
@@ -1002,6 +1020,7 @@ impl RegionProgram {
             alias_count,
             alias_pair_offset,
             state_slots,
+            runtime,
             fast: Default::default(),
             rep_slots: Default::default(),
             cell_slots: Default::default(),

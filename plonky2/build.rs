@@ -12,6 +12,7 @@ use std::{env, fs};
 
 const SOURCES: &[&str] = &[
     "src/plonk/witness_program.rs",
+    "src/plonk/witness_program/config.rs",
     "src/plonk/witness_program/region.rs",
     "src/plonk/witness_program/region/cpu.rs",
     "src/plonk/witness_program/region/plan_bytes.rs",

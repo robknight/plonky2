@@ -29,7 +29,7 @@ use crate::iop::generator::WitnessGeneratorRef;
 
 include!(concat!(env!("OUT_DIR"), "/witness_program_format.rs"));
 
-const MAGIC: &[u8; 8] = b"P2WAOT01";
+const MAGIC: &[u8; 8] = b"P2WAOT02";
 
 /// Identity of a whole-circuit program.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,6 +43,7 @@ pub(crate) struct PlanKey {
     pub format: u64,
     /// [`operation_digest`] of the circuit's generators.
     pub operations: u128,
+    pub compilation: u32,
 }
 
 fn fnv1a(bytes: &[u8], mut hash: u64) -> u64 {
@@ -219,6 +220,7 @@ pub(crate) fn encode(program: &RegionProgram, key: &PlanKey) -> Vec<u8> {
     w.u64(key.format);
     w.u64(key.operations as u64);
     w.u64((key.operations >> 64) as u64);
+    w.u32(key.compilation);
     w.usize(program.groups.len());
     for layer in &program.groups {
         w.usize(layer.len());
@@ -273,6 +275,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(PlanKey, RegionProgram)> {
         mask: to_usizes(r.deltas(u64::MAX)?)?,
         format: r.u64()?,
         operations: r.u64()? as u128 | (r.u64()? as u128) << 64,
+        compilation: r.u32()?,
     };
     ensure!(
         key.mask.windows(2).all(|w| w[0] < w[1]) && key.mask.iter().all(|&m| m < key.map_len),
@@ -358,6 +361,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<(PlanKey, RegionProgram)> {
         alias_count,
         alias_pair_offset,
         state_slots,
+        runtime: Default::default(),
         fast: Default::default(),
         rep_slots: Default::default(),
         cell_slots: Default::default(),
