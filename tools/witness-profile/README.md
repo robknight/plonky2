@@ -14,15 +14,15 @@ current thread clock on Unix. `WITNESS_LAYERS` reports the twelve longest layers
 as `(index, wall_ns, lanes)` tuples.
 
 Use uninstrumented controls for speed comparisons. Diagnostic instrumentation
-added about 18% to MainPod execution in paired Xeon measurements. Worker CPU
+added about 18% to MainPod execution in earlier paired Xeon measurements and
+about 25% with the final dependency scheduler. Worker CPU
 time measures work rather than the critical path; concurrent CPU totals can
 exceed elapsed time.
 
 For exact-state replay of snapshots exported by the same source version:
 
 ```sh
-RAYON_NUM_THREADS=8 P2_AOT_MODE=adaptive P2_AOT_SIMPLIFY_ARITH=1 \
-P2_POSEIDON_MODE=batch8-fft P2_WITNESS_PROFILE=1 \
+RAYON_NUM_THREADS=8 P2_WITNESS_PROFILE=1 \
 CARGO_TARGET_DIR=/tmp/witness-profile-target \
 cargo +nightly run --release --manifest-path tools/witness-profile/Cargo.toml \
   -- /path/to/circuit_snapshot 24
@@ -54,3 +54,11 @@ wiped and readiness reset before retention. Profile allocation and wiping
 together with full witness calls: execution savings can be larger than the
 end-to-end improvement. `benchmark_buffer_reuse(bool)` is for serial paired
 controls under the same exclusion rule as the profiling control.
+
+
+With dependency scheduling, kind/task CPU totals remain available while global
+layer-wall attribution is absent. Use `PLONKY2_EXECUTOR_SCHEDULE=layers` when
+measuring layer barriers as a control. The `layers` execution stage covers the
+operation phase under either scheduler; CPU totals are work, not critical-path
+wall time. Scalar Poseidon currently has whole-kind attribution; the nested
+input/arithmetic/output counters describe the SIMD path.

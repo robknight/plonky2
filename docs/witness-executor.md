@@ -54,12 +54,18 @@ Settings are resolved during preparation. The following environment settings are
 | `PLONKY2_EXECUTOR_CHUNK_SCALE` | Advanced operation chunk-size multiplier | `1` |
 | `PLONKY2_EXECUTOR_SIMPLIFY_ARITHMETIC` | Simplify arithmetic coefficients | `true` |
 | `PLONKY2_EXECUTOR_GATHER` | Final gather policy: `auto`, `cpu`, `gpu` | `auto` |
-| `PLONKY2_EXECUTOR_GATHER_COLUMNS` | Advanced GPU upload staging tile width | `16` |
-| `PLONKY2_EXECUTOR_GATHER_ROWS` | Advanced GPU upload staging tile height | `256` |
+| `PLONKY2_EXECUTOR_GATHER_COLUMNS` | Advanced wire-gathering tile width | `16` |
+| `PLONKY2_EXECUTOR_GATHER_ROWS` | Advanced wire-gathering tile height | `256` |
 
 Invalid settings return `WitnessProgramError::InvalidConfiguration`. `WitnessCache::Disabled` overrides an environment cache directory. With the `parallel` feature, `config.thread_pool` accepts an `Arc<rayon::ThreadPool>` to share a caller-owned pool across prepared programs. A positive `threads` count creates an owned pool instead. These pools govern witness sampling, execution, gathering and wiping. Circuit compilation, host preparation, cache I/O and worklist fallback use the caller context. Avoid creating separate large pools for every circuit when a shared pool suits the application.
 
 Clones of a circuit share its installed program slot. Program handles share immutable topology, input metadata and prepared tables. Wiped reusable state/readiness allocations belong to their execution resources; the last owner releases retained allocations. A reuse budget limits retained buffer payload, not total process memory or allocations for proofs currently in flight. `with_execution_config` reuses a program's topology and tables with different resource/execution settings while preserving its compilation policy.
+
+## Hardware selection and portable binaries
+
+`WitnessPoseidon::Auto` uses eight independent permutations together when x86 CPU and operating-system support for AVX-512 is available. Portable x86 binaries use an isolated, runtime-dispatched kernel; the rest of the binary does not require AVX-512. Builds already targeting all required AVX-512 features retain their existing native specialization. Non-AVX-512 x86 and ARM use the scalar/production field path. Small groups and tails also use individual permutations. `WitnessPoseidon::Scalar` selects that path explicitly for comparison.
+
+This dispatch accelerates witness execution; it does not change hardware selection in the rest of the prover. Whole-binary `-C target-cpu=native` remains an application build choice for a known deployment CPU. Portable applications do not need that flag to get this witness kernel. Scheduling and batching are automatic; no MainPod identifier or circuit-specific generated crate is required.
 
 ## Failures and capability checks
 
@@ -77,7 +83,7 @@ The explicit `compile_witness_program`, `WitnessProgram::to_bytes`, `witness_pro
 
 `WitnessPreparation` reports source, total elapsed time, cache reading, compilation, writing, host preparation and any nonfatal cache warning. Total elapsed time also includes identity calculation and synchronization. GPU device/context creation and prover-wide shader warm-up belong to the GPU prover lifecycle and should be measured separately. Report preparation, first proof, warm witness generation and total proof time separately; moving work into preparation does not make it disappear.
 
-`tools/witness-profile` documents optional diagnostic attribution. Use ordinary builds for performance claims. The experiment history and retained/rejected candidates are in `docs/witness-executor-experiments.md`.
+`tools/witness-profile` documents optional diagnostic attribution. Use ordinary builds for performance claims. The experiment history and retained/rejected candidates are in `docs/witness-executor-experiments.md`; the completion measurements and scope are in `docs/witness-executor-acceptance.md`.
 
 Development tooling uses a separate `witness-benchmarks` feature. Snapshot
 export, replay and process-wide comparison overrides are unavailable in normal
