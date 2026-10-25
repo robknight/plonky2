@@ -972,3 +972,9 @@ pub fn benchmark_random_spans(enabled: bool) {
 pub fn benchmark_compact_readiness(enabled: bool) {
     region::cpu::benchmark_compact_readiness(enabled);
 }
+
+#[doc(hidden)]
+#[cfg(all(feature = "gpu", feature = "witness-benchmarks"))]
+pub fn benchmark_gather_tiling(current: bool) {
+    region::cpu::benchmark_gather_tiling(current);
+}

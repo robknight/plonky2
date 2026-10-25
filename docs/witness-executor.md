@@ -51,8 +51,8 @@ Settings are resolved during preparation. The following environment settings are
 | `PLONKY2_EXECUTOR_CHUNK_SCALE` | Advanced operation chunk-size multiplier | `1` |
 | `PLONKY2_EXECUTOR_SIMPLIFY_ARITHMETIC` | Simplify arithmetic coefficients | `true` |
 | `PLONKY2_EXECUTOR_GATHER` | Final gather policy: `auto`, `cpu`, `gpu` | `auto` |
-| `PLONKY2_EXECUTOR_GATHER_COLUMNS` | Advanced GPU upload staging tile width | `2` |
-| `PLONKY2_EXECUTOR_GATHER_ROWS` | Advanced GPU upload staging tile height | `1024` |
+| `PLONKY2_EXECUTOR_GATHER_COLUMNS` | Advanced GPU upload staging tile width | `16` |
+| `PLONKY2_EXECUTOR_GATHER_ROWS` | Advanced GPU upload staging tile height | `256` |
 
 Invalid settings return `WitnessProgramError::InvalidConfiguration`. `WitnessCache::Disabled` overrides an environment cache directory. With the `parallel` feature, `config.thread_pool` accepts an `Arc<rayon::ThreadPool>` to share a caller-owned pool across prepared programs. A positive `threads` count creates an owned pool instead. Avoid creating separate large pools for every circuit when a shared pool suits the application.
 

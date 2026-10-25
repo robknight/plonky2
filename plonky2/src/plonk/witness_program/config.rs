@@ -156,8 +156,8 @@ impl Default for WitnessConfig {
             cache: WitnessCache::Environment,
             chunk_scale: 1,
             simplify_arithmetic: true,
-            gather_columns: 2,
-            gather_rows: 1024,
+            gather_columns: 16,
+            gather_rows: 256,
         }
     }
 }

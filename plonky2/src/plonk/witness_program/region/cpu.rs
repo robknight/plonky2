@@ -72,6 +72,21 @@ fn compact_readiness_enabled() -> bool {
     true
 }
 
+#[cfg(all(feature = "gpu", feature = "witness-benchmarks"))]
+static GATHER_TILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+#[cfg(all(feature = "gpu", feature = "witness-benchmarks"))]
+pub(crate) fn benchmark_gather_tiling(current: bool) {
+    GATHER_TILING.store(current, Ordering::Relaxed);
+}
+#[cfg(feature = "gpu")]
+fn gather_tiling(config: &crate::plonk::witness_program::WitnessConfig) -> (usize, usize) {
+    #[cfg(feature = "witness-benchmarks")]
+    if !GATHER_TILING.load(Ordering::Relaxed) {
+        return (2, 1024);
+    }
+    (config.gather_columns, config.gather_rows)
+}
+
 impl RegionProgram {
     /// State slot written by each random value, indexed by the random index
     /// the program assigns. Slots below the representative count are
@@ -2233,8 +2248,9 @@ pub(crate) fn generate_wires_with<
                 // filled in parallel, then copied into a pooled device buffer.
                 report.gather_mode = "reused";
                 let staging = ctx.upload_staging(bytes as u64);
-                let columns = program.runtime.config.gather_columns.clamp(1, num_wires);
-                let rows = program.runtime.config.gather_rows.clamp(1, degree);
+                let (columns, rows) = gather_tiling(&program.runtime.config);
+                let columns = columns.clamp(1, num_wires);
+                let rows = rows.clamp(1, degree);
                 let fill = |columns: usize, rows: usize| {
                     cell_slots
                         .par_chunks(degree * columns)
@@ -2742,6 +2758,91 @@ pub(crate) mod tests {
             error.contains("out of range") || error.contains("invalid target block"),
             "{error}"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "gpu")]
+    #[ignore = "requires a native GPU; run alone with --ignored"]
+    fn gpu_cpu_gather_tiles_match_every_worklist_wire() {
+        use crate::hash::poseidon::PoseidonHash;
+        use crate::plonk::witness_program::{WitnessConfig, WitnessGather};
+        for hashes in [512, 1024] {
+            let mut builder =
+                CircuitBuilder::<G, 2>::new(CircuitConfig::standard_recursion_zk_config());
+            let input = builder.add_virtual_target();
+            let mut state = vec![input; 4];
+            for _ in 0..hashes {
+                state = builder
+                    .hash_n_to_hash_no_pad::<PoseidonHash>(state)
+                    .elements
+                    .to_vec();
+            }
+            builder.register_public_inputs(&state);
+            let data = builder.build::<C>();
+            let mut pw = PartialWitness::new();
+            pw.set_target(input, G::from_canonical_u64(13)).unwrap();
+            let worklist = crate::iop::generator::generate_partial_witness(
+                pw.clone(),
+                &data.prover_only,
+                &data.common,
+            )
+            .unwrap();
+            let program = data
+                .compile_witness_program_with_config(&[input], WitnessConfig::default())
+                .unwrap();
+            let random = program
+                .program
+                .random_representatives()
+                .iter()
+                .map(|r| {
+                    worklist.values[r.expect("exclusive random writer")]
+                        .unwrap()
+                        .to_canonical_u64()
+                })
+                .collect::<Vec<_>>();
+            let expected = worklist
+                .full_witness()
+                .wire_values
+                .into_iter()
+                .flatten()
+                .map(|v| v.to_canonical_u64())
+                .collect::<Vec<_>>();
+            for (columns, rows) in [(2, 1024), (16, 256), (7, 123)] {
+                let mut config = program.config().clone();
+                config.gather = WitnessGather::Cpu;
+                config.gather_columns = columns;
+                config.gather_rows = rows;
+                data.install_witness_program(program.with_execution_config(config).unwrap())
+                    .unwrap();
+                let (public_inputs, wires, report) = generate_wires_with(
+                    &pw,
+                    &data.prover_only,
+                    &data.common,
+                    true,
+                    Some(random.clone()),
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(report.gather_mode, "reused");
+                let Wires::Resident(resident) = &wires else {
+                    panic!("native resident wires required")
+                };
+                let actual = resident.ctx.read_u64(&resident.wire_values, expected.len());
+                assert_eq!(actual.len(), expected.len());
+                for (i, (&a, &b)) in actual.iter().zip(&expected).enumerate() {
+                    assert_eq!(a, b, "hashes={hashes} tile={columns}x{rows} cell={i}");
+                }
+                let proof = crate::plonk::prover::prove_from_wires(
+                    &data.prover_only,
+                    &data.common,
+                    public_inputs,
+                    wires,
+                    &mut TimingTree::default(),
+                )
+                .unwrap();
+                data.verify(proof).unwrap();
+            }
+        }
     }
 
     #[test]
