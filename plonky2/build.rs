@@ -11,6 +11,9 @@ use std::path::Path;
 use std::{env, fs};
 
 const SOURCES: &[&str] = &[
+    "src/iop/witness_operation.rs",
+    "src/iop/target.rs",
+    "src/iop/wire.rs",
     "src/plonk/witness_program.rs",
     "src/plonk/witness_program/config.rs",
     "src/plonk/witness_program/cache.rs",

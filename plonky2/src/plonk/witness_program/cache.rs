@@ -237,7 +237,7 @@ mod tests {
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField as F;
-    use crate::field::types::Field;
+    use crate::field::types::{Field, PrimeField64};
     use crate::hash::poseidon::PoseidonHash;
     use crate::iop::target::Target;
     use crate::iop::witness::{PartialWitness, WitnessWrite};
@@ -300,6 +300,92 @@ mod tests {
         }
         data.verify(data.prove(pw).unwrap()).unwrap();
     }
+    #[derive(Clone, Debug)]
+    struct ApplicationValue {
+        target: Target,
+        value: F,
+    }
+    impl crate::iop::generator::SimpleGenerator<F, 2> for ApplicationValue {
+        fn id(&self) -> String {
+            "ApplicationValue".into()
+        }
+        fn dependencies(&self) -> Vec<Target> {
+            Vec::new()
+        }
+        fn witness_operation(&self) -> Option<crate::iop::generator::WitnessOperation> {
+            Some(crate::iop::generator::WitnessOperation::Constant {
+                output: self.target,
+                value: self.value.to_canonical_u64(),
+            })
+        }
+        fn run_once(
+            &self,
+            _: &crate::iop::witness::PartitionWitness<F>,
+            out: &mut crate::iop::generator::GeneratedValues<F>,
+        ) -> anyhow::Result<()> {
+            out.set_target(self.target, self.value)
+        }
+        fn serialize(
+            &self,
+            dst: &mut Vec<u8>,
+            _: &crate::plonk::circuit_data::CommonCircuitData<F, 2>,
+        ) -> crate::util::serialization::IoResult<()> {
+            use crate::util::serialization::Write;
+            dst.write_target(self.target)?;
+            dst.write_field(self.value)
+        }
+        fn deserialize(
+            src: &mut crate::util::serialization::Buffer,
+            _: &crate::plonk::circuit_data::CommonCircuitData<F, 2>,
+        ) -> crate::util::serialization::IoResult<Self> {
+            use crate::util::serialization::Read;
+            Ok(Self {
+                target: src.read_target()?,
+                value: src.read_field()?,
+            })
+        }
+    }
+    #[test]
+    fn cache_identity_tracks_application_generator_semantics_beyond_circuit_digest() {
+        let make = |value| {
+            let mut builder =
+                CircuitBuilder::<F, 2>::new(CircuitConfig::standard_recursion_config());
+            let target = builder.add_virtual_target();
+            builder.register_public_input(target);
+            builder.add_simple_generator(ApplicationValue {
+                target,
+                value: F::from_canonical_u64(value),
+            });
+            builder.build::<C>()
+        };
+        let original = make(7);
+        let changed = make(11);
+        assert_eq!(
+            original.prover_only.circuit_digest,
+            changed.prover_only.circuit_digest
+        );
+        let dir = Directory::new();
+        let first = original
+            .prepare_witness_program_with_config(&[], dir.config())
+            .unwrap();
+        assert_eq!(
+            changed
+                .witness_program_from_bytes(&first.program().to_bytes())
+                .unwrap_err(),
+            WitnessProgramError::ChangedOperations
+        );
+        let second = changed
+            .prepare_witness_program_with_config(&[], dir.config())
+            .unwrap();
+        assert_eq!(second.source, WitnessProgramSource::Compiled);
+        assert_eq!(dir.entries().len(), 2);
+        for (data, value) in [(original, 7), (changed, 11)] {
+            let proof = data.prove(PartialWitness::new()).unwrap();
+            assert_eq!(proof.public_inputs[0], F::from_canonical_u64(value));
+            data.verify(proof).unwrap();
+        }
+    }
+
     #[test]
     fn cache_reloads_repairs_damage_and_keys_canonical_input_shapes() {
         let dir = Directory::new();

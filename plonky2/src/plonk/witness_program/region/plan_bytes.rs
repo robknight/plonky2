@@ -77,10 +77,12 @@ impl Hasher for Fnv128 {
 }
 
 /// Digest of everything a compiled program takes from the generators: each
-/// generator's typed operation with its parameters and its expanded input and
-/// output targets, in generator order (a generator without one counts as
-/// absent). Chunks are hashed in parallel and combined in order, so the
-/// result does not depend on the thread count.
+/// generator's complete typed operation and parameters, in generator order
+/// (a generator without one counts as absent). Target expansion is a pure
+/// function of this descriptor; its definition and Target's mapping semantics
+/// are included in WITNESS_PROGRAM_FORMAT. Hashing expanded vectors again would
+/// allocate and duplicate the same semantic information on every cache load.
+/// Chunks are combined in order independently of the thread count.
 pub(crate) fn operation_digest<F: RichField + Extendable<D>, const D: usize>(
     generators: &[WitnessGeneratorRef<F, D>],
 ) -> u128 {
@@ -95,8 +97,6 @@ pub(crate) fn operation_digest<F: RichField + Extendable<D>, const D: usize>(
                     Some(op) => {
                         hasher.write_u8(1);
                         op.hash(&mut hasher);
-                        op.inputs().hash(&mut hasher);
-                        op.outputs().hash(&mut hasher);
                     }
                 }
             }
