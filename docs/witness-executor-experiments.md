@@ -443,3 +443,10 @@ Layered, checked and dependency scheduling now compute a final chunk endpoint wi
 ## Honor CPU pools while staging explicit GPU gathering
 
 The optional GPU gather also packs compact state on the CPU. That packing now uses the configured execution pool, while GPU buffer allocation, mapping and submissions remain on the caller to preserve the backend's submission tracking. The native Metal wire-matrix test now covers both CPU and explicit GPU gathering at two circuit sizes, with two-thread pools for the irregular CPU tile and the GPU path. Every wire matched the worklist and all eight proofs verified. This closes the resource-scope audit without changing the recommended CPU gather policy.
+
+
+## Final inexpensive scheduling screens
+
+A cache-line-separated per-worker completion counter replaced the scheduler's shared per-task atomic counter in a bounded prototype, accumulating inline continuations locally. MainPod M4 replay varied from about 0.4% to 5% faster, without a stable material gain. On the Xeon/A40, the two matched global-counter runs had 24.16/24.02 ms median execution, while the worker-counter runs had 23.46/24.59 ms. Full witness and proof results were similarly neutral after the reverse-order comparison. Both variants passed correctness checks, but the extra allocation, thread-index dependency and implementation complexity are not justified. The worker-counter implementation is rejected and preserved only in the artifacts.
+
+A separate M4 sweep tried Poseidon task grains 1, 4, 8, 16 and 32 in the dependency scheduler, in forward and reverse order, with 640 exact MainPod replay executions. Four was only about 0.5–2% faster than eight; coarser grains regressed. This does not justify a new hardware/circuit policy or another public tuning field. The eight-permutation default remains. Temporary grain overrides are excluded from production code.
