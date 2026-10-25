@@ -699,85 +699,6 @@ pub(super) fn run_adaptive(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn copy(offset: u32, count: u32) -> Group {
-        Group {
-            kind: Kind::Copy,
-            count,
-            targets_offset: offset,
-            argument: Kind::Copy.argument(0),
-            inputs: 1,
-            outputs: 1,
-        }
-    }
-    fn plan(groups: Vec<Vec<Group>>, targets: Vec<u32>, slots: u32) -> RegionProgram {
-        RegionProgram {
-            groups,
-            targets: targets.into(),
-            coefficients: Vec::new().into(),
-            representatives: (0..slots as usize).collect::<Vec<_>>().into(),
-            roots: vec![0].into(),
-            random_count: 0,
-            alias_count: 0,
-            alias_pair_offset: 0,
-            state_slots: slots,
-            runtime: Default::default(),
-            fast: Default::default(),
-            rep_slots: Default::default(),
-            cell_slots: Default::default(),
-        }
-    }
-    #[test]
-    fn certificate_rejects_reads_from_the_current_layer() {
-        let mut p = plan(vec![vec![copy(0, 1), copy(2, 1)]], vec![0, 1, 1, 2], 3);
-        assert!(certify(&p)
-            .unwrap_err()
-            .to_string()
-            .contains("earlier layer"));
-        let dependent = p.groups[0].pop().unwrap();
-        p.groups.push(vec![dependent]);
-        assert_eq!(certify(&p).unwrap().single.as_ref(), &[0, 1, 1]);
-    }
-    #[test]
-    fn certificate_rejects_independent_writers_and_missing_slots() {
-        let p = plan(vec![vec![copy(0, 2)]], vec![0, 0, 1, 1], 2);
-        assert!(certify(&p)
-            .unwrap_err()
-            .to_string()
-            .contains("independent writers"));
-        let p = plan(vec![vec![copy(0, 1)]], vec![0, 1], 3);
-        assert!(certify(&p).unwrap_err().to_string().contains("unwritten"));
-    }
-    #[test]
-    fn certificate_does_not_trust_declared_operand_arities() {
-        let mut p = plan(vec![vec![copy(0, 1)]], vec![0, 1], 2);
-        p.groups[0][0].inputs = 0;
-        assert!(certify(&p).unwrap_err().to_string().contains("arity"));
-    }
-    #[test]
-    fn certificate_preserves_checks_for_roots_and_repeated_lane_outputs() {
-        let roots = plan(vec![vec![copy(0, 2)]], vec![0, 0, 0, 0], 1);
-        let roots_cert = certify(&roots).unwrap();
-        assert_eq!(roots_cert.single.as_ref(), &[0]);
-        assert_eq!(roots_cert.sparse_ready.as_deref(), Some(&[][..]));
-        let split = Group {
-            kind: Kind::BaseSplit,
-            count: 1,
-            targets_offset: 0,
-            argument: Kind::BaseSplit.argument((2 << 8) | 1),
-            inputs: 1,
-            outputs: 2,
-        };
-        let repeated = plan(vec![vec![split]], vec![0, 1, 1], 2);
-        let repeated_cert = certify(&repeated).unwrap();
-        assert_eq!(repeated_cert.single.as_ref(), &[0, 0]);
-        assert!(repeated_cert.sparse_ready.is_none());
-    }
-}
-
 #[cfg(feature = "gpu")]
 #[derive(Debug)]
 pub(super) struct GpuGather {
@@ -874,7 +795,7 @@ fn poseidon_mode(e: &Executor<'_>) -> u8 {
         }
     }
     if e.program.runtime.config.poseidon == super::super::WitnessPoseidon::Auto
-        && crate::hash::poseidon_trace_simd::NATIVE
+        && crate::hash::poseidon_trace_simd::native_available()
     {
         5
     } else {
@@ -928,4 +849,83 @@ pub(super) fn run_range(e: &Executor<'_>, g: &Group, start: u32, end: u32) -> Re
         25, 26
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn copy(offset: u32, count: u32) -> Group {
+        Group {
+            kind: Kind::Copy,
+            count,
+            targets_offset: offset,
+            argument: Kind::Copy.argument(0),
+            inputs: 1,
+            outputs: 1,
+        }
+    }
+    fn plan(groups: Vec<Vec<Group>>, targets: Vec<u32>, slots: u32) -> RegionProgram {
+        RegionProgram {
+            groups,
+            targets: targets.into(),
+            coefficients: Vec::new().into(),
+            representatives: (0..slots as usize).collect::<Vec<_>>().into(),
+            roots: vec![0].into(),
+            random_count: 0,
+            alias_count: 0,
+            alias_pair_offset: 0,
+            state_slots: slots,
+            runtime: Default::default(),
+            fast: Default::default(),
+            rep_slots: Default::default(),
+            cell_slots: Default::default(),
+        }
+    }
+    #[test]
+    fn certificate_rejects_reads_from_the_current_layer() {
+        let mut p = plan(vec![vec![copy(0, 1), copy(2, 1)]], vec![0, 1, 1, 2], 3);
+        assert!(certify(&p)
+            .unwrap_err()
+            .to_string()
+            .contains("earlier layer"));
+        let dependent = p.groups[0].pop().unwrap();
+        p.groups.push(vec![dependent]);
+        assert_eq!(certify(&p).unwrap().single.as_ref(), &[0, 1, 1]);
+    }
+    #[test]
+    fn certificate_rejects_independent_writers_and_missing_slots() {
+        let p = plan(vec![vec![copy(0, 2)]], vec![0, 0, 1, 1], 2);
+        assert!(certify(&p)
+            .unwrap_err()
+            .to_string()
+            .contains("independent writers"));
+        let p = plan(vec![vec![copy(0, 1)]], vec![0, 1], 3);
+        assert!(certify(&p).unwrap_err().to_string().contains("unwritten"));
+    }
+    #[test]
+    fn certificate_does_not_trust_declared_operand_arities() {
+        let mut p = plan(vec![vec![copy(0, 1)]], vec![0, 1], 2);
+        p.groups[0][0].inputs = 0;
+        assert!(certify(&p).unwrap_err().to_string().contains("arity"));
+    }
+    #[test]
+    fn certificate_preserves_checks_for_roots_and_repeated_lane_outputs() {
+        let roots = plan(vec![vec![copy(0, 2)]], vec![0, 0, 0, 0], 1);
+        let roots_cert = certify(&roots).unwrap();
+        assert_eq!(roots_cert.single.as_ref(), &[0]);
+        assert_eq!(roots_cert.sparse_ready.as_deref(), Some(&[][..]));
+        let split = Group {
+            kind: Kind::BaseSplit,
+            count: 1,
+            targets_offset: 0,
+            argument: Kind::BaseSplit.argument((2 << 8) | 1),
+            inputs: 1,
+            outputs: 2,
+        };
+        let repeated = plan(vec![vec![split]], vec![0, 1, 1], 2);
+        let repeated_cert = certify(&repeated).unwrap();
+        assert_eq!(repeated_cert.single.as_ref(), &[0, 0]);
+        assert!(repeated_cert.sparse_ready.is_none());
+    }
 }

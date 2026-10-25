@@ -1,25 +1,26 @@
-//! The compiled witness executor: runs a `RegionProgram` on the CPU.
+//! Runs a prepared typed-operation graph on canonical atomic witness state.
 //!
-//! A program is typed operations with resolved slot indices, grouped by kind
-//! inside dependency layers, plus alias slots for additional writers. The
-//! executor keeps one atomic value and one ready flag per slot, seeds the
-//! roots from the proof's inputs and runs the layers in order: the lanes of
-//! every group in a layer can run in parallel with the `parallel` feature,
-//! one Rust loop body per operation kind. Each layer finishes before the next.
-//! Readiness and conflict guards check every read and write, and each alias
-//! slot is compared with its canonical slot at the end to reject missing
-//! dependencies and conflicting writes. Values follow the generators' typed
-//! operation descriptions. The gather then writes the slots
-//! straight into the column-major wire matrix, or into a mapped upload buffer
-//! that is copied to device memory when the GPU prover applies. This avoids
-//! building and merging a partition witness before gathering the wires.
+//! Certification establishes dependencies and writer ownership before proving.
+//! The fast path retains agreement checks for seeded/repeated destinations and
+//! private alias slots; the checked interpreter remains available as a control.
+//! Parallel automatic execution advances ready chunks without global barriers.
+//! Layered and single-thread execution retain the original dependency layers.
+//! Sparse readiness metadata avoids one flag per value on eligible programs.
+//!
+//! Gathering writes directly into column-major wires or GPU upload staging,
+//! avoiding construction and merging of a partition witness. CPU sampling,
+//! execution, gathering and wiping honor the configured execution pool; GPU
+//! orchestration stays on the caller. State and readiness buffers are wiped
+//! before release or bounded reuse.
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{ensure, Result};
 use plonky2_maybe_rayon::*;
 
-use super::profile::{self, Poseidon as PoseidonPart, Stage};
+#[cfg(target_arch = "x86_64")]
+use super::profile::Poseidon as PoseidonPart;
+use super::profile::{self, Stage};
 use super::{Kind, RegionProgram};
 use crate::field::extension::quintic::QuinticExtension;
 use crate::field::extension::Extendable;
@@ -1723,13 +1724,21 @@ impl Executor<'_> {
         bases: &[u32],
         _: u8,
     ) -> Result<()> {
-        let mut k = start;
-        // Keep the scalar-emulated eight-lane kernel out of non-AVX-512 builds.
-        // The dispatch policy already selects scalar execution on those builds.
-        while crate::hash::poseidon_trace_simd::NATIVE && k + 8 <= end {
-            self.poseidon_batch::<8>(g, k, bases)?;
-            k += 8;
-        }
+        let k = {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let mut k = start;
+                while crate::hash::poseidon_trace_simd::native_available() && k + 8 <= end {
+                    self.poseidon_batch8(g, k, bases)?;
+                    k += 8;
+                }
+                k
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                start
+            }
+        };
         for k in k..end {
             if bases[k as usize] != u32::MAX {
                 self.step_poseidon_bulk(k, g.count, g.targets_offset, bases[k as usize])?;
@@ -1739,17 +1748,13 @@ impl Executor<'_> {
         }
         Ok(())
     }
-    fn poseidon_batch<const W: usize>(
-        &self,
-        g: &super::Group,
-        k: u32,
-        bases: &[u32],
-    ) -> Result<()> {
-        use crate::hash::poseidon_trace_simd::{trace, Lanes};
-        let mut input = [Lanes([G::ZERO; W]); 12];
-        let mut swap = Lanes([G::ZERO; W]);
+    #[cfg(target_arch = "x86_64")]
+    fn poseidon_batch8(&self, g: &super::Group, k: u32, bases: &[u32]) -> Result<()> {
+        use crate::hash::poseidon_trace_simd::{trace8, Lanes};
+        let mut input = [Lanes([G::ZERO; 8]); 12];
+        let mut swap = Lanes([G::ZERO; 8]);
         let pack = self.profile.poseidon(PoseidonPart::Input);
-        for lane in 0..W {
+        for lane in 0..8 {
             for i in 0..12 {
                 input[i].0[lane] =
                     self.input(g.targets_offset, i as u32, g.count, k + lane as u32)?;
@@ -1762,15 +1767,16 @@ impl Executor<'_> {
         }
         drop(pack);
         let arithmetic = self.profile.poseidon(PoseidonPart::Arithmetic);
-        let out = trace(input, swap);
+        let out = trace8(input, swap);
         drop(arithmetic);
         let _output = self.profile.poseidon(PoseidonPart::Output);
-        for lane in 0..W {
+        for lane in 0..8 {
             let values = core::array::from_fn(|i| out[i].0[lane]);
             self.store_poseidon(g, k + lane as u32, bases[k as usize + lane], &values)?;
         }
         Ok(())
     }
+    #[cfg(target_arch = "x86_64")]
     fn store_poseidon(&self, g: &super::Group, k: u32, base: u32, values: &[G; 122]) -> Result<()> {
         if base == u32::MAX {
             for (i, &v) in values.iter().enumerate() {
@@ -2907,8 +2913,10 @@ pub(crate) mod tests {
 
     #[test]
     fn sparse_flags_preserve_repeated_output_agreement_and_failure_cleanup() {
-        let mut config = crate::plonk::witness_program::WitnessConfig::default();
-        config.buffers = crate::plonk::witness_program::WitnessBuffers::Reuse { max_bytes: 4096 };
+        let config = crate::plonk::witness_program::WitnessConfig {
+            buffers: crate::plonk::witness_program::WitnessBuffers::Reuse { max_bytes: 4096 },
+            ..Default::default()
+        };
         let mut targets = vec![0, 1, 1];
         targets.extend(2..128);
         let program = RegionProgram {
@@ -2968,8 +2976,10 @@ pub(crate) mod tests {
 
     #[test]
     fn flagless_execution_checks_seeded_outputs_and_reuses_both_buffer_shapes() {
-        let mut config = crate::plonk::witness_program::WitnessConfig::default();
-        config.buffers = crate::plonk::witness_program::WitnessBuffers::Reuse { max_bytes: 64 };
+        let config = crate::plonk::witness_program::WitnessConfig {
+            buffers: crate::plonk::witness_program::WitnessBuffers::Reuse { max_bytes: 64 },
+            ..Default::default()
+        };
         let program = RegionProgram {
             groups: vec![vec![super::super::Group {
                 kind: Kind::Constant,

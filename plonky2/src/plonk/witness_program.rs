@@ -5,11 +5,10 @@
 //! every generator and needs no preparation. A caller that proves the same
 //! circuit many times can instead compile the circuit's generators once into
 //! a [`WitnessProgram`] and install it; later proofs whose inputs set the
-//! same targets then run the compiled executor, which is two to three times
-//! faster on large circuits. Compiling takes about 0.3 s per million
-//! generators on an Apple M4 (several times longer on slower server CPUs),
-//! so it pays off only for circuits that are proved repeatedly, and only the
-//! caller knows whether that is the case.
+//! same input classes then run the prepared executor. Performance depends on
+//! circuit structure, hardware and the rest of the proving pipeline. Measure
+//! preparation, first proof and steady-state witness/proof time separately;
+//! [`WitnessPreparation`] reports the preparation breakdown.
 //!
 //! Available with the default `std` and `rand_chacha` features, with or
 //! without `gpu`; with `gpu` the executor gathers wires into a mapped staging
@@ -29,7 +28,8 @@
 //! A program applies to proofs whose
 //! [`PartialWitness`](crate::iop::witness::PartialWitness) sets targets in
 //! exactly the copy-constraint classes it was compiled for; other proofs use
-//! the worklist, and the first such proof logs a warning. A circuit with
+//! the worklist by default, and the first such proof logs a warning.
+//! [`WitnessFallback::Error`] requires compiled execution instead. A circuit with
 //! lookup tables, or with a generator that does not describe its operation
 //! (see [`WitnessGenerator::witness_operation`]), cannot be compiled; check with
 //! [`CircuitData::witness_program_support`].
@@ -686,11 +686,13 @@ mod tests {
         let hash = builder.hash_n_to_hash_no_pad::<PoseidonHash>(vec![sum, a, b]);
         builder.register_public_inputs(&hash.elements);
         let data = builder.build::<C>();
-        let mut config = WitnessConfig::default();
-        config.schedule = WitnessSchedule::Dependencies;
-        config.threads = 2;
-        config.buffers = WitnessBuffers::Reuse {
-            max_bytes: 8 * 1024 * 1024,
+        let mut config = WitnessConfig {
+            schedule: WitnessSchedule::Dependencies,
+            threads: 2,
+            buffers: WitnessBuffers::Reuse {
+                max_bytes: 8 * 1024 * 1024,
+            },
+            ..WitnessConfig::default()
         };
         data.prepare_witness_program_with_config(&[a, b], config.clone())
             .unwrap();

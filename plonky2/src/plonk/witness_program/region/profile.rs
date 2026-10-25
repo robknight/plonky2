@@ -12,6 +12,7 @@ pub(super) enum Stage {
     Ready,
     Wipe,
 }
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 #[derive(Clone, Copy)]
 pub(super) enum Poseidon {
     Input,
@@ -204,6 +205,7 @@ impl Execution {
         Span
     }
     #[inline(always)]
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub fn poseidon(&self, _: Poseidon) -> Span {
         Span
     }

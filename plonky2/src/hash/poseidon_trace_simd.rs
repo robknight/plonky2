@@ -176,7 +176,20 @@ pub fn mds_fft<W: Word>(s: [W; 12]) -> [W; 12] {
 }
 #[inline(always)]
 #[unroll::unroll_for_loops]
-fn partial_init<W: Word>(s: [W; 12]) -> [W; 12] {
+fn partial_init<W: Word, const DIRECT: bool>(s: [W; 12]) -> [W; 12] {
+    // Closure bodies otherwise get instantiated without the isolated SIMD
+    // entry's target features. Keep that backend's arithmetic in its entry.
+    if DIRECT {
+        let mut out = s;
+        for j in 1..12 {
+            let mut v = W::c(0);
+            for i in 1..12 {
+                v = v + s[i] * W::c(G::FAST_PARTIAL_ROUND_INITIAL_MATRIX[i - 1][j - 1]);
+            }
+            out[j] = v;
+        }
+        return out;
+    }
     core::array::from_fn(|j| {
         if j == 0 {
             s[0]
@@ -191,10 +204,18 @@ fn partial_init<W: Word>(s: [W; 12]) -> [W; 12] {
 }
 #[inline(always)]
 #[unroll::unroll_for_loops]
-fn partial<W: Word>(s: [W; 12], r: usize) -> [W; 12] {
+fn partial<W: Word, const DIRECT: bool>(s: [W; 12], r: usize) -> [W; 12] {
     let mut d = s[0] * W::c(G::MDS_MATRIX_CIRC[0] + G::MDS_MATRIX_DIAG[0]);
     for i in 1..12 {
         d = d + s[i] * W::c(G::FAST_PARTIAL_ROUND_W_HATS[r][i - 1]);
+    }
+    if DIRECT {
+        let mut out = s;
+        out[0] = d;
+        for i in 1..12 {
+            out[i] = s[i] + s[0] * W::c(G::FAST_PARTIAL_ROUND_VS[r][i - 1]);
+        }
+        return out;
     }
     core::array::from_fn(|i| {
         if i == 0 {
@@ -210,7 +231,11 @@ pub fn trace<W: Word>(s: [W; 12], swap: W) -> [W; 122] {
     trace_core(s, swap)
 }
 #[inline(never)]
-fn trace_core<W: Word>(mut s: [W; 12], swap: W) -> [W; 122] {
+fn trace_core<W: Word>(s: [W; 12], swap: W) -> [W; 122] {
+    trace_impl::<W, false>(s, swap)
+}
+#[inline(always)]
+fn trace_impl<W: Word, const DIRECT: bool>(mut s: [W; 12], swap: W) -> [W; 122] {
     let mut out = [W::c(0); 122];
     let mut pos = 0;
     for i in 0..4 {
@@ -236,7 +261,7 @@ fn trace_core<W: Word>(mut s: [W; 12], swap: W) -> [W; 122] {
     for i in 0..12 {
         s[i] = s[i] + W::c(G::FAST_PARTIAL_FIRST_ROUND_CONSTANT[i]);
     }
-    s = partial_init(s);
+    s = partial_init::<W, DIRECT>(s);
     for r in 0..22 {
         out[pos] = s[0];
         pos += 1;
@@ -244,7 +269,7 @@ fn trace_core<W: Word>(mut s: [W; 12], swap: W) -> [W; 122] {
         if r != 21 {
             s[0] = s[0] + W::c(G::FAST_PARTIAL_ROUND_CONSTANTS[r]);
         }
-        s = partial(s, r);
+        s = partial::<W, DIRECT>(s, r);
     }
     round += 22;
     for _ in 0..4 {
@@ -310,6 +335,125 @@ pub fn reference(mut s: [G; 12], swap: G) -> [G; 122] {
     out
 }
 
+// Benchmark-only per-proof control. Call only while no witness execution is active.
+#[doc(hidden)]
+#[cfg(feature = "witness-benchmarks")]
+pub static BENCH_MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(255);
+#[doc(hidden)]
+#[cfg(feature = "witness-benchmarks")]
+pub fn benchmark_override(mode: u8, _minimum: u32) {
+    assert!(matches!(mode, 0 | 5 | 255));
+    BENCH_MODE.store(mode, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(all(
+    feature = "std",
+    feature = "rand_chacha",
+    target_arch = "x86_64",
+    not(all(
+        target_feature = "avx512f",
+        target_feature = "avx512dq",
+        target_feature = "avx512bw",
+        target_feature = "avx512vl",
+        target_feature = "avx512cd"
+    ))
+))]
+mod runtime_avx512;
+
+/// Detect CPU and OS support once; portable binaries retain scalar fallback.
+#[cfg(all(feature = "std", feature = "rand_chacha"))]
+#[inline]
+pub(crate) fn native_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *AVAILABLE.get_or_init(|| {
+            std::is_x86_feature_detected!("avx512f")
+                && std::is_x86_feature_detected!("avx512dq")
+                && std::is_x86_feature_detected!("avx512bw")
+                && std::is_x86_feature_detected!("avx512vl")
+                && std::is_x86_feature_detected!("avx512cd")
+        })
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+#[cfg(all(feature = "std", feature = "rand_chacha", target_arch = "x86_64"))]
+pub(crate) fn trace8(s: [Lanes<8>; 12], swap: Lanes<8>) -> [Lanes<8>; 122] {
+    assert!(
+        native_available(),
+        "AVX-512 Poseidon called without CPU/OS support"
+    );
+    // Keep the faster existing specialization when the whole binary already
+    // targets AVX-512. Portable builds isolate those instructions below.
+    #[cfg(all(
+        target_feature = "avx512f",
+        target_feature = "avx512dq",
+        target_feature = "avx512bw",
+        target_feature = "avx512vl",
+        target_feature = "avx512cd"
+    ))]
+    {
+        trace(s, swap)
+    }
+    #[cfg(not(all(
+        target_feature = "avx512f",
+        target_feature = "avx512dq",
+        target_feature = "avx512bw",
+        target_feature = "avx512vl",
+        target_feature = "avx512cd"
+    )))]
+    {
+        // SAFETY: standard detection includes OS vector-state support. The
+        // vector type stays private to this feature-enabled entry.
+        unsafe { runtime_avx512::trace(s, swap) }
+    }
+}
+
+#[test]
+#[cfg(all(feature = "std", feature = "rand_chacha", target_arch = "x86_64"))]
+fn runtime_dispatch_matches_all_scalar_trace_words() {
+    use crate::field::types::{Field64, PrimeField64};
+    if !native_available() {
+        return;
+    }
+    let mut rng = 0xd4973b60a12f9901u64;
+    for case in 0..32 {
+        let inputs = core::array::from_fn(|i| {
+            Lanes(core::array::from_fn(|lane| {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                let x = match (case + i + lane) % 8 {
+                    0 => 0,
+                    1 => 1,
+                    2 => u64::MAX,
+                    3 => G::ORDER - 1,
+                    _ => rng,
+                };
+                G::from_noncanonical_u64(x)
+            }))
+        });
+        let swap = Lanes(core::array::from_fn(|lane| {
+            G::from_canonical_usize((case + lane) % 2)
+        }));
+        let actual = trace8(inputs, swap);
+        for lane in 0..8 {
+            let expected = trace(core::array::from_fn(|i| inputs[i].0[lane]), swap.0[lane]);
+            for i in 0..122 {
+                assert_eq!(
+                    actual[i].0[lane].to_canonical_u64(),
+                    expected[i].to_canonical_u64(),
+                    "case={case} lane={lane} word={i}"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,22 +505,4 @@ mod tests {
             }
         }
     }
-}
-pub(crate) const NATIVE: bool = cfg!(all(
-    target_arch = "x86_64",
-    target_feature = "avx512bw",
-    target_feature = "avx512cd",
-    target_feature = "avx512dq",
-    target_feature = "avx512f",
-    target_feature = "avx512vl"
-));
-// Benchmark-only per-proof control. Call only while no witness execution is active.
-#[doc(hidden)]
-#[cfg(feature = "witness-benchmarks")]
-pub static BENCH_MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(255);
-#[doc(hidden)]
-#[cfg(feature = "witness-benchmarks")]
-pub fn benchmark_override(mode: u8, _minimum: u32) {
-    assert!(matches!(mode, 0 | 5 | 255));
-    BENCH_MODE.store(mode, core::sync::atomic::Ordering::Relaxed);
 }
