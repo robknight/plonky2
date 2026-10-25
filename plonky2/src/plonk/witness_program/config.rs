@@ -128,7 +128,9 @@ pub struct WitnessConfig {
     pub fallback: WitnessFallback,
     pub buffers: WitnessBuffers,
     pub gather: WitnessGather,
-    /// Zero uses the current Rayon pool. Positive values create a program-owned pool.
+    /// CPU witness sampling, execution, gathering and wiping use this pool.
+    /// Zero inherits the current Rayon pool; positive values create an owned pool.
+    /// Circuit compilation/preparation and disk I/O use the caller's context.
     pub threads: usize,
     /// A caller-owned pool, shared across programs. Takes precedence over `threads`.
     #[cfg(feature = "parallel")]
@@ -349,6 +351,24 @@ pub(crate) struct Runtime {
     pub pool: Option<Arc<rayon::ThreadPool>>,
 }
 impl Runtime {
+    #[inline]
+    pub(crate) fn run<R: Send>(&self, task: impl FnOnce() -> R + Send) -> R {
+        #[cfg(feature = "parallel")]
+        if let Some(pool) = &self.pool {
+            return pool.install(task);
+        }
+        task()
+    }
+    #[cfg(test)]
+    pub(crate) fn assert_active_pool(&self) {
+        #[cfg(feature = "parallel")]
+        if let Some(pool) = &self.pool {
+            assert!(
+                pool.current_thread_index().is_some(),
+                "witness CPU work escaped its configured pool"
+            );
+        }
+    }
     pub fn new(config: WitnessConfig) -> Result<Self, WitnessProgramError> {
         config.validate()?;
         #[cfg(feature = "parallel")]

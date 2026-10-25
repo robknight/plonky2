@@ -205,14 +205,8 @@ impl RegionProgram {
         root_values: &[u64],
         random_values: &'a [u64],
     ) -> Result<Executor<'a>> {
-        #[cfg(feature = "parallel")]
-        {
-            if let Some(pool) = &self.runtime.pool {
-                return pool
-                    .install(|| self.execute_state_inner(root_values, random_values, false));
-            }
-        }
-        self.execute_state_inner(root_values, random_values, false)
+        self.runtime
+            .run(|| self.execute_state_inner(root_values, random_values, false))
     }
 
     fn execute_state_inner<'a>(
@@ -374,10 +368,14 @@ impl Drop for Executor<'_> {
     /// elide, rather than relaxed atomic stores.
     fn drop(&mut self) {
         let wipe = self.profile.stage(Stage::Wipe);
-        self.program.runtime.buffers.release(
-            core::mem::take(&mut self.state),
-            core::mem::take(&mut self.ready),
-        );
+        let state = core::mem::take(&mut self.state);
+        let ready = core::mem::take(&mut self.ready);
+        let runtime = &self.program.runtime;
+        runtime.run(|| {
+            #[cfg(test)]
+            runtime.assert_active_pool();
+            runtime.buffers.release(state, ready);
+        });
         drop(wipe);
         self.profile.report();
     }
@@ -2150,7 +2148,11 @@ pub(crate) fn generate_wires_with<
     let random_sampling = profile::Pipeline::new("random-sampling", prover.generators.len());
     let random = match random_values {
         Some(values) => zeroize::Zeroizing::new(values),
-        None => sample_random_values::<F>(program.random_count as usize),
+        None => program.runtime.run(|| {
+            #[cfg(test)]
+            program.runtime.assert_active_pool();
+            sample_random_values::<F>(program.random_count as usize)
+        }),
     };
     report.sample = started.elapsed();
     drop(random_sampling);
@@ -2277,7 +2279,11 @@ pub(crate) fn generate_wires_with<
                             }
                         });
                 };
-                fill(columns, rows);
+                program.runtime.run(|| {
+                    #[cfg(test)]
+                    program.runtime.assert_active_pool();
+                    fill(columns, rows);
+                });
                 let wire_values = ctx.storage("resident proving wires", bytes as u64);
                 ctx.finish_upload(staging, &wire_values, bytes as u64);
                 wire_values
@@ -2287,15 +2293,19 @@ pub(crate) fn generate_wires_with<
         }
         _ => {
             let cell_slots = program.cell_slots(map, num_wires, degree);
-            let columns = cell_slots
-                .par_chunks(degree)
-                .map(|slots| {
-                    slots
-                        .iter()
-                        .map(|&slot| F::from_canonical_u64(slot_value(slot)))
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>();
+            let columns = program.runtime.run(|| {
+                #[cfg(test)]
+                program.runtime.assert_active_pool();
+                cell_slots
+                    .par_chunks(degree)
+                    .map(|slots| {
+                        slots
+                            .iter()
+                            .map(|&slot| F::from_canonical_u64(slot_value(slot)))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            });
             report.mode = "host";
             Wires::Host(MatrixWitness {
                 wire_values: columns,
@@ -2814,6 +2824,9 @@ pub(crate) mod tests {
                 config.gather = WitnessGather::Cpu;
                 config.gather_columns = columns;
                 config.gather_rows = rows;
+                if columns == 7 && cfg!(feature = "parallel") {
+                    config.threads = 2;
+                }
                 data.install_witness_program(program.with_execution_config(config).unwrap())
                     .unwrap();
                 let (public_inputs, wires, report) = generate_wires_with(

@@ -404,3 +404,8 @@ The retained tile dimensions will be checked on NVIDIA at the end. Raw compariso
 ## Reject invalid external target coordinates
 
 Compilation, preparation, direct binding, input-shape checking and worklist input initialization now validate wire rows/columns and use checked index arithmetic. An oversized wire column must not alias the next row, a row at `degree` must not alias virtual target zero, and an overflowing virtual index must not wrap into a valid class. Internal generator indexing remains unchanged. The focused test rejects these cases through compile/prepare and through both ordinary worklist and installed execution, with worklist and strict fallback policies. All 31 witness-program tests passed.
+
+
+## Apply execution pools to the complete witness CPU phase
+
+A configured caller-owned or program-owned pool now also covers CSPRNG sampling, final gathering and buffer wiping, rather than only the operation loops. Program selection remains on the caller, and compilation/preparation/cache I/O retain their caller context. GPU context/submission orchestration stays on the caller: moving it to workers would break the GPU backend's thread-local submission tracking. An initial native test exposed this as a stalled readback; its stack sample is preserved. CPU fill work alone enters the configured pool. No preparation mutex is held across a cross-pool witness call. The same runtime helper handles nested calls and diagnostic cleanup; default inherited-pool behavior is unchanged. All 31 witness tests passed, with test assertions requiring the actual configured pool during witness work and wiping. The GPU wire-matrix test also exercises an explicit two-thread pool.
