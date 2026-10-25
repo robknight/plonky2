@@ -274,7 +274,10 @@ fn compile_with_identity<
     // Compilation reads which classes are set, never their values.
     let mut entry = PartitionWitness::new(num_wires, degree, map);
     for &target in input_targets {
-        if target.index(num_wires, degree) >= map.len() {
+        if !target
+            .checked_index(num_wires, degree)
+            .is_some_and(|i| i < map.len())
+        {
             return Err(WitnessProgramError::InputOutsideCircuit(target));
         }
         entry
@@ -485,9 +488,8 @@ pub(crate) fn prepare<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, 
     let mut mask = input_targets
         .iter()
         .map(|&t| {
-            prover
-                .representative_map
-                .get(t.index(common.config.num_wires, common.degree()))
+            t.checked_index(common.config.num_wires, common.degree())
+                .and_then(|index| prover.representative_map.get(index))
                 .copied()
                 .ok_or(WitnessProgramError::InputOutsideCircuit(t))
         })
@@ -649,6 +651,7 @@ mod tests {
     use super::region::cpu::EXECUTOR_RUNS;
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField as G;
+    use crate::field::types::Field;
     use crate::iop::witness::PartialWitness;
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::{CircuitConfig, CircuitData};
@@ -660,6 +663,49 @@ mod tests {
         let proof = data.prove(pw).unwrap();
         data.verify(proof).unwrap();
         EXECUTOR_RUNS.with(|runs| runs.get()) > before
+    }
+
+    #[test]
+    fn external_target_coordinates_are_rejected_without_wrapping_or_aliasing() {
+        let mut builder = CircuitBuilder::<G, 2>::new(CircuitConfig::standard_recursion_config());
+        let a = builder.add_virtual_target();
+        let b = builder.add_virtual_target();
+        let product = builder.mul(a, b);
+        builder.register_public_input(product);
+        let data = builder.build::<C>();
+        let mut inputs = PartialWitness::new();
+        inputs.set_target(a, G::from_canonical_u64(7)).unwrap();
+        inputs.set_target(b, G::from_canonical_u64(9)).unwrap();
+        let invalids = [
+            Target::wire(0, data.common.config.num_wires),
+            Target::wire(data.common.degree(), 0),
+            Target::wire(usize::MAX, 0),
+            Target::VirtualTarget { index: usize::MAX },
+        ];
+        for target in invalids {
+            assert_eq!(
+                data.compile_witness_program(&[target]).unwrap_err(),
+                WitnessProgramError::InputOutsideCircuit(target)
+            );
+            assert_eq!(
+                data.prepare_witness_program(&[target]).unwrap_err(),
+                WitnessProgramError::InputOutsideCircuit(target)
+            );
+            for mode in 0..3 {
+                data.remove_witness_program();
+                if mode != 0 {
+                    let mut config = WitnessConfig::default();
+                    if mode == 2 {
+                        config.fallback = WitnessFallback::Error;
+                    }
+                    data.prepare_witness_program_with_config(&[a, b], config)
+                        .unwrap();
+                }
+                let mut bad = inputs.clone();
+                bad.set_target(target, G::from_canonical_u64(7)).unwrap();
+                assert!(data.prove(bad).is_err());
+            }
+        }
     }
 
     #[test]

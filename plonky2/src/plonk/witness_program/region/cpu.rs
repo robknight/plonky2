@@ -1960,8 +1960,9 @@ fn bind_roots_direct<F: PrimeField64>(
     let mut values = vec![0; program.roots.len()];
     let mut seen = vec![false; values.len()];
     for (&target, &value) in &inputs.target_values {
-        let representative = map
-            .get(target.index(num_wires, degree))
+        let representative = target
+            .checked_index(num_wires, degree)
+            .and_then(|index| map.get(index))
             .copied()
             .ok_or_else(|| anyhow::anyhow!("input target {target:?} is outside the circuit"))?;
         let Some(position) = slots
@@ -1999,9 +2000,8 @@ fn report_input_mismatch<
         .target_values
         .keys()
         .map(|t| {
-            prover
-                .representative_map
-                .get(t.index(common.config.num_wires, common.degree()))
+            t.checked_index(common.config.num_wires, common.degree())
+                .and_then(|index| prover.representative_map.get(index))
                 .copied()
                 .ok_or_else(|| anyhow::anyhow!("input outside circuit"))
         })
@@ -2044,7 +2044,9 @@ pub(crate) fn generate_wires_with<
     let degree = common.degree();
     let map = &prover.representative_map;
     let rep = |target: Target| -> Result<usize> {
-        map.get(target.index(num_wires, degree))
+        target
+            .checked_index(num_wires, degree)
+            .and_then(|index| map.get(index))
             .copied()
             .ok_or_else(|| anyhow::anyhow!("input target {target:?} is outside the circuit"))
     };

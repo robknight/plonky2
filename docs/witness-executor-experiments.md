@@ -399,3 +399,8 @@ A public-API MainPod harness compared 20 configurations with paired controls: CP
 **Keep existing defaults elsewhere:** GPU gathering roughly doubled the M4 witness phase in the screen. Canonical, block4 and block8 layouts increased it by approximately 37%, 42% and 68%; output-local placement remains the default. Two- and four-thread execution pools lost to the eight-thread control. Buffer reuse again improved M4 witness time, but remains explicit because it retains per-program memory. These measurements do not change its API or default.
 
 The retained tile dimensions will be checked on NVIDIA at the end. Raw comparisons are `configuration-*`, `gather-tiles-*` and the preserved temporary harness sources in the completion artifacts. No rejected scheduling/layout prototype is included in implementation commits.
+
+
+## Reject invalid external target coordinates
+
+Compilation, preparation, direct binding, input-shape checking and worklist input initialization now validate wire rows/columns and use checked index arithmetic. An oversized wire column must not alias the next row, a row at `degree` must not alias virtual target zero, and an overflowing virtual index must not wrap into a valid class. Internal generator indexing remains unchanged. The focused test rejects these cases through compile/prepare and through both ordinary worklist and installed execution, with worklist and strict fallback policies. All 31 witness-program tests passed.

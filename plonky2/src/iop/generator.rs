@@ -62,6 +62,11 @@ pub(crate) fn initial_witness<
         representative_map: &prover_data.representative_map,
     };
     for (&t, &v) in &inputs.target_values {
+        anyhow::ensure!(
+            t.checked_index(config.num_wires, common_data.degree())
+                .is_some_and(|i| i < prover_data.representative_map.len()),
+            "input target {t:?} is outside the circuit"
+        );
         witness.set_target(t, v)?;
     }
     Ok(witness)

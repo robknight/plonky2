@@ -59,6 +59,19 @@ impl Target {
         }
     }
 
+    /// Bounds-aware indexing for external inputs. Virtual-target limits still
+    /// require checking the returned index against the representative map.
+    #[inline]
+    pub(crate) fn checked_index(&self, num_wires: usize, degree: usize) -> Option<usize> {
+        match *self {
+            Target::Wire(Wire { row, column }) if row < degree && column < num_wires => {
+                row.checked_mul(num_wires)?.checked_add(column)
+            }
+            Target::Wire(_) => None,
+            Target::VirtualTarget { index } => degree.checked_mul(num_wires)?.checked_add(index),
+        }
+    }
+
     /// Conversion to an `ExtensionTarget`.
     pub const fn to_ext_target<const D: usize>(self, zero: Self) -> ExtensionTarget<D> {
         let mut arr = [zero; D];
