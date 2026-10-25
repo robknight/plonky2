@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use anyhow::{ensure, Result};
 use plonky2_maybe_rayon::*;
 
-use super::cpu::Executor;
+use super::cpu::{chunk_end, Executor};
 use super::{Group, Kind, RegionProgram};
 
 mod generated {
@@ -70,7 +70,7 @@ pub(super) fn run_fixed<const K: u8>(executor: &Executor<'_>, group: &Group) -> 
                 .into_par_iter()
                 .try_for_each(|c| {
                     let start = c * chunk;
-                    let end = ((c + 1) * chunk).min(group.count);
+                    let end = chunk_end(c * chunk, chunk, group.count);
                     let _profile = executor.profile.kind(K, end - start);
                     executor.step_random_span(source, destination, start, end)
                 });
@@ -82,12 +82,12 @@ pub(super) fn run_fixed<const K: u8>(executor: &Executor<'_>, group: &Group) -> 
             .try_for_each(|c| {
                 let _profile = executor
                     .profile
-                    .kind(K, (((c + 1) * chunk).min(group.count)) - c * chunk);
+                    .kind(K, (chunk_end(c * chunk, chunk, group.count)) - c * chunk);
                 arithmetic_simplified(
                     executor,
                     group,
                     c * chunk,
-                    ((c + 1) * chunk).min(group.count),
+                    chunk_end(c * chunk, chunk, group.count),
                 )
             });
     }
@@ -97,12 +97,12 @@ pub(super) fn run_fixed<const K: u8>(executor: &Executor<'_>, group: &Group) -> 
             .try_for_each(|c| {
                 let _profile = executor
                     .profile
-                    .kind(K, (((c + 1) * chunk).min(group.count)) - c * chunk);
+                    .kind(K, (chunk_end(c * chunk, chunk, group.count)) - c * chunk);
                 equality_batch(
                     executor,
                     group,
                     c * chunk,
-                    ((c + 1) * chunk).min(group.count),
+                    chunk_end(c * chunk, chunk, group.count),
                 )
             });
     }
@@ -113,7 +113,7 @@ pub(super) fn run_fixed<const K: u8>(executor: &Executor<'_>, group: &Group) -> 
             .into_par_iter()
             .try_for_each(|c| {
                 let begin = c * chunk;
-                let end = ((c + 1) * chunk).min(group.count);
+                let end = chunk_end(c * chunk, chunk, group.count);
                 let _profile = executor.profile.kind(K, end - begin);
                 let mode = if use_simd { poseidon_mode(executor) } else { 0 };
                 if mode != 0 {
@@ -139,8 +139,8 @@ pub(super) fn run_fixed<const K: u8>(executor: &Executor<'_>, group: &Group) -> 
         .try_for_each(|c| {
             let _profile = executor
                 .profile
-                .kind(K, (((c + 1) * chunk).min(group.count)) - c * chunk);
-            for k in c * chunk..((c + 1) * chunk).min(group.count) {
+                .kind(K, (chunk_end(c * chunk, chunk, group.count)) - c * chunk);
+            for k in c * chunk..chunk_end(c * chunk, chunk, group.count) {
                 executor.step_fixed::<K>(group, k)?;
             }
             Ok(())

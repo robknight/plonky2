@@ -290,7 +290,7 @@ impl RegionProgram {
             let chunk = lane_chunk(group.kind);
             let chunks = group.count.div_ceil(chunk);
             (0..chunks).into_par_iter().try_for_each(|c| {
-                for k in c * chunk..((c + 1) * chunk).min(group.count) {
+                for k in c * chunk..chunk_end(c * chunk, chunk, group.count) {
                     executor.step(group, k)?;
                 }
                 Ok::<(), anyhow::Error>(())
@@ -395,6 +395,11 @@ impl Drop for Executor<'_> {
 
 /// Lanes per Rayon task. Expensive kinds split to single lanes; cheap
 /// kinds are batched so task overhead stays below the arithmetic.
+#[inline]
+pub(super) fn chunk_end(start: u32, chunk: u32, count: u32) -> u32 {
+    start.saturating_add(chunk).min(count)
+}
+
 pub(super) fn lane_chunk(kind: Kind) -> u32 {
     match kind {
         Kind::Poseidon
@@ -2530,6 +2535,22 @@ pub(crate) mod tests {
     use crate::plonk::config::PoseidonGoldilocksConfig as C;
     use crate::util::reducing::ReducingFactorTarget;
     use crate::util::timing::TimingTree;
+
+    #[test]
+    fn chunk_end_handles_the_last_u32_range_without_wrapping() {
+        for count in [1, 512, u32::MAX / 2, u32::MAX - 1, u32::MAX] {
+            for chunk in [1, 2, 511, 1 << 31, u32::MAX] {
+                let last = count.div_ceil(chunk) - 1;
+                for c in [0, last] {
+                    let start = c * chunk;
+                    assert_eq!(
+                        chunk_end(start, chunk, count) as u64,
+                        (start as u64 + chunk as u64).min(count as u64)
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn direct_binding_validates_aliases_missing_and_additional_roots() {

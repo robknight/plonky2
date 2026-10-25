@@ -77,7 +77,7 @@ impl Schedule {
                     tasks.push(Task {
                         group: group.clone(),
                         start,
-                        end: start.saturating_add(chunk).min(group.count),
+                        end: super::cpu::chunk_end(start, chunk, group.count),
                     });
                     layers.push(layer);
                 }
