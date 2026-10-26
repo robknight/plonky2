@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use super::region::buffers::Buffers;
 use super::WitnessProgramError;
+use crate::util::environment::{Environment, EnvironmentError};
 
 /// Placement of witness values. `Outputs` is the measured general default.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -181,85 +182,102 @@ impl Default for WitnessConfig {
 fn invalid(message: impl Into<String>) -> WitnessProgramError {
     WitnessProgramError::InvalidConfiguration(message.into())
 }
-fn setting(name: &str, legacy: &str) -> Result<Option<String>, WitnessProgramError> {
-    let key = if std::env::var_os(name).is_some() {
-        name
-    } else {
-        legacy
-    };
-    match std::env::var(key) {
-        Ok(v) => Ok(Some(v)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(_) => Err(invalid(format!("{key} must be Unicode"))),
+impl From<EnvironmentError> for WitnessProgramError {
+    fn from(error: EnvironmentError) -> Self {
+        invalid(error.to_string())
     }
 }
-fn number<T: std::str::FromStr>(
-    name: &str,
-    legacy: &str,
-) -> Result<Option<T>, WitnessProgramError> {
-    setting(name, legacy)?
-        .map(|v| {
-            v.parse()
-                .map_err(|_| invalid(format!("{name}: invalid number {v:?}")))
-        })
-        .transpose()
+pub(super) fn cache_from_env() -> WitnessCache {
+    cache_from_environment(&Environment::process())
+}
+fn cache_from_environment<F: Fn(&str) -> Option<std::ffi::OsString>>(
+    env: &Environment<F>,
+) -> WitnessCache {
+    env.path("PLONKY2_EXECUTOR_CACHE_DIR")
+        .map_or(WitnessCache::Disabled, WitnessCache::Directory)
 }
 impl WitnessConfig {
     /// Resolves documented `PLONKY2_EXECUTOR_*` settings. Historical `P2_AOT_*`
     /// controls are accepted as migration aliases; the new names take precedence.
     pub fn from_env() -> Result<Self, WitnessProgramError> {
+        Self::from_environment(&Environment::process())
+    }
+    fn from_environment<F: Fn(&str) -> Option<std::ffi::OsString>>(
+        env: &Environment<F>,
+    ) -> Result<Self, WitnessProgramError> {
         let mut c = Self::default();
-        if let Some(v) = setting("PLONKY2_EXECUTOR_LAYOUT", "P2_AOT_LAYOUT")? {
-            c.layout = match v.as_str() {
-                "canonical" => WitnessLayout::Canonical,
-                "outputs" | "aos" => WitnessLayout::Outputs,
-                "representative" => WitnessLayout::Representatives,
-                "block4" => WitnessLayout::Block4,
-                "block8" => WitnessLayout::Block8,
-                _ => return Err(invalid(format!("unknown witness layout {v:?}"))),
-            };
+        if let Some(v) = env.choice(
+            "PLONKY2_EXECUTOR_LAYOUT",
+            "P2_AOT_LAYOUT",
+            &[
+                ("canonical", WitnessLayout::Canonical),
+                ("outputs", WitnessLayout::Outputs),
+                ("aos", WitnessLayout::Outputs),
+                ("representative", WitnessLayout::Representatives),
+                ("block4", WitnessLayout::Block4),
+                ("block8", WitnessLayout::Block8),
+            ],
+        )? {
+            c.layout = v;
         }
-        if let Some(v) = number("PLONKY2_EXECUTOR_CHAIN_LENGTH", "P2_AOT_CHAIN_LEN")? {
+        if let Some(v) = env.number("PLONKY2_EXECUTOR_CHAIN_LENGTH", "P2_AOT_CHAIN_LEN")? {
             c.chain_length = v;
         }
-        if setting("P2_AOT_FUSE", "P2_AOT_FUSE")?.as_deref() == Some("0")
-            && std::env::var_os("PLONKY2_EXECUTOR_CHAIN_LENGTH").is_none()
+        if !env.present("PLONKY2_EXECUTOR_CHAIN_LENGTH")
+            && env.boolean("P2_AOT_FUSE", "P2_AOT_FUSE")? == Some(false)
         {
             c.chain_length = 0;
         }
-        if let Some(v) = setting("PLONKY2_EXECUTOR_MODE", "P2_AOT_MODE")? {
-            c.execution = match v.as_str() {
-                "auto" | "adaptive" | "fast" | "fast-batch" | "bulk" => WitnessExecution::Auto,
-                "checked" => WitnessExecution::Checked,
-                _ => return Err(invalid(format!("unknown witness execution mode {v:?}"))),
-            };
+        if let Some(v) = env.choice(
+            "PLONKY2_EXECUTOR_MODE",
+            "P2_AOT_MODE",
+            &[
+                ("auto", WitnessExecution::Auto),
+                ("adaptive", WitnessExecution::Auto),
+                ("fast", WitnessExecution::Auto),
+                ("fast-batch", WitnessExecution::Auto),
+                ("bulk", WitnessExecution::Auto),
+                ("checked", WitnessExecution::Checked),
+            ],
+        )? {
+            c.execution = v;
         }
-        if let Some(v) = setting("PLONKY2_EXECUTOR_SCHEDULE", "PLONKY2_EXECUTOR_SCHEDULE")? {
-            c.schedule = match v.as_str() {
-                "auto" => WitnessSchedule::Auto,
-                "layers" => WitnessSchedule::Layers,
-                "dependencies" => WitnessSchedule::Dependencies,
-                _ => return Err(invalid(format!("unknown witness schedule {v:?}"))),
-            };
+        if let Some(v) = env.choice(
+            "PLONKY2_EXECUTOR_SCHEDULE",
+            "PLONKY2_EXECUTOR_SCHEDULE",
+            &[
+                ("auto", WitnessSchedule::Auto),
+                ("layers", WitnessSchedule::Layers),
+                ("dependencies", WitnessSchedule::Dependencies),
+            ],
+        )? {
+            c.schedule = v;
         }
-        if let Some(v) = setting("PLONKY2_EXECUTOR_POSEIDON", "P2_POSEIDON_MODE")? {
-            c.poseidon = match v.as_str() {
-                "auto" | "batch8-fft" => WitnessPoseidon::Auto,
-                "scalar" => WitnessPoseidon::Scalar,
-                _ => return Err(invalid(format!("unknown Poseidon mode {v:?}"))),
-            };
+        if let Some(v) = env.choice(
+            "PLONKY2_EXECUTOR_POSEIDON",
+            "P2_POSEIDON_MODE",
+            &[
+                ("auto", WitnessPoseidon::Auto),
+                ("batch8-fft", WitnessPoseidon::Auto),
+                ("scalar", WitnessPoseidon::Scalar),
+            ],
+        )? {
+            c.poseidon = v;
         }
-        if let Some(v) = setting("PLONKY2_EXECUTOR_FALLBACK", "PLONKY2_EXECUTOR_FALLBACK")? {
-            c.fallback = match v.as_str() {
-                "worklist" => WitnessFallback::Worklist,
-                "error" => WitnessFallback::Error,
-                _ => return Err(invalid(format!("unknown witness fallback {v:?}"))),
-            };
+        if let Some(v) = env.choice(
+            "PLONKY2_EXECUTOR_FALLBACK",
+            "PLONKY2_EXECUTOR_FALLBACK",
+            &[
+                ("worklist", WitnessFallback::Worklist),
+                ("error", WitnessFallback::Error),
+            ],
+        )? {
+            c.fallback = v;
         }
-        if let Some(v) = number("PLONKY2_EXECUTOR_THREADS", "P2_AOT_WITNESS_THREADS")? {
+        if let Some(v) = env.number("PLONKY2_EXECUTOR_THREADS", "P2_AOT_WITNESS_THREADS")? {
             c.threads = v;
         }
-        if let Some(v) = number(
+        if let Some(v) = env.number(
             "PLONKY2_EXECUTOR_BUFFER_BYTES",
             "PLONKY2_EXECUTOR_BUFFER_BYTES",
         )? {
@@ -268,45 +286,45 @@ impl WitnessConfig {
             } else {
                 WitnessBuffers::Reuse { max_bytes: v }
             };
-        } else if setting("P2_WITNESS_BUFFERS", "P2_WITNESS_BUFFERS")?.as_deref() == Some("pool") {
+        } else if env.choice(
+            "P2_WITNESS_BUFFERS",
+            "P2_WITNESS_BUFFERS",
+            &[("pool", true), ("fresh", false)],
+        )? == Some(true)
+        {
             c.buffers = WitnessBuffers::Reuse {
                 max_bytes: 64 * 1024 * 1024,
             };
         }
-        if let Some(v) = number("PLONKY2_EXECUTOR_CHUNK_SCALE", "P2_AOT_CHUNK_SCALE")? {
+        if let Some(v) = env.number("PLONKY2_EXECUTOR_CHUNK_SCALE", "P2_AOT_CHUNK_SCALE")? {
             c.chunk_scale = v;
         }
-        if let Some(v) = number("PLONKY2_EXECUTOR_GATHER_COLUMNS", "P2_AOT_GATHER_COLUMNS")? {
+        if let Some(v) = env.number("PLONKY2_EXECUTOR_GATHER_COLUMNS", "P2_AOT_GATHER_COLUMNS")? {
             c.gather_columns = v;
         }
-        if let Some(v) = number("PLONKY2_EXECUTOR_GATHER_ROWS", "P2_AOT_GATHER_ROWS")? {
+        if let Some(v) = env.number("PLONKY2_EXECUTOR_GATHER_ROWS", "P2_AOT_GATHER_ROWS")? {
             c.gather_rows = v;
         }
-        if let Some(v) = setting("PLONKY2_EXECUTOR_GATHER", "PLONKY2_EXECUTOR_GATHER")? {
-            c.gather = match v.as_str() {
-                "auto" => WitnessGather::Auto,
-                "cpu" => WitnessGather::Cpu,
-                "gpu" => WitnessGather::Gpu,
-                _ => return Err(invalid(format!("unknown witness gather {v:?}"))),
-            };
-        } else if setting("P2_AOT_GPU_GATHER", "P2_AOT_GPU_GATHER")?.as_deref() == Some("1") {
+        if let Some(v) = env.choice(
+            "PLONKY2_EXECUTOR_GATHER",
+            "PLONKY2_EXECUTOR_GATHER",
+            &[
+                ("auto", WitnessGather::Auto),
+                ("cpu", WitnessGather::Cpu),
+                ("gpu", WitnessGather::Gpu),
+            ],
+        )? {
+            c.gather = v;
+        } else if env.boolean("P2_AOT_GPU_GATHER", "P2_AOT_GPU_GATHER")? == Some(true) {
             c.gather = WitnessGather::Gpu;
         }
-        if let Some(v) = setting(
+        if let Some(v) = env.boolean(
             "PLONKY2_EXECUTOR_SIMPLIFY_ARITHMETIC",
             "P2_AOT_SIMPLIFY_ARITH",
         )? {
-            c.simplify_arithmetic = match v.as_str() {
-                "1" | "true" => true,
-                "0" | "false" => false,
-                _ => return Err(invalid("arithmetic simplification must be true or false")),
-            };
+            c.simplify_arithmetic = v;
         }
-        c.cache = std::env::var_os("PLONKY2_EXECUTOR_CACHE_DIR")
-            .filter(|dir| !dir.is_empty())
-            .map_or(WitnessCache::Disabled, |dir| {
-                WitnessCache::Directory(dir.into())
-            });
+        c.cache = cache_from_environment(env);
         c.validate()?;
         Ok(c)
     }
@@ -433,6 +451,38 @@ impl Default for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn typed_settings_keep_new_names_ahead_of_legacy_aliases() {
+        let values: std::collections::BTreeMap<_, std::ffi::OsString> = [
+            ("PLONKY2_EXECUTOR_CHAIN_LENGTH", "4".into()),
+            ("P2_AOT_FUSE", "bad".into()),
+            ("P2_AOT_CHAIN_LEN", "invalid".into()),
+            ("PLONKY2_EXECUTOR_GATHER", "cpu".into()),
+            ("P2_AOT_GPU_GATHER", "bad".into()),
+            ("PLONKY2_EXECUTOR_BUFFER_BYTES", "0".into()),
+            ("P2_WITNESS_BUFFERS", "bad".into()),
+            ("PLONKY2_EXECUTOR_SIMPLIFY_ARITHMETIC", "false".into()),
+            ("PLONKY2_EXECUTOR_CACHE_DIR", "".into()),
+        ]
+        .into();
+        let env = Environment::with_lookup(|key: &str| values.get(key).cloned());
+        let c = WitnessConfig::from_environment(&env).unwrap();
+        assert_eq!(c.chain_length, 4);
+        assert_eq!(c.gather, WitnessGather::Cpu);
+        assert_eq!(c.buffers, WitnessBuffers::Fresh);
+        assert_eq!(c.cache, WitnessCache::Disabled);
+        assert!(!c.simplify_arithmetic);
+        for (key, value) in [
+            ("PLONKY2_EXECUTOR_SIMPLIFY_ARITHMETIC", "yes"),
+            ("PLONKY2_EXECUTOR_GATHER", "bad"),
+            ("P2_AOT_GPU_GATHER", "bad"),
+            ("PLONKY2_EXECUTOR_THREADS", "not-an-integer"),
+        ] {
+            let env = Environment::with_lookup(|name: &str| (name == key).then(|| value.into()));
+            let error = WitnessConfig::from_environment(&env).unwrap_err();
+            assert!(error.to_string().contains(key), "{error}");
+        }
+    }
     #[test]
     fn validates_application_options_before_resource_creation() {
         let options = WitnessConfig::default();

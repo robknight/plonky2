@@ -26,6 +26,8 @@ Missing entries are compiled. Incompatible or damaged entries are rebuilt and re
 
 ## Configuration and resource ownership
 
+The [runtime configuration audit](runtime-configuration.md) identifies deployment settings that can be controlled through environment defaults, alongside resource/lifecycle APIs that remain explicit.
+
 `WitnessConfig::default()` selects deterministic recommended settings. `WitnessConfig::from_env()` applies process defaults; the ordinary preparation methods use it. To override process settings, pass a configuration to `prepare_witness_program_with_config`.
 
 ```rust,ignore

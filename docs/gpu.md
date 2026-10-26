@@ -35,15 +35,19 @@ plonky2 = { git = "...", features = ["gpu"] }
 
 Nothing else is required: on the first proof the prover creates a process-wide GPU context on the best available adapter, and proves on the CPU if there is none. The context is shut down automatically at normal process exit; `plonky2::gpu::shutdown()` releases it earlier, after proving workers have been joined.
 
-To change settings, call `plonky2::gpu::configure` before the first proof:
+Deployment settings are read automatically from typed `PLONKY2_GPU_*` environment defaults. For example, `PLONKY2_GPU_PROVING_WORKERS=2` sizes retained resources for two concurrent proofs; `PLONKY2_GPU_RETAINED_BYTES=0` disables retained caches, and `PLONKY2_GPU_ENABLED=false` avoids GPU initialization. POD2 does not need to forward a config structure. The complete variable table and API audit are in [runtime configuration](runtime-configuration.md).
 
-```rust
-let mut config = plonky2::gpu::GpuConfig::default();
-config.proving_workers = 2; // proofs that run concurrently
+The environment selects backend/adapter, execution mode, worker hint, memory budgets, hybrid CPU share and exit cleanup. Invalid values return an error from `GpuConfig::from_env()` or the fallible `plonky2::gpu::config()`, without creating a device. Automatic GPU routing warns and falls back to the CPU on invalid settings. Process defaults are captured once on first configuration access or context use.
+
+For an explicit application override, preserve environment defaults and change only the fields the application knows:
+
+```rust,ignore
+let mut config = plonky2::gpu::GpuConfig::from_env()?;
+config.proving_workers = actual_workers;
 plonky2::gpu::configure(config)?;
 ```
 
-`GpuConfig` selects the backend and adapter, the execution mode (whether commitment leaves stay on the device and how the quotient is split between CPU and GPU), the number of concurrent proving workers, device memory budgets and the automatic shutdown. `plonky2::gpu::set_enabled(false)` keeps proving on the CPU. GPU context settings use this API; profiling builds also read the diagnostic environment variables described below.
+`GpuConfig::default()` remains deterministic and intentionally bypasses environment settings. Explicit `configure` and independent `GpuContext::with_config` remain available. `plonky2::gpu::set_enabled(false)` temporarily routes work to the CPU; orderly shutdown remains an explicit lifecycle API as well as an exit default.
 
 ## Compiled witness programs
 

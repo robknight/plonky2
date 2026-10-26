@@ -16,6 +16,7 @@ const SOURCES: &[&str] = &[
     "src/iop/wire.rs",
     "src/plonk/witness_program.rs",
     "src/plonk/witness_program/config.rs",
+    "src/util/environment.rs",
     "src/plonk/witness_program/cache.rs",
     "src/plonk/witness_program/region.rs",
     "src/plonk/witness_program/region/cpu.rs",

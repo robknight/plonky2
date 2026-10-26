@@ -24,11 +24,12 @@
 //! when nothing still holds it; applications may call [`shutdown`] earlier,
 //! after joining proving workers, to release driver resources sooner.
 //!
-//! The context reads no settings from the environment; only the
-//! `gpu-profiling` diagnostics below do. Applications choose its
-//! settings with [`configure`] before the first proof (see [`GpuConfig`]), and
-//! [`set_enabled`] sends proofs to the CPU; without either, the context uses
-//! [`GpuConfig::default`] on the best available adapter.
+//! The context resolves typed `PLONKY2_GPU_*` environment defaults once on
+//! first use (see [`GpuConfig::from_env`]). No wrapper configuration is needed
+//! in applications using a downstream library. [`configure`] can override the
+//! complete configuration before first use. [`config`] validates process
+//! defaults without creating a device; invalid defaults disable automatic GPU
+//! routing with a warning. [`set_enabled`] temporarily sends work to the CPU.
 //!
 //! # Diagnostics
 //!
@@ -112,8 +113,8 @@ enum ContextState {
 
 static CONTEXT: Mutex<ContextState> = Mutex::new(ContextState::Uninitialized);
 
-/// The settings `configure` stored; `None` until it is called.
-static CONFIG: Mutex<Option<GpuConfig>> = Mutex::new(None);
+/// Explicit settings or the first typed environment resolution, including errors.
+static CONFIG: Mutex<Option<Result<GpuConfig, ConfigureError>>> = Mutex::new(None);
 
 thread_local! {
     /// The last submission made from this thread, which its readbacks wait for.
@@ -134,7 +135,18 @@ pub fn context() -> Option<Arc<GpuContext>> {
     }
     let mut state = CONTEXT.lock().unwrap();
     if matches!(*state, ContextState::Uninitialized) {
-        let config = config();
+        let config = match config() {
+            Ok(config) => config,
+            Err(error) => {
+                log::warn!("plonky2 gpu: invalid settings, using the CPU ({error})");
+                *state = ContextState::Available(None);
+                return None;
+            }
+        };
+        if !config.enabled {
+            *state = ContextState::Available(None);
+            return None;
+        }
         let context = match GpuContext::with_config(&config) {
             Ok(context) => {
                 log::info!(
@@ -165,20 +177,27 @@ pub fn context() -> Option<Arc<GpuContext>> {
 /// Sets the global context's settings. Call it before the first proof: once
 /// the context exists, or after [`shutdown`], its settings are fixed and this
 /// returns [`ConfigureError::AlreadyInitialized`]. Without a call the context
-/// uses [`GpuConfig::default`].
+/// resolves [`GpuConfig::from_env`]. Explicit settings override all process defaults.
 pub fn configure(config: GpuConfig) -> Result<(), ConfigureError> {
     config.validate()?;
     let state = CONTEXT.lock().unwrap();
     if !matches!(*state, ContextState::Uninitialized) {
         return Err(ConfigureError::AlreadyInitialized);
     }
-    *CONFIG.lock().unwrap() = Some(config);
+    *CONFIG.lock().unwrap() = Some(Ok(config));
     Ok(())
 }
 
-/// The settings the global context uses, or will use when it is created.
-pub fn config() -> GpuConfig {
-    CONFIG.lock().unwrap().clone().unwrap_or_default()
+/// Resolve the global settings without initializing a device. Environment
+/// defaults (including errors) are captured on the first call. Call this at
+/// application startup to return invalid settings as an error. A subsequent
+/// explicit [`configure`] may replace them until the context is initialized.
+pub fn config() -> Result<GpuConfig, ConfigureError> {
+    CONFIG
+        .lock()
+        .unwrap()
+        .get_or_insert_with(GpuConfig::from_env)
+        .clone()
 }
 
 /// Why an orderly GPU shutdown could not complete.
@@ -288,6 +307,7 @@ fn shutdown_locked(state: &mut ContextState, at_exit: bool) -> Result<(), Shutdo
 
 /// Enables or disables the GPU paths for the whole process. The context, once
 /// created, is kept until [`shutdown`]; disabling only routes calls to the CPU.
+/// Re-enabling does not override startup `enabled=false` or permanent shutdown.
 pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
 }
@@ -622,12 +642,13 @@ impl GpuContext {
     /// Creates a context on the best available adapter, with the global
     /// context's settings ([`config`]).
     pub fn new() -> anyhow::Result<Self> {
-        Self::with_config(&config())
+        Self::with_config(&config()?)
     }
 
     /// Creates a context on the best available adapter with `config`.
     pub fn with_config(config: &GpuConfig) -> anyhow::Result<Self> {
         config.validate()?;
+        anyhow::ensure!(config.enabled, "GPU disabled by configuration");
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         if let Some(backend) = config.backend {
             descriptor.backends = backend.backends();

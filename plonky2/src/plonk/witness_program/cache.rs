@@ -54,11 +54,7 @@ pub(super) struct Outcome {
 
 pub(super) fn directory(config: &mut WitnessConfig) -> Option<PathBuf> {
     if config.cache == WitnessCache::Environment {
-        config.cache = std::env::var_os("PLONKY2_EXECUTOR_CACHE_DIR")
-            .filter(|v| !v.is_empty())
-            .map_or(WitnessCache::Disabled, |v| {
-                WitnessCache::Directory(v.into())
-            });
+        config.cache = super::config::cache_from_env();
     }
     match &config.cache {
         WitnessCache::Directory(p) => Some(p.clone()),
