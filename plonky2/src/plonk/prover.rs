@@ -146,6 +146,9 @@ where
             // An installed program that cannot run these inputs; the worklist
             // is correct for any inputs.
             Err(error) => {
+                if prover_data.witness_program.strict_inputs() {
+                    return Err(error.context("required compiled witness execution failed"));
+                }
                 log::warn!("plonky2: witness program failed, using the worklist: {error:#}");
             }
         }

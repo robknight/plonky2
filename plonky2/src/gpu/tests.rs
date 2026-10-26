@@ -688,7 +688,7 @@ fn configure_is_refused_once_the_context_exists() {
         configure(GpuConfig::default()),
         Err(ConfigureError::AlreadyInitialized)
     );
-    assert_eq!(config(), GpuConfig::default());
+    assert_eq!(config().unwrap(), GpuConfig::default());
 }
 
 #[test]

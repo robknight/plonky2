@@ -13,6 +13,8 @@ use crate::field::types::Field;
 #[cfg(all(feature = "std", feature = "rand_chacha"))]
 pub(crate) mod blinding_rng;
 pub(crate) mod context_tree;
+#[cfg(all(feature = "std", feature = "rand_chacha"))]
+pub mod environment;
 pub(crate) mod partial_products;
 pub mod reducing;
 pub mod serialization;

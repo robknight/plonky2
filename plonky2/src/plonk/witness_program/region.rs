@@ -20,8 +20,13 @@ use crate::iop::generator::{WitnessGeneratorRef, WitnessOperation as Op};
 use crate::iop::target::Target;
 use crate::iop::witness::{PartialWitness, PartitionWitness};
 
+pub(crate) mod aot;
+pub(super) mod buffers;
 pub mod cpu;
 pub(crate) mod plan_bytes;
+mod profile;
+#[cfg(feature = "parallel")]
+pub(crate) mod schedule;
 
 /// Log target of the compiler's phase timings (debug level).
 pub(crate) const COMPILE_LOG: &str = "plonky2::witness_program::compile";
@@ -74,6 +79,7 @@ operation_kinds! {
     EcScalarMul = 23,
     CosetInterpolation = 24,
     Comparison = 25,
+    ArithmeticChain = 26,
 }
 use OperationKind as Kind;
 
@@ -108,6 +114,8 @@ impl OperationKind {
 
 #[derive(Clone, Debug)]
 struct Group {
+    inputs: u32,
+    outputs: u32,
     kind: Kind,
     count: u32,
     targets_offset: u32,
@@ -136,20 +144,22 @@ pub struct RegionProgram {
     /// Operation groups in dependency layers: every group in a layer depends
     /// only on earlier layers.
     groups: Vec<Vec<Group>>,
-    targets: Vec<u32>,
-    coefficients: Vec<u64>,
-    representatives: Vec<usize>,
-    roots: Vec<usize>,
+    targets: Arc<[u32]>,
+    coefficients: Arc<[u64]>,
+    representatives: Arc<[usize]>,
+    roots: Arc<[usize]>,
     random_count: u32,
     alias_count: u32,
     alias_pair_offset: u32,
     state_slots: u32,
+    pub(super) runtime: Arc<super::config::Runtime>,
+    fast: Arc<std::sync::OnceLock<aot::FastLayout>>,
     /// Representative index to canonical slot, `u32::MAX` when absent; built
     /// on first use by the CPU executor's gather.
-    rep_slots: std::sync::OnceLock<Vec<u32>>,
+    rep_slots: Arc<std::sync::OnceLock<Vec<u32>>>,
     /// Canonical slot of every wire cell in column-major order, `u32::MAX`
     /// where the program has no slot; built on first use by the gather.
-    cell_slots: std::sync::OnceLock<Vec<u32>>,
+    cell_slots: Arc<std::sync::OnceLock<Vec<u32>>>,
 }
 
 /// The program slot of one prover circuit: the whole-circuit program a caller
@@ -157,15 +167,21 @@ pub struct RegionProgram {
 /// key because it determines boundary roots and writer ownership. Clones
 /// share the slot.
 #[derive(Clone, Debug)]
-pub struct ProgramCache(Arc<Mutex<CacheState>>);
+pub struct ProgramCache(
+    Arc<Mutex<CacheState>>,
+    Arc<Mutex<()>>,
+    Arc<std::sync::atomic::AtomicU64>,
+);
 
 #[derive(Debug)]
 struct CachedProgram {
     initial: Vec<usize>,
+    roots_match_inputs: bool,
     generators: usize,
     program: Arc<RegionProgram>,
     /// Diagnostics that compile their own program leave this unset.
     operations: Option<u128>,
+    key: Option<Arc<super::region::plan_bytes::PlanKey>>,
 }
 
 #[derive(Debug, Default)]
@@ -173,6 +189,7 @@ struct CacheState {
     // Only complete circuit programs are installed in this cache.
     program: Option<CachedProgram>,
     warned_mismatch: bool,
+    unsupported: Option<super::WitnessProgramError>,
 }
 
 /// What a proof's inputs find in the program slot.
@@ -187,7 +204,11 @@ pub(crate) enum Installed {
 
 impl Default for ProgramCache {
     fn default() -> Self {
-        Self(Arc::new(Mutex::new(CacheState::default())))
+        Self(
+            Arc::new(Mutex::new(CacheState::default())),
+            Arc::new(Mutex::new(())),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        )
     }
 }
 
@@ -199,6 +220,52 @@ impl PartialEq for ProgramCache {
 impl Eq for ProgramCache {}
 
 impl ProgramCache {
+    pub(crate) fn origin(&self) -> super::ProgramOrigin {
+        super::ProgramOrigin {
+            slot: Arc::downgrade(&self.1),
+            generation: self.2.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+    pub(crate) fn has_origin(&self, origin: &super::ProgramOrigin) -> bool {
+        origin.slot.as_ptr() == Arc::as_ptr(&self.1)
+            && origin.generation == self.2.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn preparation_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.1.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    pub(crate) fn unsupported(&self) -> Option<super::WitnessProgramError> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unsupported
+            .clone()
+    }
+    pub(crate) fn record_unsupported(&self, error: &super::WitnessProgramError) {
+        if matches!(
+            error,
+            super::WitnessProgramError::UnsupportedField
+                | super::WitnessProgramError::Lookups
+                | super::WitnessProgramError::UnsupportedGenerator { .. }
+        ) {
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).unsupported = Some(error.clone());
+            log::info!("compiled witness execution unavailable: {error}");
+        }
+    }
+    pub(crate) fn status(&self, generators: usize) -> super::WitnessProgramStatus {
+        let c = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if c.program
+            .as_ref()
+            .is_some_and(|p| p.generators == generators)
+        {
+            super::WitnessProgramStatus::Ready
+        } else if c.unsupported.is_some() {
+            super::WitnessProgramStatus::Unsupported
+        } else {
+            super::WitnessProgramStatus::Unprepared
+        }
+    }
+
     /// Installs a whole-circuit program for proofs whose inputs set exactly
     /// the representatives in `initial`, replacing any program in the slot.
     pub(crate) fn install_all(
@@ -207,22 +274,29 @@ impl ProgramCache {
         initial: Vec<usize>,
         program: Arc<RegionProgram>,
         operations: u128,
+        key: Arc<super::region::plan_bytes::PlanKey>,
     ) {
         let mut cached = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let roots_match_inputs = initial.as_slice() == program.roots.as_ref();
         cached.program = Some(CachedProgram {
+            roots_match_inputs,
             initial,
             generators,
             program,
             operations: Some(operations),
+            key: Some(key),
         });
         cached.warned_mismatch = false;
+        cached.unsupported = None;
     }
 
     /// Empties the slot.
     pub(crate) fn clear(&self) {
         let mut cached = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        self.2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         cached.program = None;
         cached.warned_mismatch = false;
+        cached.unsupported = None;
     }
 
     /// Whether the slot holds a whole-circuit program, without computing a
@@ -233,6 +307,35 @@ impl ProgramCache {
             .program
             .as_ref()
             .is_some_and(|program| program.generators == generators)
+    }
+
+    /// Candidate program; callers must validate that every supplied input
+    /// maps to a root and that every root is supplied before executing it.
+    pub(crate) fn candidate_all(&self, generators: usize) -> Option<Arc<RegionProgram>> {
+        let cached = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let program = cached.program.as_ref()?;
+        (program.generators == generators && program.roots_match_inputs)
+            .then(|| program.program.clone())
+    }
+
+    pub(crate) fn strict_inputs(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .program
+            .as_ref()
+            .is_some_and(|p| p.program.runtime.config.fallback == super::WitnessFallback::Error)
+    }
+
+    pub(crate) fn installed_program(&self, generators: usize) -> Option<super::WitnessProgram> {
+        let cached = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let p = cached.program.as_ref()?;
+        (p.generators == generators).then_some(())?;
+        Some(super::WitnessProgram {
+            origin: self.origin(),
+            program: p.program.clone(),
+            key: p.key.as_ref()?.clone(),
+        })
     }
 
     /// The whole-circuit program in the slot, its mask and its operation
@@ -301,11 +404,14 @@ impl ProgramCache {
             .map(u32::try_from)
             .collect::<Result<Vec<_>, _>>()?;
         let program = Arc::new(RegionProgram::compile(generators, entry, &indices)?);
+        let roots_match_inputs = initial.as_slice() == program.roots.as_ref();
         cached.program = Some(CachedProgram {
+            roots_match_inputs,
             initial,
             generators: generators.len(),
             program: program.clone(),
             operations: None,
+            key: None,
         });
         cached.warned_mismatch = false;
         Ok((program, false))
@@ -444,6 +550,121 @@ impl Lane {
     }
 }
 
+/// Fuses only single-consumer arithmetic chains. Intermediate outputs remain
+/// materialized for the proof, but their next arithmetic consumer uses a local
+/// temporary. Choosing only single-consumer edges makes contraction acyclic.
+fn fuse_arithmetic<F: RichField>(
+    nodes: Vec<Lane>,
+    entry: &PartitionWitness<F>,
+    config: &super::WitnessConfig,
+) -> Result<Vec<Lane>> {
+    if config.policy.chain_length == 0 {
+        return Ok(nodes);
+    }
+    let limit = config.policy.chain_length as usize;
+    const MANY: u32 = u32::MAX - 1;
+    let mut producer = vec![NONE; entry.values.len()];
+    let mut consumer = vec![NONE; entry.values.len()];
+    for (i, lane) in nodes.iter().enumerate() {
+        for &r in &lane.outputs {
+            producer[r] = if producer[r] == NONE { i as u32 } else { MANY };
+        }
+        for &r in &lane.inputs {
+            if consumer[r] == NONE {
+                consumer[r] = i as u32;
+            } else if consumer[r] != i as u32 {
+                consumer[r] = MANY;
+            }
+        }
+    }
+    let mut next = vec![NONE; nodes.len()];
+    let mut previous = vec![NONE; nodes.len()];
+    for (i, lane) in nodes.iter().enumerate() {
+        if lane.kind != Kind::Arithmetic || lane.outputs.len() != 1 {
+            continue;
+        }
+        let r = lane.outputs[0];
+        let j = consumer[r];
+        if entry.values[r].is_some() || producer[r] != i as u32 || j >= MANY || j == i as u32 {
+            continue;
+        }
+        if nodes[j as usize].kind != Kind::Arithmetic {
+            continue;
+        }
+        if previous[j as usize] == NONE {
+            previous[j as usize] = i as u32;
+            next[i] = j;
+        }
+    }
+    drop(producer);
+    drop(consumer);
+    let heads = (0..nodes.len())
+        .filter(|&i| previous[i] == NONE)
+        .collect::<Vec<_>>();
+    let before = nodes.len();
+    let mut remaining = nodes.into_iter().map(Some).collect::<Vec<_>>();
+    let mut result = Vec::with_capacity(before);
+    let mut chain_count = 0;
+    let mut fused_nodes = 0;
+    for head in heads {
+        let mut current = head as u32;
+        while current != NONE && remaining[current as usize].is_some() {
+            let mut chain = Vec::with_capacity(limit);
+            while current != NONE && remaining[current as usize].is_some() && chain.len() < limit {
+                chain.push(remaining[current as usize].take().unwrap());
+                current = next[current as usize];
+            }
+            if chain.len() == 1 {
+                result.push(chain.pop().unwrap());
+                continue;
+            }
+            chain_count += 1;
+            fused_nodes += chain.len();
+            let index = chain[0].index;
+            let mut inputs = Vec::new();
+            let mut outputs = Vec::new();
+            let mut coefficients = Vec::new();
+            for lane in chain {
+                ensure!(
+                    lane.inputs.len() == 3 && lane.coefficients.len() == 2,
+                    "invalid arithmetic shape"
+                );
+                for r in lane.inputs {
+                    if let Some(j) = outputs.iter().position(|&out| out == r) {
+                        coefficients.push((1u64 << 63) | j as u64);
+                    } else {
+                        let position =
+                            inputs
+                                .iter()
+                                .position(|&input| input == r)
+                                .unwrap_or_else(|| {
+                                    let position = inputs.len();
+                                    inputs.push(r);
+                                    position
+                                });
+                        coefficients.push(position as u64);
+                    }
+                }
+                coefficients.extend(lane.coefficients);
+                outputs.push(lane.outputs[0]);
+            }
+            result.push(Lane {
+                index,
+                kind: Kind::ArithmeticChain,
+                parameter: outputs.len() as u32,
+                name: "arithmetic_chain",
+                coefficients,
+                inputs,
+                outputs,
+            });
+        }
+    }
+    // Any cyclic component remains intact for the existing cycle diagnostic.
+    result.extend(remaining.into_iter().flatten());
+    log::debug!(target:COMPILE_LOG,"arithmetic fusion: {before} -> {}, chains={chain_count}, operations={fused_nodes}, limit={limit}", result.len());
+    Ok(result)
+}
+
 impl RegionProgram {
     /// Number of dependency layers.
     pub fn layer_count(&self) -> usize {
@@ -460,6 +681,17 @@ impl RegionProgram {
         generators: &[WitnessGeneratorRef<F, D>],
         entry: &PartitionWitness<F>,
         indices: &[u32],
+    ) -> Result<Self> {
+        let runtime = Arc::new(super::config::Runtime::new(
+            super::WitnessConfig::from_env()?,
+        )?);
+        Self::compile_with_runtime(generators, entry, indices, runtime)
+    }
+    pub(super) fn compile_with_runtime<F: RichField + Extendable<D>, const D: usize>(
+        generators: &[WitnessGeneratorRef<F, D>],
+        entry: &PartitionWitness<F>,
+        indices: &[u32],
+        runtime: Arc<super::config::Runtime>,
     ) -> Result<Self> {
         ensure!(Op::field_supported::<F>(), "unsupported witness field");
         // Phase timings at debug level under COMPILE_LOG.
@@ -504,6 +736,7 @@ impl RegionProgram {
                 Ok(Lane::new(index, &op, input, output))
             })
             .collect::<Result<Vec<_>>>()?;
+        let nodes = fuse_arithmetic(nodes, entry, &runtime.config)?;
         let mut produced = vec![false; reps];
         for lane in &nodes {
             for &r in &lane.outputs {
@@ -804,6 +1037,8 @@ impl RegionProgram {
                     }
                 }
                 layer_groups.push(Group {
+                    inputs: input_len as u32,
+                    outputs: output_len as u32,
                     kind,
                     count: u32::try_from(count)?,
                     targets_offset: u32::try_from(target_offset)?,
@@ -849,18 +1084,27 @@ impl RegionProgram {
         if profile {
             log::debug!(target: COMPILE_LOG,"compile phase aliases {:?}", phase.elapsed());
         }
-        Ok(Self {
+        let mut program = Self {
             groups,
-            targets,
-            coefficients,
-            representatives,
-            roots,
+            targets: targets.into(),
+            coefficients: coefficients.into(),
+            representatives: representatives.into(),
+            roots: roots.into(),
             random_count,
             alias_count,
             alias_pair_offset,
             state_slots,
+            runtime,
+            fast: Default::default(),
             rep_slots: Default::default(),
             cell_slots: Default::default(),
-        })
+        };
+        aot::reorder(&mut program)?;
+        Ok(program)
     }
+}
+
+#[cfg(feature = "witness-benchmarks")]
+pub(super) fn benchmark_profile(active: bool) {
+    profile::benchmark_override(active);
 }

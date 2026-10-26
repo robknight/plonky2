@@ -11,9 +11,25 @@ use std::path::Path;
 use std::{env, fs};
 
 const SOURCES: &[&str] = &[
+    "src/iop/witness_operation.rs",
+    "src/iop/target.rs",
+    "src/iop/wire.rs",
+    "src/plonk/witness_program.rs",
+    "src/plonk/witness_program/config.rs",
+    "src/plonk/witness_program/policy.rs",
+    "src/util/environment.rs",
+    "src/plonk/witness_program/cache.rs",
     "src/plonk/witness_program/region.rs",
     "src/plonk/witness_program/region/cpu.rs",
     "src/plonk/witness_program/region/plan_bytes.rs",
+    "src/plonk/witness_program/region/aot.rs",
+    "src/plonk/witness_program/region/schedule.rs",
+    "src/plonk/witness_program/region/profile.rs",
+    "src/plonk/witness_program/region/buffers.rs",
+    "src/hash/poseidon_trace_simd.rs",
+    "src/hash/poseidon_trace_simd/runtime_avx512.rs",
+    "src/plonk/witness_program/region/native_kernels.rs",
+    "../field/src/arch/x86_64/avx512_goldilocks_field.rs",
 ];
 
 fn fnv1a(bytes: &[u8], mut hash: u64) -> u64 {

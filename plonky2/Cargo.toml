@@ -13,6 +13,10 @@ categories.workspace = true
 [features]
 default = ["gate_testing", "parallel", "rand_chacha", "std", "timing"]
 gate_testing = []
+# Optional witness diagnostics; disabled builds contain no clocks or counters.
+witness-profiling = []
+# Development-only replay, snapshot export and process-wide benchmark overrides.
+witness-benchmarks = []
 # GPU proving through wgpu (Metal, Vulkan, DirectX 12): Merkle hashing,
 # low-degree extensions, FRI, the quotient polynomial and the openings.
 # Selected at runtime when a suitable adapter exists; otherwise the CPU paths
@@ -121,3 +125,7 @@ rustdoc-args = ["--html-in-header", ".cargo/katex-header.html"]
 
 [lints]
 workspace = true
+
+[[example]]
+name = "witness_program"
+required-features = ["std", "rand_chacha"]

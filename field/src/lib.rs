@@ -31,3 +31,14 @@ mod field_testing;
 
 #[cfg(test)]
 mod prime_field_testing;
+
+#[doc(hidden)]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512bw",
+    target_feature = "avx512cd",
+    target_feature = "avx512dq",
+    target_feature = "avx512f",
+    target_feature = "avx512vl"
+))]
+pub use arch::x86_64::avx512_goldilocks_field::Avx512GoldilocksField as WitnessAvx512;

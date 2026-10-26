@@ -13,3 +13,6 @@ pub mod poseidon;
 #[cfg(feature = "poseidon_bn128")]
 pub mod poseidon_bn128;
 pub mod poseidon_goldilocks;
+
+#[doc(hidden)]
+pub mod poseidon_trace_simd;
