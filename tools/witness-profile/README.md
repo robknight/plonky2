@@ -47,7 +47,7 @@ Installed programs bind inputs through the existing canonical slot map when
 their input mask matches the full boundary-root set. Set
 `P2_WITNESS_INPUT_BINDING=legacy` for a comparison with sorting and binary search.
 
-`P2_WITNESS_BUFFERS=pool` enables bounded reuse of wiped witness buffers. The
+`PLONKY2_EXECUTOR_BUFFER_BYTES=67108864` enables bounded reuse of wiped witness buffers. The
 default uses fresh allocations. The pool retains at most 64 MiB of buffer
 capacity; MainPod uses about 31.5 MiB for one state/sparse-readiness pair. Values are
 wiped and readiness reset before retention. Profile allocation and wiping
@@ -57,8 +57,24 @@ controls under the same exclusion rule as the profiling control.
 
 
 With dependency scheduling, kind/task CPU totals remain available while global
-layer-wall attribution is absent. Use `PLONKY2_EXECUTOR_SCHEDULE=layers` when
+layer-wall attribution is absent. Use `PLONKY2_WITNESS_BENCH_SCHEDULE=layers` when
 measuring layer barriers as a control. The `layers` execution stage covers the
 operation phase under either scheduler; CPU totals are work, not critical-path
 wall time. Scalar Poseidon currently has whole-kind attribution; the nested
 input/arithmetic/output counters describe the SIMD path.
+
+
+With `witness-benchmarks`, comparisons can be selected at preparation/replay:
+
+| Development variable | Values |
+| --- | --- |
+| `PLONKY2_WITNESS_BENCH_MODE` | `auto`, `checked` |
+| `PLONKY2_WITNESS_BENCH_SCHEDULE` | `auto`, `layers`, `dependencies` |
+| `PLONKY2_WITNESS_BENCH_POSEIDON` | `auto`, `scalar` |
+| `PLONKY2_WITNESS_BENCH_GATHER` | `auto`, `cpu`, `gpu` (gather comparison requires GPU proving) |
+
+Normal builds ignore these. The retired `PLONKY2_EXECUTOR_*` tuning names and
+`P2_*` configuration aliases are not controls for either build. Layout, fusion,
+chunk sizes, arithmetic simplification and gather tiles use private measured
+implementation defaults; there is no public tuning config. Replay resolves its
+resource/diagnostic settings explicitly after deterministic program decoding.

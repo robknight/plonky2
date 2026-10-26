@@ -1,6 +1,6 @@
 # Witness executor completion: acceptance report
 
-25 October 2026. This closes the bounded completion plan in [the experiment log](witness-executor-experiments.md#completion-plan-agreed-on-25-october-2026). The consumer contract is documented in [Preparing fast witness generation](witness-executor.md).
+25 October 2026. Subsequent API simplification leaves four operational executor variables; the comparison policies mentioned in the historical measurements are now benchmark-only. See the current integration guide for supported controls. This closes the bounded completion plan in [the experiment log](witness-executor-experiments.md#completion-plan-agreed-on-25-october-2026). The consumer contract is documented in [Preparing fast witness generation](witness-executor.md).
 
 ## Comparison and scope
 

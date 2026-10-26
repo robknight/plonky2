@@ -7,7 +7,7 @@ use anyhow::{ensure, Result};
 
 use super::cpu::Executor;
 use super::{Group, Kind, RegionProgram};
-use crate::plonk::witness_program::WitnessSchedule;
+use crate::plonk::witness_program::policy::WitnessSchedule;
 
 #[derive(Debug)]
 struct Task {
@@ -39,7 +39,7 @@ pub(super) fn run(e: &Executor<'_>) -> Result<bool> {
     if !BENCH_ENABLED.load(Ordering::Relaxed) {
         return Ok(false);
     }
-    let requested = e.program.runtime.config.schedule;
+    let requested = e.program.runtime.config.policy.schedule;
     if requested == WitnessSchedule::Layers
         || (requested == WitnessSchedule::Auto && rayon::current_num_threads() == 1)
     {
@@ -71,7 +71,7 @@ impl Schedule {
                     Kind::RandomValue => 4096,
                     _ => super::cpu::lane_chunk(group.kind),
                 };
-                let chunk = base.saturating_mul(p.runtime.config.chunk_scale).max(1);
+                let chunk = base;
                 for c in 0..group.count.div_ceil(chunk) {
                     let start = c * chunk;
                     tasks.push(Task {

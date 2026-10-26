@@ -2,82 +2,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use super::policy::Policy;
 use super::region::buffers::Buffers;
 use super::WitnessProgramError;
 use crate::util::environment::{Environment, EnvironmentError};
-
-/// Placement of witness values. `Outputs` is the measured general default.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum WitnessLayout {
-    /// Keep the compiler's original canonical ordering.
-    Canonical,
-    /// Place each operation's outputs together.
-    #[default]
-    Outputs,
-    /// Sort non-root values by copy-constraint representative.
-    Representatives,
-    /// Interleave outputs in blocks of four operations.
-    Block4,
-    /// Interleave outputs in blocks of eight operations.
-    Block8,
-}
-impl WitnessLayout {
-    pub(crate) fn code(self) -> u32 {
-        match self {
-            Self::Canonical => 0,
-            Self::Outputs => 1,
-            Self::Representatives => 2,
-            Self::Block4 => 3,
-            Self::Block8 => 4,
-        }
-    }
-    fn from_code(code: u32) -> Result<Self, WitnessProgramError> {
-        match code {
-            0 => Ok(Self::Canonical),
-            1 => Ok(Self::Outputs),
-            2 => Ok(Self::Representatives),
-            3 => Ok(Self::Block4),
-            4 => Ok(Self::Block8),
-            _ => Err(invalid("invalid stored witness layout")),
-        }
-    }
-}
-
-/// Execution policy. Automatic execution retains checks for aliases and inputs.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum WitnessExecution {
-    /// Use validated shared/native kernels, with generic operation fallbacks.
-    #[default]
-    Auto,
-    /// Use the checked interpreter, useful as a control or for diagnosis.
-    Checked,
-}
-
-/// Dependency scheduling is prepared once and does not change the stored graph.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum WitnessSchedule {
-    /// Advance ready chunks independently; use layers on a single-thread pool.
-    #[default]
-    Auto,
-    /// Retain global dependency-layer barriers.
-    Layers,
-    /// Schedule ready chunks without global barriers (requires `parallel`).
-    Dependencies,
-}
-
-/// Poseidon selection, independent of the serialized circuit program.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum WitnessPoseidon {
-    /// Batch independent permutations when the compiled backend supports it.
-    #[default]
-    Auto,
-    /// Use individual permutations.
-    Scalar,
-}
 
 /// Policy when a proof sets a different input shape from the installed program.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -101,19 +29,6 @@ pub enum WitnessBuffers {
     Reuse { max_bytes: usize },
 }
 
-/// Destination for the final witness gather.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum WitnessGather {
-    /// Use the recommended CPU gather, including mapped GPU staging when applicable.
-    #[default]
-    Auto,
-    /// Gather on the CPU.
-    Cpu,
-    /// Request GPU gathering when GPU proving and a validated plan are available.
-    Gpu,
-}
-
 /// Persistent executor-cache policy. Only program data is stored, never witnesses.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -131,55 +46,47 @@ pub enum WitnessCache {
 /// process defaults. Explicit configuration passed to a circuit takes precedence.
 /// Programs and circuit clones share resources; independently prepared programs
 /// can use different settings. Compilation never occurs implicitly in `prove`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct WitnessConfig {
-    pub layout: WitnessLayout,
-    /// Maximum fused arithmetic-chain length: zero disables fusion; otherwise 2..=8.
-    pub chain_length: u8,
-    pub execution: WitnessExecution,
-    pub schedule: WitnessSchedule,
-    pub poseidon: WitnessPoseidon,
     pub fallback: WitnessFallback,
     pub buffers: WitnessBuffers,
-    pub gather: WitnessGather,
-    /// CPU witness sampling, execution, gathering and wiping use this pool.
-    /// Zero inherits the current Rayon pool; positive values create an owned pool.
-    /// Circuit compilation/preparation and disk I/O use the caller's context.
+    /// CPU sampling, execution, gathering and wiping use this pool size.
+    /// Zero inherits the caller's Rayon pool; positive values create an owned pool.
     pub threads: usize,
-    /// A caller-owned pool, shared across programs. Takes precedence over `threads`.
+    /// Application-owned CPU witness pool; takes precedence over `threads`.
     #[cfg(feature = "parallel")]
     pub thread_pool: Option<Arc<rayon::ThreadPool>>,
     pub cache: WitnessCache,
-    /// Advanced execution tuning. One uses the standard operation chunk sizes.
-    pub chunk_scale: u32,
-    pub simplify_arithmetic: bool,
-    pub gather_columns: usize,
-    pub gather_rows: usize,
+    pub(crate) policy: Policy,
+}
+impl core::fmt::Debug for WitnessConfig {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut debug = f.debug_struct("WitnessConfig");
+        debug
+            .field("fallback", &self.fallback)
+            .field("buffers", &self.buffers)
+            .field("threads", &self.threads)
+            .field("cache", &self.cache);
+        #[cfg(feature = "parallel")]
+        debug.field("thread_pool", &self.thread_pool);
+        debug.finish_non_exhaustive()
+    }
 }
 impl Default for WitnessConfig {
     fn default() -> Self {
         Self {
-            layout: WitnessLayout::Outputs,
-            chain_length: 4,
-            execution: WitnessExecution::Auto,
-            schedule: WitnessSchedule::Auto,
-            poseidon: WitnessPoseidon::Auto,
             fallback: WitnessFallback::Worklist,
             buffers: WitnessBuffers::Fresh,
-            gather: WitnessGather::Auto,
             threads: 0,
             #[cfg(feature = "parallel")]
             thread_pool: None,
             cache: WitnessCache::Environment,
-            chunk_scale: 1,
-            simplify_arithmetic: true,
-            gather_columns: 16,
-            gather_rows: 256,
+            policy: Policy::default(),
         }
     }
 }
-fn invalid(message: impl Into<String>) -> WitnessProgramError {
+pub(super) fn invalid(message: impl Into<String>) -> WitnessProgramError {
     WitnessProgramError::InvalidConfiguration(message.into())
 }
 impl From<EnvironmentError> for WitnessProgramError {
@@ -197,8 +104,9 @@ fn cache_from_environment<F: Fn(&str) -> Option<std::ffi::OsString>>(
         .map_or(WitnessCache::Disabled, WitnessCache::Directory)
 }
 impl WitnessConfig {
-    /// Resolves documented `PLONKY2_EXECUTOR_*` settings. Historical `P2_AOT_*`
-    /// controls are accepted as migration aliases; the new names take precedence.
+    /// Resolve the four operational `PLONKY2_EXECUTOR_*` settings: cache
+    /// directory, threads, retained-buffer bytes and fallback. Algorithm tuning
+    /// and legacy aliases are not part of the application configuration API.
     pub fn from_env() -> Result<Self, WitnessProgramError> {
         Self::from_env_with_defaults(Self::default())
     }
@@ -214,64 +122,6 @@ impl WitnessConfig {
         env: &Environment<F>,
     ) -> Result<Self, WitnessProgramError> {
         if let Some(v) = env.choice(
-            "PLONKY2_EXECUTOR_LAYOUT",
-            "P2_AOT_LAYOUT",
-            &[
-                ("canonical", WitnessLayout::Canonical),
-                ("outputs", WitnessLayout::Outputs),
-                ("aos", WitnessLayout::Outputs),
-                ("representative", WitnessLayout::Representatives),
-                ("block4", WitnessLayout::Block4),
-                ("block8", WitnessLayout::Block8),
-            ],
-        )? {
-            c.layout = v;
-        }
-        if let Some(v) = env.number("PLONKY2_EXECUTOR_CHAIN_LENGTH", "P2_AOT_CHAIN_LEN")? {
-            c.chain_length = v;
-        }
-        if !env.present("PLONKY2_EXECUTOR_CHAIN_LENGTH")
-            && env.boolean("P2_AOT_FUSE", "P2_AOT_FUSE")? == Some(false)
-        {
-            c.chain_length = 0;
-        }
-        if let Some(v) = env.choice(
-            "PLONKY2_EXECUTOR_MODE",
-            "P2_AOT_MODE",
-            &[
-                ("auto", WitnessExecution::Auto),
-                ("adaptive", WitnessExecution::Auto),
-                ("fast", WitnessExecution::Auto),
-                ("fast-batch", WitnessExecution::Auto),
-                ("bulk", WitnessExecution::Auto),
-                ("checked", WitnessExecution::Checked),
-            ],
-        )? {
-            c.execution = v;
-        }
-        if let Some(v) = env.choice(
-            "PLONKY2_EXECUTOR_SCHEDULE",
-            "PLONKY2_EXECUTOR_SCHEDULE",
-            &[
-                ("auto", WitnessSchedule::Auto),
-                ("layers", WitnessSchedule::Layers),
-                ("dependencies", WitnessSchedule::Dependencies),
-            ],
-        )? {
-            c.schedule = v;
-        }
-        if let Some(v) = env.choice(
-            "PLONKY2_EXECUTOR_POSEIDON",
-            "P2_POSEIDON_MODE",
-            &[
-                ("auto", WitnessPoseidon::Auto),
-                ("batch8-fft", WitnessPoseidon::Auto),
-                ("scalar", WitnessPoseidon::Scalar),
-            ],
-        )? {
-            c.poseidon = v;
-        }
-        if let Some(v) = env.choice(
             "PLONKY2_EXECUTOR_FALLBACK",
             "PLONKY2_EXECUTOR_FALLBACK",
             &[
@@ -281,7 +131,7 @@ impl WitnessConfig {
         )? {
             c.fallback = v;
         }
-        if let Some(v) = env.number("PLONKY2_EXECUTOR_THREADS", "P2_AOT_WITNESS_THREADS")? {
+        if let Some(v) = env.number("PLONKY2_EXECUTOR_THREADS", "PLONKY2_EXECUTOR_THREADS")? {
             c.threads = v;
             #[cfg(feature = "parallel")]
             {
@@ -297,59 +147,18 @@ impl WitnessConfig {
             } else {
                 WitnessBuffers::Reuse { max_bytes: v }
             };
-        } else if env.choice(
-            "P2_WITNESS_BUFFERS",
-            "P2_WITNESS_BUFFERS",
-            &[("pool", true), ("fresh", false)],
-        )? == Some(true)
-        {
-            c.buffers = WitnessBuffers::Reuse {
-                max_bytes: 64 * 1024 * 1024,
-            };
-        }
-        if let Some(v) = env.number("PLONKY2_EXECUTOR_CHUNK_SCALE", "P2_AOT_CHUNK_SCALE")? {
-            c.chunk_scale = v;
-        }
-        if let Some(v) = env.number("PLONKY2_EXECUTOR_GATHER_COLUMNS", "P2_AOT_GATHER_COLUMNS")? {
-            c.gather_columns = v;
-        }
-        if let Some(v) = env.number("PLONKY2_EXECUTOR_GATHER_ROWS", "P2_AOT_GATHER_ROWS")? {
-            c.gather_rows = v;
-        }
-        if let Some(v) = env.choice(
-            "PLONKY2_EXECUTOR_GATHER",
-            "PLONKY2_EXECUTOR_GATHER",
-            &[
-                ("auto", WitnessGather::Auto),
-                ("cpu", WitnessGather::Cpu),
-                ("gpu", WitnessGather::Gpu),
-            ],
-        )? {
-            c.gather = v;
-        } else if env.boolean("P2_AOT_GPU_GATHER", "P2_AOT_GPU_GATHER")? == Some(true) {
-            c.gather = WitnessGather::Gpu;
-        }
-        if let Some(v) = env.boolean(
-            "PLONKY2_EXECUTOR_SIMPLIFY_ARITHMETIC",
-            "P2_AOT_SIMPLIFY_ARITH",
-        )? {
-            c.simplify_arithmetic = v;
         }
         if env.present("PLONKY2_EXECUTOR_CACHE_DIR") || c.cache == WitnessCache::Environment {
             c.cache = cache_from_environment(env);
         }
+        #[cfg(feature = "witness-benchmarks")]
+        c.policy.apply_diagnostics(env)?;
         c.validate()?;
         Ok(c)
     }
     /// Checks options without allocating execution buffers or creating threads.
     /// Preparation and compilation also validate configuration automatically.
     pub fn validate(&self) -> Result<(), WitnessProgramError> {
-        #[cfg(not(feature = "parallel"))]
-        if self.schedule == WitnessSchedule::Dependencies {
-            return Err(invalid(
-                "dependency scheduling requires the parallel feature",
-            ));
-        }
         if matches!(&self.cache,WitnessCache::Directory(path) if path.as_os_str().is_empty()) {
             return Err(invalid("executor cache directory must not be empty"));
         }
@@ -357,14 +166,7 @@ impl WitnessConfig {
         if self.threads != 0 {
             return Err(invalid("executor threads require the parallel feature"));
         }
-        if self.chain_length == 1 || self.chain_length > 8 {
-            return Err(invalid("chain_length must be zero or 2..=8"));
-        }
-        if self.chunk_scale == 0 || self.gather_columns == 0 || self.gather_rows == 0 {
-            return Err(invalid(
-                "chunk_scale and gather dimensions must be positive",
-            ));
-        }
+        self.policy.validate()?;
         if matches!(self.buffers, WitnessBuffers::Reuse { max_bytes: 0 }) {
             return Err(invalid("buffer reuse requires a positive memory budget"));
         }
@@ -376,29 +178,19 @@ impl WitnessConfig {
             == other.thread_pool.as_ref().map(Arc::as_ptr);
         #[cfg(not(feature = "parallel"))]
         let pool = true;
-        self.compilation_key() == other.compilation_key()
-            && self.schedule == other.schedule
-            && self.execution == other.execution
-            && self.poseidon == other.poseidon
+        self.policy == other.policy
             && self.fallback == other.fallback
             && self.buffers == other.buffers
-            && self.gather == other.gather
             && self.threads == other.threads
             && pool
             && self.cache == other.cache
-            && self.chunk_scale == other.chunk_scale
-            && self.simplify_arithmetic == other.simplify_arithmetic
-            && self.gather_columns == other.gather_columns
-            && self.gather_rows == other.gather_rows
     }
 
     pub(crate) fn compilation_key(&self) -> u32 {
-        self.layout.code() | (u32::from(self.chain_length) << 3)
+        self.policy.compilation_key()
     }
     pub(crate) fn with_compilation_key(mut self, key: u32) -> Result<Self, WitnessProgramError> {
-        self.layout = WitnessLayout::from_code(key & 7)?;
-        self.chain_length =
-            u8::try_from(key >> 3).map_err(|_| invalid("invalid stored chain length"))?;
+        self.policy = self.policy.with_compilation_key(key)?;
         self.validate()?;
         Ok(self)
     }
@@ -464,7 +256,7 @@ impl Default for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn read_defaults(
+    fn read(
         defaults: WitnessConfig,
         values: &[(&str, &str)],
     ) -> Result<WitnessConfig, WitnessProgramError> {
@@ -476,41 +268,30 @@ mod tests {
         )
     }
     #[test]
-    fn application_policy_overrides_library_defaults_and_can_clear_cache_and_buffers() {
+    fn environment_overrides_library_resource_defaults() {
         let defaults = WitnessConfig {
             fallback: WitnessFallback::Error,
-            chain_length: 8,
-            execution: WitnessExecution::Checked,
-            schedule: WitnessSchedule::Layers,
             cache: WitnessCache::Directory("library-cache".into()),
             buffers: WitnessBuffers::Reuse { max_bytes: 8192 },
-            gather_rows: 7,
             ..Default::default()
         };
-        assert!(read_defaults(defaults.clone(), &[])
+        assert!(read(defaults.clone(), &[])
             .unwrap()
             .same_settings(&defaults));
-        let c = read_defaults(
-            defaults.clone(),
+        let c = read(
+            defaults,
             &[
-                ("PLONKY2_EXECUTOR_CHAIN_LENGTH", "2"),
-                ("P2_AOT_CHAIN_LEN", "bad"),
-                ("PLONKY2_EXECUTOR_MODE", "auto"),
                 ("PLONKY2_EXECUTOR_FALLBACK", "worklist"),
                 ("PLONKY2_EXECUTOR_CACHE_DIR", ""),
                 ("PLONKY2_EXECUTOR_BUFFER_BYTES", "0"),
             ],
         )
         .unwrap();
-        assert_eq!(c.chain_length, 2);
-        assert_eq!(c.execution, WitnessExecution::Auto);
         assert_eq!(c.fallback, WitnessFallback::Worklist);
         assert_eq!(c.cache, WitnessCache::Disabled);
         assert_eq!(c.buffers, WitnessBuffers::Fresh);
-        assert_eq!(c.schedule, defaults.schedule);
-        assert_eq!(c.gather_rows, defaults.gather_rows);
         assert_eq!(
-            read_defaults(
+            read(
                 WitnessConfig {
                     cache: WitnessCache::Disabled,
                     ..Default::default()
@@ -521,11 +302,20 @@ mod tests {
             .cache,
             WitnessCache::Directory("app-cache".into())
         );
-        assert!(read_defaults(defaults, &[("PLONKY2_EXECUTOR_MODE", "bad")]).is_err());
+        for (key, value) in [
+            ("PLONKY2_EXECUTOR_FALLBACK", "bad"),
+            ("PLONKY2_EXECUTOR_THREADS", "bad"),
+            ("PLONKY2_EXECUTOR_BUFFER_BYTES", "-1"),
+        ] {
+            assert!(read(WitnessConfig::default(), &[(key, value)])
+                .unwrap_err()
+                .to_string()
+                .contains(key));
+        }
     }
     #[test]
     #[cfg(feature = "parallel")]
-    fn application_thread_count_replaces_a_library_suggested_pool() {
+    fn environment_thread_count_replaces_library_suggested_pool() {
         let pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(2)
@@ -537,7 +327,7 @@ mod tests {
             ..Default::default()
         };
         assert!(Arc::ptr_eq(
-            read_defaults(defaults.clone(), &[])
+            read(defaults.clone(), &[])
                 .unwrap()
                 .thread_pool
                 .as_ref()
@@ -545,86 +335,126 @@ mod tests {
             &pool
         ));
         for count in ["0", "1"] {
-            let c =
-                read_defaults(defaults.clone(), &[("PLONKY2_EXECUTOR_THREADS", count)]).unwrap();
+            let c = read(defaults.clone(), &[("PLONKY2_EXECUTOR_THREADS", count)]).unwrap();
             assert!(c.thread_pool.is_none());
             assert_eq!(c.threads.to_string(), count);
         }
     }
     #[test]
-    fn typed_settings_keep_new_names_ahead_of_legacy_aliases() {
-        let values: std::collections::BTreeMap<_, std::ffi::OsString> = [
-            ("PLONKY2_EXECUTOR_CHAIN_LENGTH", "4".into()),
-            ("P2_AOT_FUSE", "bad".into()),
-            ("P2_AOT_CHAIN_LEN", "invalid".into()),
-            ("PLONKY2_EXECUTOR_GATHER", "cpu".into()),
-            ("P2_AOT_GPU_GATHER", "bad".into()),
-            ("PLONKY2_EXECUTOR_BUFFER_BYTES", "0".into()),
-            ("P2_WITNESS_BUFFERS", "bad".into()),
-            ("PLONKY2_EXECUTOR_SIMPLIFY_ARITHMETIC", "false".into()),
-            ("PLONKY2_EXECUTOR_CACHE_DIR", "".into()),
-        ]
-        .into();
-        let env = Environment::with_lookup(|key: &str| values.get(key).cloned());
-        let c = WitnessConfig::from_environment(WitnessConfig::default(), &env).unwrap();
-        assert_eq!(c.chain_length, 4);
-        assert_eq!(c.gather, WitnessGather::Cpu);
-        assert_eq!(c.buffers, WitnessBuffers::Fresh);
-        assert_eq!(c.cache, WitnessCache::Disabled);
-        assert!(!c.simplify_arithmetic);
-        for (key, value) in [
-            ("PLONKY2_EXECUTOR_SIMPLIFY_ARITHMETIC", "yes"),
-            ("PLONKY2_EXECUTOR_GATHER", "bad"),
-            ("P2_AOT_GPU_GATHER", "bad"),
-            ("PLONKY2_EXECUTOR_THREADS", "not-an-integer"),
+    fn retired_tuning_and_legacy_names_have_no_effect() {
+        let names = [
+            "PLONKY2_EXECUTOR_LAYOUT",
+            "PLONKY2_EXECUTOR_CHAIN_LENGTH",
+            "PLONKY2_EXECUTOR_CHUNK_SCALE",
+            "PLONKY2_EXECUTOR_SIMPLIFY_ARITHMETIC",
+            "PLONKY2_EXECUTOR_GATHER_COLUMNS",
+            "PLONKY2_EXECUTOR_GATHER_ROWS",
+            "PLONKY2_EXECUTOR_MODE",
+            "PLONKY2_EXECUTOR_SCHEDULE",
+            "PLONKY2_EXECUTOR_POSEIDON",
+            "PLONKY2_EXECUTOR_GATHER",
+            "P2_AOT_LAYOUT",
+            "P2_AOT_CHAIN_LEN",
+            "P2_AOT_FUSE",
+            "P2_AOT_MODE",
+            "P2_POSEIDON_MODE",
+            "P2_AOT_GPU_GATHER",
+            "P2_AOT_WITNESS_THREADS",
+            "P2_WITNESS_BUFFERS",
+            "P2_AOT_SIMPLIFY_ARITH",
+        ];
+        let values: Vec<_> = names.iter().map(|&name| (name, "bad")).collect();
+        let defaults = WitnessConfig {
+            cache: WitnessCache::Disabled,
+            ..Default::default()
+        };
+        let c = read(defaults.clone(), &values).unwrap();
+        assert!(c.same_settings(&defaults));
+        let public = format!("{c:?}");
+        for private in [
+            "policy",
+            "layout",
+            "chain_length",
+            "schedule",
+            "poseidon",
+            "gather",
         ] {
-            let env = Environment::with_lookup(|name: &str| (name == key).then(|| value.into()));
-            let error =
-                WitnessConfig::from_environment(WitnessConfig::default(), &env).unwrap_err();
-            assert!(error.to_string().contains(key), "{error}");
+            assert!(!public.contains(private), "{public}");
         }
     }
     #[test]
-    fn validates_application_options_before_resource_creation() {
+    fn diagnostic_environment_is_feature_gated() {
+        let values = [
+            ("PLONKY2_WITNESS_BENCH_MODE", "checked"),
+            ("PLONKY2_WITNESS_BENCH_SCHEDULE", "layers"),
+            ("PLONKY2_WITNESS_BENCH_POSEIDON", "scalar"),
+            ("PLONKY2_WITNESS_BENCH_GATHER", "gpu"),
+        ];
+        let c = read(WitnessConfig::default(), &values).unwrap();
+        #[cfg(feature = "witness-benchmarks")]
+        {
+            assert_eq!(
+                c.policy.execution,
+                super::super::policy::WitnessExecution::Checked
+            );
+            assert_eq!(
+                c.policy.schedule,
+                super::super::policy::WitnessSchedule::Layers
+            );
+            assert_eq!(
+                c.policy.poseidon,
+                super::super::policy::WitnessPoseidon::Scalar
+            );
+            assert_eq!(c.policy.gather, super::super::policy::WitnessGather::Gpu);
+            assert!(read(
+                WitnessConfig::default(),
+                &[("PLONKY2_WITNESS_BENCH_MODE", "bad")]
+            )
+            .is_err());
+        }
+        #[cfg(not(feature = "witness-benchmarks"))]
+        {
+            assert_eq!(c.policy, Policy::default());
+            assert!(read(
+                WitnessConfig::default(),
+                &[("PLONKY2_WITNESS_BENCH_MODE", "bad")]
+            )
+            .is_ok());
+        }
+    }
+    #[test]
+    fn validates_application_resources_before_allocation() {
         let options = WitnessConfig::default();
         options.validate().unwrap();
-        let invalid = WitnessConfig {
+        assert!(WitnessConfig {
             cache: WitnessCache::Directory(PathBuf::new()),
             ..options.clone()
-        };
-        assert!(invalid.validate().is_err());
-        let invalid = WitnessConfig {
-            chain_length: 1,
-            ..options.clone()
-        };
-        assert!(invalid.validate().is_err());
-        let invalid = WitnessConfig {
-            gather_columns: 0,
-            ..options.clone()
-        };
-        assert!(invalid.validate().is_err());
-        let invalid = WitnessConfig {
+        }
+        .validate()
+        .is_err());
+        assert!(WitnessConfig {
             buffers: WitnessBuffers::Reuse { max_bytes: 0 },
             ..options
-        };
-        assert!(invalid.validate().is_err());
+        }
+        .validate()
+        .is_err());
     }
     #[test]
     #[cfg(feature = "parallel")]
-    fn environment_precedence_is_resolved_without_mutating_the_test_process() {
+    fn environment_is_captured_without_mutating_the_test_process() {
         const CHILD: &str = "PLONKY2_EXECUTOR_CONFIG_TEST_CHILD";
         if std::env::var_os(CHILD).is_some() {
             let config = WitnessConfig::from_env().unwrap();
             assert_eq!(config.threads, 2);
-            assert_eq!(config.chain_length, 0);
+            assert_eq!(config.buffers, WitnessBuffers::Reuse { max_bytes: 4096 });
+            assert_eq!(config.fallback, WitnessFallback::Error);
             assert_eq!(config.cache, WitnessCache::Disabled);
             return;
         }
-        let status=std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact","plonk::witness_program::config::tests::environment_precedence_is_resolved_without_mutating_the_test_process"])
-            .env(CHILD,"1").env("P2_AOT_WITNESS_THREADS","7").env("PLONKY2_EXECUTOR_THREADS","2")
-            .env("P2_AOT_CHAIN_LEN","8").env("PLONKY2_EXECUTOR_CHAIN_LENGTH","0")
-            .env_remove("PLONKY2_EXECUTOR_CACHE_DIR").status().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "plonk::witness_program::config::tests::environment_is_captured_without_mutating_the_test_process"])
+            .env(CHILD,"1").env("PLONKY2_EXECUTOR_THREADS","2").env("PLONKY2_EXECUTOR_BUFFER_BYTES","4096")
+            .env("PLONKY2_EXECUTOR_FALLBACK","error").env_remove("PLONKY2_EXECUTOR_CACHE_DIR").status().unwrap();
         assert!(status.success());
     }
 }

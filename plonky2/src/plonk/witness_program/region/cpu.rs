@@ -80,12 +80,15 @@ pub(crate) fn benchmark_gather_tiling(current: bool) {
     GATHER_TILING.store(current, Ordering::Relaxed);
 }
 #[cfg(feature = "gpu")]
-fn gather_tiling(config: &crate::plonk::witness_program::WitnessConfig) -> (usize, usize) {
+fn gather_tiling(_config: &crate::plonk::witness_program::WitnessConfig) -> (usize, usize) {
     #[cfg(feature = "witness-benchmarks")]
     if !GATHER_TILING.load(Ordering::Relaxed) {
         return (2, 1024);
     }
-    (config.gather_columns, config.gather_rows)
+    #[cfg(test)]
+    return _config.policy.gather_tiles;
+    #[cfg(not(test))]
+    (16, 256)
 }
 
 impl RegionProgram {
@@ -194,8 +197,10 @@ impl RegionProgram {
             && {
                 #[cfg(feature = "parallel")]
                 {
-                    self.runtime.config.execution == super::super::WitnessExecution::Checked
-                        || self.runtime.config.schedule == super::super::WitnessSchedule::Layers
+                    self.runtime.config.policy.execution
+                        == super::super::policy::WitnessExecution::Checked
+                        || self.runtime.config.policy.schedule
+                            == super::super::policy::WitnessSchedule::Layers
                         || matches!(self.runtime.schedule.get(), Some(Ok(_)))
                 }
                 #[cfg(not(feature = "parallel"))]
@@ -2264,7 +2269,8 @@ pub(crate) fn generate_wires_with<
         #[cfg(feature = "gpu")]
         Some(ctx) => {
             let cell_slots = program.cell_slots(map, num_wires, degree);
-            let gpu_gather = program.runtime.config.gather == super::super::WitnessGather::Gpu
+            let gpu_gather = program.runtime.config.policy.gather
+                == super::super::policy::WitnessGather::Gpu
                 && executor.fast.is_some();
             let wire_values = if gpu_gather {
                 report.gather_mode = "gpu";
@@ -2816,7 +2822,8 @@ pub(crate) mod tests {
     #[ignore = "requires a native GPU; run alone with --ignored"]
     fn gpu_cpu_gather_tiles_match_every_worklist_wire() {
         use crate::hash::poseidon::PoseidonHash;
-        use crate::plonk::witness_program::{WitnessConfig, WitnessGather};
+        use crate::plonk::witness_program::policy::WitnessGather;
+        use crate::plonk::witness_program::WitnessConfig;
         for hashes in [512, 1024] {
             let mut builder =
                 CircuitBuilder::<G, 2>::new(CircuitConfig::standard_recursion_zk_config());
@@ -2859,15 +2866,14 @@ pub(crate) mod tests {
                 .map(|v| v.to_canonical_u64())
                 .collect::<Vec<_>>();
             for (gather, columns, rows) in [
-                (WitnessGather::Cpu, 2, 1024),
-                (WitnessGather::Cpu, 16, 256),
-                (WitnessGather::Cpu, 7, 123),
+                (WitnessGather::Auto, 2, 1024),
+                (WitnessGather::Auto, 16, 256),
+                (WitnessGather::Auto, 7, 123),
                 (WitnessGather::Gpu, 16, 256),
             ] {
                 let mut config = program.config().clone();
-                config.gather = gather;
-                config.gather_columns = columns;
-                config.gather_rows = rows;
+                config.policy.gather = gather;
+                config.policy.gather_tiles = (columns, rows);
                 if (columns == 7 || gather == WitnessGather::Gpu) && cfg!(feature = "parallel") {
                     config.threads = 2;
                 }
@@ -3147,11 +3153,17 @@ pub(crate) mod tests {
 #[cfg(feature = "witness-benchmarks")]
 pub(crate) fn replay_snapshot(stem: &std::path::Path, iterations: usize) -> Result<()> {
     let started = Instant::now();
-    let (key, program) = super::plan_bytes::decode(&std::fs::read(stem.with_extension("p2w"))?)?;
+    let (key, mut program) =
+        super::plan_bytes::decode(&std::fs::read(stem.with_extension("p2w"))?)?;
     ensure!(
         key.format == super::plan_bytes::WITNESS_PROGRAM_FORMAT,
         "snapshot executor format changed"
     );
+    // Replay opts into development controls explicitly; the decoder itself
+    // stays deterministic and never reads process settings.
+    program.runtime = std::sync::Arc::new(super::super::config::Runtime::new(
+        super::super::WitnessConfig::from_env()?.with_compilation_key(key.compilation)?,
+    )?);
     let read_words = |extension: &str| -> Result<Vec<u64>> {
         let bytes = std::fs::read(stem.with_extension(extension))?;
         ensure!(bytes.len() % 8 == 0, "invalid word file");

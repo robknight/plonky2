@@ -43,7 +43,7 @@ pub(crate) fn file_stem(digest: &[u8]) -> String {
 }
 
 pub(super) fn fast_enabled(p: &RegionProgram) -> bool {
-    p.runtime.config.execution != super::super::WitnessExecution::Checked
+    p.runtime.config.policy.execution != super::super::policy::WitnessExecution::Checked
 }
 
 pub(super) fn execute(executor: &Executor<'_>) -> Result<bool> {
@@ -60,7 +60,7 @@ pub(super) fn run_fixed<const K: u8>(executor: &Executor<'_>, group: &Group) -> 
     let chunk = if use_simd {
         poseidon_chunk()
     } else {
-        tuned_chunk(executor, kind)
+        super::cpu::lane_chunk(kind)
     };
     if K == 17 && group.count >= 512 && random_spans_enabled() {
         if let Some(&(source, destination)) =
@@ -76,7 +76,7 @@ pub(super) fn run_fixed<const K: u8>(executor: &Executor<'_>, group: &Group) -> 
                 });
         }
     }
-    if K == 1 && executor.program.runtime.config.simplify_arithmetic {
+    if K == 1 {
         return (0..group.count.div_ceil(chunk))
             .into_par_iter()
             .try_for_each(|c| {
@@ -188,12 +188,6 @@ fn random_spans(p: &RegionProgram) -> &HashMap<u32, (u32, u32)> {
         log::debug!(target: super::COMPILE_LOG, "contiguous random copies: {eligible}/{}", p.random_count);
         spans
     })
-}
-
-fn tuned_chunk(e: &Executor<'_>, kind: Kind) -> u32 {
-    super::cpu::lane_chunk(kind)
-        .saturating_mul(e.program.runtime.config.chunk_scale)
-        .max(1)
 }
 
 fn arithmetic_simplified(e: &Executor<'_>, g: &Group, start: u32, end: u32) -> Result<()> {
@@ -498,7 +492,7 @@ pub(super) fn certify(p: &RegionProgram) -> Result<FastLayout> {
 
 /// Changes value placement while retaining operand and group ordering.
 pub(super) fn reorder(p: &mut RegionProgram) -> Result<()> {
-    let mode = p.runtime.config.layout.code();
+    let mode = p.runtime.config.policy.layout.code();
     if mode == 0 {
         return Ok(());
     }
@@ -601,7 +595,7 @@ pub(super) fn run_pattern_group(
         ids.len() == g.count as usize,
         "native pattern lane count mismatch"
     );
-    let chunk = tuned_chunk(e, Kind::ArithmeticChain) as usize;
+    let chunk = super::cpu::lane_chunk(Kind::ArithmeticChain) as usize;
     ids.par_chunks(chunk).enumerate().try_for_each(|(c, ids)| {
         let _profile = e.profile.kind(26, ids.len() as u32);
         for (i, &id) in ids.iter().enumerate() {
@@ -667,7 +661,7 @@ pub(super) fn prepare(p: &RegionProgram) -> Result<()> {
         let _ = random_spans(p);
         generated::prepare(p);
         #[cfg(feature = "parallel")]
-        if p.runtime.config.schedule != super::super::WitnessSchedule::Layers {
+        if p.runtime.config.policy.schedule != super::super::policy::WitnessSchedule::Layers {
             let _ = super::schedule::prepare(p)?;
         }
     }
@@ -794,7 +788,7 @@ fn poseidon_mode(e: &Executor<'_>) -> u8 {
             return override_mode;
         }
     }
-    if e.program.runtime.config.poseidon == super::super::WitnessPoseidon::Auto
+    if e.program.runtime.config.policy.poseidon == super::super::policy::WitnessPoseidon::Auto
         && crate::hash::poseidon_trace_simd::native_available()
     {
         5
@@ -812,9 +806,7 @@ fn poseidon_chunk() -> u32 {
 #[cfg(feature = "parallel")]
 pub(super) fn run_range(e: &Executor<'_>, g: &Group, start: u32, end: u32) -> Result<()> {
     match g.kind {
-        Kind::Arithmetic if e.program.runtime.config.simplify_arithmetic => {
-            return arithmetic_simplified(e, g, start, end)
-        }
+        Kind::Arithmetic => return arithmetic_simplified(e, g, start, end),
         Kind::Equality => return equality_batch(e, g, start, end),
         Kind::Poseidon => {
             let starts = &poseidon_bases(e.program)[&g.targets_offset];

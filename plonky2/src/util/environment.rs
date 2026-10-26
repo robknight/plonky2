@@ -127,6 +127,7 @@ impl<F: Fn(&str) -> Option<OsString>> Environment<F> {
                 .join(", "),
         })
     }
+    #[cfg(any(feature = "gpu", test))]
     pub(crate) fn boolean(
         &self,
         name: &'static str,

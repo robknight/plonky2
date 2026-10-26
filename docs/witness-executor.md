@@ -28,7 +28,7 @@ Missing entries are compiled. Incompatible or damaged entries are rebuilt and re
 
 The [runtime configuration audit](runtime-configuration.md) identifies deployment settings that can be controlled through environment defaults, alongside resource/lifecycle APIs that remain explicit.
 
-`WitnessConfig::default()` selects deterministic recommended settings. `WitnessConfig::from_env()` applies process defaults; the ordinary preparation methods use it. To override process settings, pass a configuration to `prepare_witness_program_with_config`.
+`WitnessConfig` exposes only cache policy, CPU resources, retained-buffer budget and fallback. `WitnessConfig::default()` selects deterministic recommended settings. `WitnessConfig::from_env()` applies process defaults; the ordinary preparation methods use it. To override process settings, pass a configuration to `prepare_witness_program_with_config`.
 
 ```rust,ignore
 let mut config = WitnessConfig::default();
@@ -40,9 +40,9 @@ let prepared = circuit.prepare_witness_program_with_config(&input_targets, confi
 
 Libraries supplying suggested policy should use `WitnessConfig::from_env_with_defaults(defaults)` so application environment variables override those suggestions. The example above is an explicit application override. POD2 resolves its defaults on the plonky2 side and exposes only an optional caller-owned witness pool, rather than forwarding these policy fields to applications.
 
-The default scheduler lets independent branches advance as soon as their inputs are ready. It retains global layers on single-thread pools and builds without `parallel`. `WitnessSchedule::Layers` selects the old scheduling model; `Dependencies` explicitly requests parallel dependency scheduling. Checked execution always uses the checked layer interpreter. Preparation builds dependency metadata once per execution-resource configuration; no generated Rust or external compiler is involved.
+The default scheduler lets independent branches advance as soon as their inputs are ready. It retains global layers on single-thread pools and builds without `parallel`. Layered and checked comparisons are available only in development tooling. They are not application configuration options. Preparation builds dependency metadata once per execution-resource configuration; no generated Rust or external compiler is involved.
 
-Settings are resolved during preparation. The following environment settings are supported; historical `P2_AOT_*` tuning names remain migration aliases, with the new names taking precedence.
+Settings are resolved during preparation. These are the only four executor environment settings supported by normal applications:
 
 | Variable | Meaning | Default |
 | --- | --- | --- |
@@ -50,24 +50,14 @@ Settings are resolved during preparation. The following environment settings are
 | `PLONKY2_EXECUTOR_THREADS` | Program-owned execution pool size; zero uses the current Rayon pool | `0` |
 | `PLONKY2_EXECUTOR_BUFFER_BYTES` | Retained capacity for wiped buffers; zero uses fresh allocations | `0` |
 | `PLONKY2_EXECUTOR_FALLBACK` | Input-shape/failure policy: `worklist` or `error` | `worklist` |
-| `PLONKY2_EXECUTOR_MODE` | Validated adaptive execution or checked control: `auto` or `checked` | `auto` |
-| `PLONKY2_EXECUTOR_SCHEDULE` | Ready chunk dependencies or layer barriers: `auto`, `dependencies`, `layers` | `auto` |
-| `PLONKY2_EXECUTOR_POSEIDON` | Hardware-eligible batching or individual permutations: `auto` or `scalar` | `auto` |
-| `PLONKY2_EXECUTOR_LAYOUT` | Value placement: `outputs`, `canonical`, `representative`, `block4`, `block8` | `outputs` |
-| `PLONKY2_EXECUTOR_CHAIN_LENGTH` | Fused arithmetic-chain limit; zero disables, otherwise 2–8 | `4` |
-| `PLONKY2_EXECUTOR_CHUNK_SCALE` | Advanced operation chunk-size multiplier | `1` |
-| `PLONKY2_EXECUTOR_SIMPLIFY_ARITHMETIC` | Simplify arithmetic coefficients | `true` |
-| `PLONKY2_EXECUTOR_GATHER` | Final gather policy: `auto`, `cpu`, `gpu` | `auto` |
-| `PLONKY2_EXECUTOR_GATHER_COLUMNS` | Advanced wire-gathering tile width | `16` |
-| `PLONKY2_EXECUTOR_GATHER_ROWS` | Advanced wire-gathering tile height | `256` |
 
 Invalid settings return `WitnessProgramError::InvalidConfiguration`. `WitnessCache::Disabled` overrides an environment cache directory. With the `parallel` feature, `config.thread_pool` accepts an `Arc<rayon::ThreadPool>` to share a caller-owned pool across prepared programs. A positive `threads` count creates an owned pool instead. These pools govern witness sampling, execution, gathering and wiping. Circuit compilation, host preparation, cache I/O and worklist fallback use the caller context. Avoid creating separate large pools for every circuit when a shared pool suits the application.
 
-Clones of a circuit share its installed program slot. Program handles share immutable topology, input metadata and prepared tables. Wiped reusable state/readiness allocations belong to their execution resources; the last owner releases retained allocations. A reuse budget limits retained buffer payload, not total process memory or allocations for proofs currently in flight. `with_execution_config` reuses a program's topology and tables with different resource/execution settings while preserving its compilation policy.
+Clones of a circuit share its installed program slot. Program handles share immutable topology, input metadata and prepared tables. Wiped reusable state/readiness allocations belong to their execution resources; the last owner releases retained allocations. A reuse budget limits retained buffer payload, not total process memory or allocations for proofs currently in flight. `with_execution_config` reuses a program's topology and tables with different resource/fallback settings while preserving its compilation policy.
 
 ## Hardware selection and portable binaries
 
-`WitnessPoseidon::Auto` uses eight independent permutations together when x86 CPU and operating-system support for AVX-512 is available. Portable x86 binaries use an isolated, runtime-dispatched kernel; the rest of the binary does not require AVX-512. Builds already targeting all required AVX-512 features retain their existing native specialization. Non-AVX-512 x86 and ARM use the scalar/production field path. Small groups and tails also use individual permutations. `WitnessPoseidon::Scalar` selects that path explicitly for comparison.
+Automatic hardware selection uses eight independent permutations together when x86 CPU and operating-system support for AVX-512 is available. Portable x86 binaries use an isolated, runtime-dispatched kernel; the rest of the binary does not require AVX-512. Builds already targeting all required AVX-512 features retain their existing native specialization. Non-AVX-512 x86 and ARM use the scalar/production field path. Small groups and tails also use individual permutations. Individual-permutation comparisons are available in benchmark builds.
 
 This dispatch accelerates witness execution; it does not change hardware selection in the rest of the prover. Whole-binary `-C target-cpu=native` remains an application build choice for a known deployment CPU. Portable applications do not need that flag to get this witness kernel. Scheduling and batching are automatic; no MainPod identifier or circuit-specific generated crate is required.
 
@@ -93,3 +83,12 @@ Development tooling uses a separate `witness-benchmarks` feature. Snapshot
 export, replay and process-wide comparison overrides are unavailable in normal
 application builds; see `tools/witness-profile/README.md`. Consumer code uses
 `WitnessConfig` and preparation methods rather than internal region structures.
+
+
+The measured implementation fixes output-local placement, four-operation chain
+fusion, arithmetic simplification, standard operation chunks and 16×256 gather
+tiles internally. Scheduling and Poseidon batching are selected automatically.
+The former tuning fields and enums have been removed from the public config;
+old `PLONKY2_EXECUTOR_*` tuning names and `P2_*` configuration aliases are ignored.
+Development comparisons use `PLONKY2_WITNESS_BENCH_*` only with the
+`witness-benchmarks` feature; see `tools/witness-profile/README.md`.

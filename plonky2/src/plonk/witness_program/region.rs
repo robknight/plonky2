@@ -558,10 +558,10 @@ fn fuse_arithmetic<F: RichField>(
     entry: &PartitionWitness<F>,
     config: &super::WitnessConfig,
 ) -> Result<Vec<Lane>> {
-    if config.chain_length == 0 {
+    if config.policy.chain_length == 0 {
         return Ok(nodes);
     }
-    let limit = config.chain_length as usize;
+    let limit = config.policy.chain_length as usize;
     const MANY: u32 = u32::MAX - 1;
     let mut producer = vec![NONE; entry.values.len()];
     let mut consumer = vec![NONE; entry.values.len()];

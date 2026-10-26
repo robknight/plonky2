@@ -8,7 +8,7 @@
 | --- | --- | --- |
 | `GpuConfig`: backend, adapter, mode, workers, budgets, hybrid share, software adapters, exit cleanup | Environment defaults, applied automatically | Deployment policy; no POD2 wrapper is necessary. |
 | `gpu::set_enabled` startup use | Add `PLONKY2_GPU_ENABLED` | CPU-only startup needs no direct plonky2 API call. Keep `set_enabled` for temporary runtime routing. |
-| `WitnessConfig`: scheduling, layout, fusion, gather policies and budgets | Keep environment-first preparation; share strict typed extraction | Already supports `PLONKY2_EXECUTOR_*`; remove duplicated parsing and preserve documented migration aliases. |
+| `WitnessConfig`: cache, CPU resources, buffer budget, fallback | Four operational environment settings and an optional caller-owned pool | Algorithms and tuning constants are private implementation choices. Normal applications do not select scheduling, layouts, fusion or gather kernels. |
 | `WitnessCache` / cache directory | Keep `PLONKY2_EXECUTOR_CACHE_DIR` and explicit overrides | Plonky2 manages programs independently of POD2 circuit-data caching. Paths support native OS strings. |
 | `WitnessConfig::thread_pool` | Keep explicit `Arc<rayon::ThreadPool>` | A live resource cannot be encoded in an environment variable. Thread count already has an environment setting. |
 | `prepare_*_with_config`, `with_execution_config`, `GpuContext::with_config` | Keep low-level explicit APIs | Support independently configured programs and caller-owned low-level contexts. Private GPU contexts do not select the device for ordinary plonky2/POD2 proofs. Ordinary calls need no configuration argument. |
@@ -50,7 +50,7 @@ The worker hint sizes GPU resources; it does not spawn application proof request
 
 ## Extraction, precedence and lifetime
 
-`GpuConfig::from_env()` and `WitnessConfig::from_env()` return typed, validated settings without creating a device, execution pool or disk cache. They use a shared internal extractor with numeric, boolean, enum and native-path readers. `EnvironmentError` preserves the selected variable name and expected type/value. Tests inject a lookup to avoid mutating process-global environment in parallel; lifecycle tests run in isolated child processes.
+`GpuConfig::from_env()` and `WitnessConfig::from_env()` return typed, validated settings without creating a device, execution pool or disk cache. They use a shared internal extractor with numeric, boolean, enum and native-path readers. The executor application surface is only `CACHE_DIR`, `THREADS`, `BUFFER_BYTES` and `FALLBACK`, all under `PLONKY2_EXECUTOR_`. `EnvironmentError` preserves the selected variable name and expected type/value. Tests inject a lookup to avoid mutating process-global environment in parallel; lifecycle tests run in isolated child processes.
 
 The precedence is plonky2 defaults, then library suggestions, then application environment variables, then optional explicit application overrides. `GpuConfig::from_env_with_defaults(defaults)` and `WitnessConfig::from_env_with_defaults(defaults)` implement the library-default layer. Unset variables preserve suggested values. Empty adapter text clears a filter; GPU budget `auto` clears a suggested fixed budget; an empty executor cache directory disables a suggested cache; a nonempty directory can enable caching even if the library suggested disabling it. An explicit witness thread-count variable selects an owned/inherited pool instead of a library-suggested pool handle.
 
@@ -68,7 +68,7 @@ plonky2::gpu::configure(settings)?;
 
 `enabled=false` avoids device creation and is fixed with the startup configuration. `set_enabled(false)` is a separate temporary routing gate; setting it back to true does not undo startup disablement or permanent shutdown.
 
-Witness settings are captured during preparation and remain in the installed program. Current `PLONKY2_EXECUTOR_*` names override supported `P2_*` aliases; both override library defaults when using `from_env_with_defaults`. Standalone applications can deliberately bypass environment settings with the explicit `_with_config` APIs. Shadowed aliases are not parsed. `WitnessCache::Environment` is an explicit exception in otherwise passed-in configuration: it still resolves the cache-directory hint during preparation; choose `Disabled` or `Directory` for an explicit cache policy. POD2 captures its defaults through `WitnessConfig::from_env_with_defaults` on first preparation/proving because circuit objects are shared. It exposes no scalar plonky2 policy wrapper. Applications may call `set_witness_thread_pool(Arc<rayon::ThreadPool>)` before that point to inject a resource; this explicit application handle takes precedence over an environment thread-count hint while other environment policies remain effective. The pool is retained with process-wide circuit caches; this is not an independently disposable per-proof runtime.
+Witness settings are captured during preparation and remain in the installed program. The four operational `PLONKY2_EXECUTOR_*` settings override library defaults when using `from_env_with_defaults`. Legacy `P2_*` configuration aliases and retired tuning variables are ignored. Standalone applications can deliberately bypass environment settings with the explicit `_with_config` APIs. `WitnessCache::Environment` is an explicit exception in otherwise passed-in configuration: it still resolves the cache-directory hint during preparation; choose `Disabled` or `Directory` for an explicit cache policy. POD2 captures its defaults through `WitnessConfig::from_env_with_defaults` on first preparation/proving because circuit objects are shared. It exposes no scalar plonky2 policy wrapper. Applications may call `set_witness_thread_pool(Arc<rayon::ThreadPool>)` before that point to inject a resource; this explicit application handle takes precedence over an environment thread-count hint while other environment policies remain effective. The pool is retained with process-wide circuit caches; this is not an independently disposable per-proof runtime.
 
 No environment lookup is added to kernel loops. Execution remains independent of later environment changes. The shared extractor is included in the conservative executor source fingerprint, so this change invalidates old on-disk executor entries once; managed preparation rebuilds them.
 
@@ -77,7 +77,7 @@ No environment lookup is added to kernel loops. Execution remains independent of
 - Existing code using `gpu::config()` should handle its new `Result`, usually with `?`.
 - Prefer environment variables for deployment knobs. Library authors should use `from_env_with_defaults` or `gpu::configure_defaults`; full `configure` is reserved for explicit application overrides. Standalone plonky2 explicit APIs remain supported.
 - Change partial overrides built from `GpuConfig::default()` to `GpuConfig::from_env()?` when they should preserve deployment settings.
-- Witness migration aliases retain priority below the new names. Legacy fuse/gather/buffer switches now reject unknown values rather than silently accepting them; use documented booleans or `pool`/`fresh` for `P2_WITNESS_BUFFERS`.
+- Migrate resource configuration to the four supported `PLONKY2_EXECUTOR_*` names. Legacy aliases and the ten retired tuning names no longer affect normal execution. The corresponding public fields and policy enums are removed. Use benchmark-only tooling for comparisons.
 - POD2 removes `configure_witness_executor(WitnessConfig)` and its configuration-type re-exports. Use environment variables for policy and `set_witness_thread_pool` for a caller-owned pool.
 - Security/circuit configuration, custom-generator descriptions and application proof concurrency stay explicit.
 
@@ -90,3 +90,29 @@ Initial audit logs remain in `.benchmark-artifacts/configuration-audit-2026-10-2
 - All 36 witness tests passed, including library cache/buffer/fallback suggestions overridden by application variables and replacement of a library-suggested pool by an environment thread count.
 - POD2's resource tests validate shared caller-owned pool identity, environment-controlled policy and setup freezing. A standalone application with direct dependencies only on POD2, Rayon, logging and error handling verified two MainPod proofs on Apple M4/Metal. It used a two-thread application pool alongside a one-thread environment hint, strict compiled execution, environment GPU policy and automatic cleanup; its source imports no plonky2 API.
 - Default CPU, `no_std`, std-only, GPU rustdoc, formatting and lint checks passed. Lint output contains existing unrelated warnings. This changes startup configuration and public integration, without adding kernel-loop environment reads or making a new performance claim.
+
+
+## Executor tuning surface reduction
+
+Normal executor configuration contains only cache policy, thread count or a
+caller-owned pool, wiped-buffer retention and fallback. Layout, chain length,
+chunk scaling, simplification and gather tiles are not public settings.
+Automatic scheduling, batching and CPU gathering retain the measured defaults.
+The private comparison controls `PLONKY2_WITNESS_BENCH_MODE`,
+`PLONKY2_WITNESS_BENCH_SCHEDULE`, `PLONKY2_WITNESS_BENCH_POSEIDON` and
+`PLONKY2_WITNESS_BENCH_GATHER` are read only in `witness-benchmarks` builds.
+They are excluded from normal application parsing and the public config schema.
+Earlier audit counts and experimental tuning in the history refer to the API
+before this reduction.
+
+
+Validation of the reduced executor surface is recorded in
+`.benchmark-artifacts/executor-public-config-2026-10-26/`: 39 witness tests pass
+in normal and benchmark builds, 36 pass without parallel support, and all eight
+graph fixtures match the checked executor in 192 automatic/checked/layered-scalar
+replays. Native Metal wire comparisons verify eight proofs, and a POD2-only
+application verifies two more with retired and benchmark-only variables set to
+invalid values in its normal build. Generated public rustdoc contains only
+`cache`, `threads`, `thread_pool`, `buffers` and `fallback`; removed policy enums
+are absent from the public module exports. The measured algorithm defaults are
+preserved; these checks make no new performance claim.

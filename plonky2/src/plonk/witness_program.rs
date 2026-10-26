@@ -45,10 +45,8 @@
 mod cache;
 pub use cache::{WitnessPreparation, WitnessProgramSource};
 mod config;
-pub use config::{
-    WitnessBuffers, WitnessCache, WitnessConfig, WitnessExecution, WitnessFallback, WitnessGather,
-    WitnessLayout, WitnessPoseidon, WitnessSchedule,
-};
+pub use config::{WitnessBuffers, WitnessCache, WitnessConfig, WitnessFallback};
+mod policy;
 
 #[doc(hidden)]
 pub(crate) mod region;
@@ -687,7 +685,10 @@ mod tests {
         builder.register_public_inputs(&hash.elements);
         let data = builder.build::<C>();
         let mut config = WitnessConfig {
-            schedule: WitnessSchedule::Dependencies,
+            policy: policy::Policy {
+                schedule: policy::WitnessSchedule::Dependencies,
+                ..Default::default()
+            },
             threads: 2,
             buffers: WitnessBuffers::Reuse {
                 max_bytes: 8 * 1024 * 1024,
@@ -710,12 +711,12 @@ mod tests {
                 });
             }
         });
-        config.schedule = WitnessSchedule::Layers;
+        config.policy.schedule = policy::WitnessSchedule::Layers;
         data.prepare_witness_program_with_config(&[a, b], config)
             .unwrap();
         assert_eq!(
-            data.witness_program().unwrap().config().schedule,
-            WitnessSchedule::Layers
+            data.witness_program().unwrap().config().policy.schedule,
+            policy::WitnessSchedule::Layers
         );
         let mut pw = PartialWitness::new();
         pw.set_target(a, G::ONE).unwrap();
@@ -920,26 +921,37 @@ mod tests {
             .data
             .compile_witness_program_with_config(&targets, config.clone())
             .unwrap();
-        assert_eq!(program.config().execution, WitnessExecution::Auto);
+        assert_eq!(
+            program.config().policy.execution,
+            policy::WitnessExecution::Auto
+        );
         let bytes = program.to_bytes();
         fast.data.install_witness_program(program).unwrap();
-        config.execution = WitnessExecution::Checked;
+        config.policy.execution = policy::WitnessExecution::Checked;
         let loaded = checked
             .data
             .witness_program_from_bytes_with_config(&bytes, config)
             .unwrap();
-        assert_eq!(loaded.config().execution, WitnessExecution::Checked);
-        assert_eq!(loaded.config().chain_length, 4);
+        assert_eq!(
+            loaded.config().policy.execution,
+            policy::WitnessExecution::Checked
+        );
+        assert_eq!(loaded.config().policy.chain_length, 4);
         checked.data.install_witness_program(loaded).unwrap();
         assert!(prove_and_verify(&fast.data, inputs(&fast)));
         assert!(prove_and_verify(&checked.data, inputs(&checked)));
         assert!(fast.data.has_witness_program());
         assert_eq!(
-            fast.data.witness_program().unwrap().config().execution,
-            WitnessExecution::Auto
+            fast.data
+                .witness_program()
+                .unwrap()
+                .config()
+                .policy
+                .execution,
+            policy::WitnessExecution::Auto
         );
         let invalid = WitnessConfig {
-            chain_length: 1,
+            buffers: WitnessBuffers::Reuse { max_bytes: 0 },
             ..WitnessConfig::default()
         };
         assert!(matches!(
@@ -959,7 +971,10 @@ mod tests {
         assert!(Arc::ptr_eq(&program.key, &clone.key));
         assert!(Arc::ptr_eq(&program.program, &clone.program));
         let config = WitnessConfig {
-            execution: WitnessExecution::Checked,
+            policy: policy::Policy {
+                execution: policy::WitnessExecution::Checked,
+                ..Default::default()
+            },
             ..WitnessConfig::default()
         };
         let checked = program.with_execution_config(config).unwrap();

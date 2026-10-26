@@ -1,5 +1,7 @@
 # Witness executor optimization experiments and priorities
 
+The current executor API exposes only cache location, CPU resources, wiped-buffer retention and fallback. Algorithm tuning and policy enums discussed in the dated experiments are private; comparison controls live in benchmark tooling. See [the current guide](witness-executor.md).
+
 The bounded 25 October completion pass is summarized in [the acceptance report](witness-executor-acceptance.md), with the supported consumer API in [the integration guide](witness-executor.md). Earlier priorities and open questions below are dated experiment history; see the final disposition at the end.
 
 As of 24 October 2026. The objective is to beat the existing witness executor during execution, with MainPod as the primary workload and a small set of other circuits checking whether the approach generalizes. Program generation should stay quick, and Rust build cost must remain practical. Larger files on disk are acceptable when they buy speed without expensive generation or compilation.
