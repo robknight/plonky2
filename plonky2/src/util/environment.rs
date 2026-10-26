@@ -81,6 +81,28 @@ impl<F: Fn(&str) -> Option<OsString>> Environment<F> {
             expected: format!("a valid {} number", core::any::type_name::<T>()),
         })
     }
+    /// Outer None means absent; Some(None) restores automatic sizing.
+    #[cfg(any(feature = "gpu", test))]
+    pub(crate) fn optional_number<T: FromStr>(
+        &self,
+        name: &'static str,
+        alias: &'static str,
+    ) -> Result<Option<Option<T>>, EnvironmentError> {
+        let Some((variable, value)) = self.value(name, alias) else {
+            return Ok(None);
+        };
+        if value == "auto" {
+            return Ok(Some(None));
+        }
+        value
+            .to_str()
+            .and_then(|s| s.parse().ok())
+            .map(|v| Some(Some(v)))
+            .ok_or_else(|| EnvironmentError {
+                variable,
+                expected: format!("auto or a valid {} number", core::any::type_name::<T>()),
+            })
+    }
     pub(crate) fn choice<T: Copy>(
         &self,
         name: &'static str,
@@ -134,6 +156,7 @@ mod tests {
             ("OLD", "bad".into()),
             ("BOOL", "false".into()),
             ("EMPTY", "".into()),
+            ("AUTO", "auto".into()),
             ("OVERFLOW", "18446744073709551616".into()),
         ]
         .into();
@@ -148,6 +171,16 @@ mod tests {
         assert!(env.number::<u64>("OVERFLOW", "OVERFLOW").is_err());
         assert!(env.number::<u32>("EMPTY", "EMPTY").is_err());
         assert_eq!(env.path("EMPTY"), None);
+        assert_eq!(
+            env.optional_number::<u64>("PRIMARY", "OLD").unwrap(),
+            Some(Some(2))
+        );
+        assert_eq!(
+            env.optional_number::<u64>("AUTO", "AUTO").unwrap(),
+            Some(None)
+        );
+        assert_eq!(env.optional_number::<u64>("UNSET", "UNSET").unwrap(), None);
+        assert!(env.optional_number::<u64>("OVERFLOW", "OVERFLOW").is_err());
         assert_eq!(env.number::<u64>("UNSET", "UNSET").unwrap(), None);
     }
     #[test]

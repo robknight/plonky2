@@ -27,7 +27,8 @@
 //! The context resolves typed `PLONKY2_GPU_*` environment defaults once on
 //! first use (see [`GpuConfig::from_env`]). No wrapper configuration is needed
 //! in applications using a downstream library. [`configure`] can override the
-//! complete configuration before first use. [`config`] validates process
+//! complete configuration before first use. Libraries may offer lower-priority
+//! suggestions with [`configure_defaults`]. [`config`] validates process
 //! defaults without creating a device; invalid defaults disable automatic GPU
 //! routing with a warning. [`set_enabled`] temporarily sends work to the CPU.
 //!
@@ -113,8 +114,13 @@ enum ContextState {
 
 static CONTEXT: Mutex<ContextState> = Mutex::new(ContextState::Uninitialized);
 
-/// Explicit settings or the first typed environment resolution, including errors.
-static CONFIG: Mutex<Option<Result<GpuConfig, ConfigureError>>> = Mutex::new(None);
+enum Configuration {
+    Environment,
+    LibraryDefaults(GpuConfig),
+    Resolved(Result<GpuConfig, ConfigureError>),
+    Application(GpuConfig),
+}
+static CONFIG: Mutex<Configuration> = Mutex::new(Configuration::Environment);
 
 thread_local! {
     /// The last submission made from this thread, which its readbacks wait for.
@@ -184,20 +190,45 @@ pub fn configure(config: GpuConfig) -> Result<(), ConfigureError> {
     if !matches!(*state, ContextState::Uninitialized) {
         return Err(ConfigureError::AlreadyInitialized);
     }
-    *CONFIG.lock().unwrap() = Some(Ok(config));
+    *CONFIG.lock().unwrap() = Configuration::Application(config);
     Ok(())
 }
 
-/// Resolve the global settings without initializing a device. Environment
-/// defaults (including errors) are captured on the first call. Call this at
-/// application startup to return invalid settings as an error. A subsequent
-/// explicit [`configure`] may replace them until the context is initialized.
+/// Offer library defaults without overriding application policy or existing
+/// defaults. The first offer before configuration resolution wins. Returns
+/// false if settings have already been offered, resolved, explicitly configured
+/// or shut down. Application environment variables are applied later by
+/// [`config`]; explicit application [`configure`] takes precedence over both.
+/// This does not create a device. Most libraries can simply use platform defaults.
+pub fn configure_defaults(defaults: GpuConfig) -> Result<bool, ConfigureError> {
+    let state = CONTEXT.lock().unwrap();
+    let mut settings = CONFIG.lock().unwrap();
+    if !matches!(*state, ContextState::Uninitialized)
+        || !matches!(*settings, Configuration::Environment)
+    {
+        return Ok(false);
+    }
+    defaults.validate()?;
+    *settings = Configuration::LibraryDefaults(defaults);
+    Ok(true)
+}
+
+/// Resolve the global settings without initializing a device. Library defaults
+/// are below environment overrides; explicit application configuration is above
+/// both. Values and errors are captured on first resolution. A later explicit
+/// [`configure`] may replace them until the context is initialized.
 pub fn config() -> Result<GpuConfig, ConfigureError> {
-    CONFIG
-        .lock()
-        .unwrap()
-        .get_or_insert_with(GpuConfig::from_env)
-        .clone()
+    let mut settings = CONFIG.lock().unwrap();
+    let resolved = match &*settings {
+        Configuration::Environment => GpuConfig::from_env(),
+        Configuration::LibraryDefaults(defaults) => {
+            GpuConfig::from_env_with_defaults(defaults.clone())
+        }
+        Configuration::Resolved(result) => return result.clone(),
+        Configuration::Application(config) => return Ok(config.clone()),
+    };
+    *settings = Configuration::Resolved(resolved.clone());
+    resolved
 }
 
 /// Why an orderly GPU shutdown could not complete.
@@ -645,7 +676,9 @@ impl GpuContext {
         Self::with_config(&config()?)
     }
 
-    /// Creates a context on the best available adapter with `config`.
+    /// Creates a caller-owned low-level context with `config`. This does not
+    /// replace the global context used by normal proving or POD2; independent
+    /// contexts are not an application-level per-proof device-selection API.
     pub fn with_config(config: &GpuConfig) -> anyhow::Result<Self> {
         config.validate()?;
         anyhow::ensure!(config.enabled, "GPU disabled by configuration");

@@ -38,6 +38,8 @@ config.fallback = WitnessFallback::Error;
 let prepared = circuit.prepare_witness_program_with_config(&input_targets, config)?;
 ```
 
+Libraries supplying suggested policy should use `WitnessConfig::from_env_with_defaults(defaults)` so application environment variables override those suggestions. The example above is an explicit application override. POD2 resolves its defaults on the plonky2 side and exposes only an optional caller-owned witness pool, rather than forwarding these policy fields to applications.
+
 The default scheduler lets independent branches advance as soon as their inputs are ready. It retains global layers on single-thread pools and builds without `parallel`. `WitnessSchedule::Layers` selects the old scheduling model; `Dependencies` explicitly requests parallel dependency scheduling. Checked execution always uses the checked layer interpreter. Preparation builds dependency metadata once per execution-resource configuration; no generated Rust or external compiler is involved.
 
 Settings are resolved during preparation. The following environment settings are supported; historical `P2_AOT_*` tuning names remain migration aliases, with the new names taking precedence.

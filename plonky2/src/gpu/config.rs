@@ -91,13 +91,20 @@ impl GpuConfig {
     /// is initialized. Explicit `configure`/`with_config` calls do not read the
     /// environment; start from this method to override only selected fields.
     pub fn from_env() -> Result<Self, ConfigureError> {
-        Self::from_environment(&Environment::process())
+        Self::from_env_with_defaults(Self::default())
+    }
+
+    /// Apply application environment overrides to library-supplied defaults.
+    /// Unset variables preserve those defaults; explicit empty adapter text
+    /// clears a filter, and `auto` restores automatic budget sizing.
+    pub fn from_env_with_defaults(defaults: Self) -> Result<Self, ConfigureError> {
+        Self::from_environment(defaults, &Environment::process())
     }
 
     fn from_environment<F: Fn(&str) -> Option<std::ffi::OsString>>(
+        mut c: Self,
         env: &Environment<F>,
     ) -> Result<Self, ConfigureError> {
-        let mut c = Self::default();
         if let Some(v) = env.boolean("PLONKY2_GPU_ENABLED", "PLONKY2_GPU_ENABLED")? {
             c.enabled = v;
         }
@@ -113,7 +120,9 @@ impl GpuConfig {
         )? {
             c.backend = v;
         }
-        c.adapter_name = env.text("PLONKY2_GPU_ADAPTER_NAME", "PLONKY2_GPU_ADAPTER_NAME")?;
+        if let Some(name) = env.text("PLONKY2_GPU_ADAPTER_NAME", "PLONKY2_GPU_ADAPTER_NAME")? {
+            c.adapter_name = (!name.is_empty()).then_some(name);
+        }
         if let Some(v) = env.boolean("PLONKY2_GPU_ALLOW_SOFTWARE", "PLONKY2_GPU_ALLOW_SOFTWARE")? {
             c.allow_software = v;
         }
@@ -138,9 +147,16 @@ impl GpuConfig {
             }
             c.proving_workers = v;
         }
-        c.retained_bytes =
-            env.number("PLONKY2_GPU_RETAINED_BYTES", "PLONKY2_GPU_RETAINED_BYTES")?;
-        c.pool_bytes = env.number("PLONKY2_GPU_POOL_BYTES", "PLONKY2_GPU_POOL_BYTES")?;
+        if let Some(value) =
+            env.optional_number("PLONKY2_GPU_RETAINED_BYTES", "PLONKY2_GPU_RETAINED_BYTES")?
+        {
+            c.retained_bytes = value;
+        }
+        if let Some(value) =
+            env.optional_number("PLONKY2_GPU_POOL_BYTES", "PLONKY2_GPU_POOL_BYTES")?
+        {
+            c.pool_bytes = value;
+        }
         if let Some(v) = env.number(
             "PLONKY2_GPU_QUOTIENT_CPU_SHARE",
             "PLONKY2_GPU_QUOTIENT_CPU_SHARE",
@@ -229,13 +245,66 @@ mod tests {
 
     use super::*;
     fn read(values: &[(&str, &str)]) -> Result<GpuConfig, ConfigureError> {
+        read_defaults(GpuConfig::default(), values)
+    }
+    fn read_defaults(
+        defaults: GpuConfig,
+        values: &[(&str, &str)],
+    ) -> Result<GpuConfig, ConfigureError> {
         let values: BTreeMap<_, _> = values
             .iter()
             .map(|(k, v)| (*k, OsString::from(v)))
             .collect();
-        GpuConfig::from_environment(&Environment::with_lookup(|key: &str| {
-            values.get(key).cloned()
-        }))
+        GpuConfig::from_environment(
+            defaults,
+            &Environment::with_lookup(|key: &str| values.get(key).cloned()),
+        )
+    }
+    #[test]
+    fn application_environment_overrides_library_defaults_without_erasing_unset_fields() {
+        let defaults = GpuConfig {
+            enabled: false,
+            backend: Some(Backend::Vulkan),
+            adapter_name: Some("suggested".into()),
+            allow_software: true,
+            mode: ExecutionMode::Hybrid,
+            proving_workers: 7,
+            retained_bytes: Some(1024),
+            pool_bytes: Some(2048),
+            quotient_cpu_share: 0.3,
+            shutdown_at_exit: false,
+        };
+        assert_eq!(read_defaults(defaults.clone(), &[]).unwrap(), defaults);
+        let c = read_defaults(
+            defaults.clone(),
+            &[
+                ("PLONKY2_GPU_ENABLED", "true"),
+                ("PLONKY2_GPU_BACKEND", "auto"),
+                ("PLONKY2_GPU_ADAPTER_NAME", ""),
+                ("PLONKY2_GPU_PROVING_WORKERS", "2"),
+                ("PLONKY2_GPU_RETAINED_BYTES", "auto"),
+                ("PLONKY2_GPU_POOL_BYTES", "0"),
+            ],
+        )
+        .unwrap();
+        assert!(c.enabled);
+        assert_eq!(c.backend, None);
+        assert_eq!(c.adapter_name, None);
+        assert_eq!(c.proving_workers, 2);
+        assert_eq!(c.retained_bytes, None);
+        assert_eq!(c.pool_bytes, Some(0));
+        assert_eq!(c.retained_bytes_limit(), 4 << 30);
+        assert_eq!(c.mode, defaults.mode);
+        assert_eq!(c.quotient_cpu_share, defaults.quotient_cpu_share);
+        assert_eq!(c.allow_software, defaults.allow_software);
+        assert_eq!(c.shutdown_at_exit, defaults.shutdown_at_exit);
+        assert_eq!(
+            read_defaults(defaults.clone(), &[("PLONKY2_GPU_POOL_BYTES", "auto")])
+                .unwrap()
+                .pool_bytes,
+            None
+        );
+        assert!(read_defaults(defaults, &[("PLONKY2_GPU_PROVING_WORKERS", "bad")]).is_err());
     }
     #[test]
     fn typed_environment_controls_context_selection_and_budgets() {
@@ -267,10 +336,40 @@ mod tests {
     /// Isolated children exercise real process defaults without racing GPU tests.
     #[test]
     fn global_environment_is_captured_and_explicit_settings_override_it() {
-        use crate::gpu::{config, configure, context};
+        use crate::gpu::{config, configure, configure_defaults, context};
         const CHILD: &str = "PLONKY2_GPU_ENV_TEST_CHILD";
         if let Ok(case) = std::env::var(CHILD) {
             match case.as_str() {
+                "defaults" => {
+                    assert!(configure_defaults(GpuConfig {
+                        proving_workers: 7,
+                        pool_bytes: Some(99),
+                        ..Default::default()
+                    })
+                    .unwrap());
+                    assert!(!configure_defaults(GpuConfig::default()).unwrap());
+                    let c = config().unwrap();
+                    assert_eq!(c.proving_workers, 3);
+                    assert_eq!(c.pool_bytes, Some(0));
+                    assert!(!c.enabled);
+                }
+                "application" => {
+                    configure(GpuConfig {
+                        enabled: false,
+                        proving_workers: 2,
+                        pool_bytes: Some(77),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                    assert!(!configure_defaults(GpuConfig::default()).unwrap());
+                    assert_eq!(config().unwrap().proving_workers, 2);
+                    assert_eq!(config().unwrap().pool_bytes, Some(77));
+                }
+                "late_defaults" => {
+                    let c = config().unwrap();
+                    assert!(!configure_defaults(GpuConfig::default()).unwrap());
+                    assert_eq!(config().unwrap(), c);
+                }
                 "capture" => {
                     let c = config().unwrap();
                     assert_eq!(c.proving_workers, 3);
@@ -308,13 +407,20 @@ mod tests {
             );
             return;
         }
-        for case in ["capture", "override", "invalid"] {
+        for case in [
+            "capture",
+            "override",
+            "invalid",
+            "defaults",
+            "application",
+            "late_defaults",
+        ] {
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
             command.args(["--exact", "gpu::config::tests::global_environment_is_captured_and_explicit_settings_override_it"])
                 .env(CHILD, case).env("PLONKY2_GPU_ENABLED", "false")
                 .env("PLONKY2_GPU_BACKEND", "auto").env("PLONKY2_GPU_ADAPTER_NAME", "")
                 .env("PLONKY2_GPU_ALLOW_SOFTWARE", "false").env("PLONKY2_GPU_MODE", "auto")
-                .env("PLONKY2_GPU_PROVING_WORKERS", if case == "capture" { "3" } else { "invalid" })
+                .env("PLONKY2_GPU_PROVING_WORKERS", if matches!(case, "override" | "invalid") { "invalid" } else { "3" })
                 .env("PLONKY2_GPU_RETAINED_BYTES", "0").env("PLONKY2_GPU_POOL_BYTES", "0")
                 .env("PLONKY2_GPU_QUOTIENT_CPU_SHARE", "0.1").env("PLONKY2_GPU_SHUTDOWN_AT_EXIT", "true");
             assert!(command.status().unwrap().success(), "{case}");

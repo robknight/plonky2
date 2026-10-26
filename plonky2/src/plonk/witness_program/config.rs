@@ -200,12 +200,19 @@ impl WitnessConfig {
     /// Resolves documented `PLONKY2_EXECUTOR_*` settings. Historical `P2_AOT_*`
     /// controls are accepted as migration aliases; the new names take precedence.
     pub fn from_env() -> Result<Self, WitnessProgramError> {
-        Self::from_environment(&Environment::process())
+        Self::from_env_with_defaults(Self::default())
+    }
+    /// Apply application environment settings after a library's defaults.
+    /// Unset variables preserve defaults. An explicit cache path overrides
+    /// the suggested policy (empty disables caching). A thread-count override
+    /// selects an owned/inherited pool instead of a suggested pool handle.
+    pub fn from_env_with_defaults(defaults: Self) -> Result<Self, WitnessProgramError> {
+        Self::from_environment(defaults, &Environment::process())
     }
     fn from_environment<F: Fn(&str) -> Option<std::ffi::OsString>>(
+        mut c: Self,
         env: &Environment<F>,
     ) -> Result<Self, WitnessProgramError> {
-        let mut c = Self::default();
         if let Some(v) = env.choice(
             "PLONKY2_EXECUTOR_LAYOUT",
             "P2_AOT_LAYOUT",
@@ -276,6 +283,10 @@ impl WitnessConfig {
         }
         if let Some(v) = env.number("PLONKY2_EXECUTOR_THREADS", "P2_AOT_WITNESS_THREADS")? {
             c.threads = v;
+            #[cfg(feature = "parallel")]
+            {
+                c.thread_pool = None;
+            }
         }
         if let Some(v) = env.number(
             "PLONKY2_EXECUTOR_BUFFER_BYTES",
@@ -324,7 +335,9 @@ impl WitnessConfig {
         )? {
             c.simplify_arithmetic = v;
         }
-        c.cache = cache_from_environment(env);
+        if env.present("PLONKY2_EXECUTOR_CACHE_DIR") || c.cache == WitnessCache::Environment {
+            c.cache = cache_from_environment(env);
+        }
         c.validate()?;
         Ok(c)
     }
@@ -451,6 +464,93 @@ impl Default for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn read_defaults(
+        defaults: WitnessConfig,
+        values: &[(&str, &str)],
+    ) -> Result<WitnessConfig, WitnessProgramError> {
+        let values: std::collections::BTreeMap<_, std::ffi::OsString> =
+            values.iter().map(|(k, v)| (*k, (*v).into())).collect();
+        WitnessConfig::from_environment(
+            defaults,
+            &Environment::with_lookup(|key: &str| values.get(key).cloned()),
+        )
+    }
+    #[test]
+    fn application_policy_overrides_library_defaults_and_can_clear_cache_and_buffers() {
+        let defaults = WitnessConfig {
+            fallback: WitnessFallback::Error,
+            chain_length: 8,
+            execution: WitnessExecution::Checked,
+            schedule: WitnessSchedule::Layers,
+            cache: WitnessCache::Directory("library-cache".into()),
+            buffers: WitnessBuffers::Reuse { max_bytes: 8192 },
+            gather_rows: 7,
+            ..Default::default()
+        };
+        assert!(read_defaults(defaults.clone(), &[])
+            .unwrap()
+            .same_settings(&defaults));
+        let c = read_defaults(
+            defaults.clone(),
+            &[
+                ("PLONKY2_EXECUTOR_CHAIN_LENGTH", "2"),
+                ("P2_AOT_CHAIN_LEN", "bad"),
+                ("PLONKY2_EXECUTOR_MODE", "auto"),
+                ("PLONKY2_EXECUTOR_FALLBACK", "worklist"),
+                ("PLONKY2_EXECUTOR_CACHE_DIR", ""),
+                ("PLONKY2_EXECUTOR_BUFFER_BYTES", "0"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(c.chain_length, 2);
+        assert_eq!(c.execution, WitnessExecution::Auto);
+        assert_eq!(c.fallback, WitnessFallback::Worklist);
+        assert_eq!(c.cache, WitnessCache::Disabled);
+        assert_eq!(c.buffers, WitnessBuffers::Fresh);
+        assert_eq!(c.schedule, defaults.schedule);
+        assert_eq!(c.gather_rows, defaults.gather_rows);
+        assert_eq!(
+            read_defaults(
+                WitnessConfig {
+                    cache: WitnessCache::Disabled,
+                    ..Default::default()
+                },
+                &[("PLONKY2_EXECUTOR_CACHE_DIR", "app-cache")]
+            )
+            .unwrap()
+            .cache,
+            WitnessCache::Directory("app-cache".into())
+        );
+        assert!(read_defaults(defaults, &[("PLONKY2_EXECUTOR_MODE", "bad")]).is_err());
+    }
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn application_thread_count_replaces_a_library_suggested_pool() {
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap(),
+        );
+        let defaults = WitnessConfig {
+            thread_pool: Some(pool.clone()),
+            ..Default::default()
+        };
+        assert!(Arc::ptr_eq(
+            read_defaults(defaults.clone(), &[])
+                .unwrap()
+                .thread_pool
+                .as_ref()
+                .unwrap(),
+            &pool
+        ));
+        for count in ["0", "1"] {
+            let c =
+                read_defaults(defaults.clone(), &[("PLONKY2_EXECUTOR_THREADS", count)]).unwrap();
+            assert!(c.thread_pool.is_none());
+            assert_eq!(c.threads.to_string(), count);
+        }
+    }
     #[test]
     fn typed_settings_keep_new_names_ahead_of_legacy_aliases() {
         let values: std::collections::BTreeMap<_, std::ffi::OsString> = [
@@ -466,7 +566,7 @@ mod tests {
         ]
         .into();
         let env = Environment::with_lookup(|key: &str| values.get(key).cloned());
-        let c = WitnessConfig::from_environment(&env).unwrap();
+        let c = WitnessConfig::from_environment(WitnessConfig::default(), &env).unwrap();
         assert_eq!(c.chain_length, 4);
         assert_eq!(c.gather, WitnessGather::Cpu);
         assert_eq!(c.buffers, WitnessBuffers::Fresh);
@@ -479,7 +579,8 @@ mod tests {
             ("PLONKY2_EXECUTOR_THREADS", "not-an-integer"),
         ] {
             let env = Environment::with_lookup(|name: &str| (name == key).then(|| value.into()));
-            let error = WitnessConfig::from_environment(&env).unwrap_err();
+            let error =
+                WitnessConfig::from_environment(WitnessConfig::default(), &env).unwrap_err();
             assert!(error.to_string().contains(key), "{error}");
         }
     }

@@ -39,6 +39,8 @@ Deployment settings are read automatically from typed `PLONKY2_GPU_*` environmen
 
 The environment selects backend/adapter, execution mode, worker hint, memory budgets, hybrid CPU share and exit cleanup. Invalid values return an error from `GpuConfig::from_env()` or the fallible `plonky2::gpu::config()`, without creating a device. Automatic GPU routing warns and falls back to the CPU on invalid settings. Process defaults are captured once on first configuration access or context use.
 
+Libraries should leave platform defaults alone unless they have useful additional knowledge. They can offer suggestions with `gpu::configure_defaults(defaults)`, which applies the application's environment afterward and never overwrites explicit application configuration. `GpuConfig::from_env_with_defaults(defaults)` provides the same precedence for configuration resolution without global registration. POD2 does not require a GPU configuration wrapper.
+
 For an explicit application override, preserve environment defaults and change only the fields the application knows:
 
 ```rust,ignore
@@ -47,7 +49,7 @@ config.proving_workers = actual_workers;
 plonky2::gpu::configure(config)?;
 ```
 
-`GpuConfig::default()` remains deterministic and intentionally bypasses environment settings. Explicit `configure` and independent `GpuContext::with_config` remain available. `plonky2::gpu::set_enabled(false)` temporarily routes work to the CPU; orderly shutdown remains an explicit lifecycle API as well as an exit default.
+`GpuConfig::default()` remains deterministic and intentionally bypasses environment settings. Explicit application `configure` remains available. Independently owned `GpuContext::with_config` contexts serve low-level operations; creating one does not route normal proofs or POD2 through it. `plonky2::gpu::set_enabled(false)` temporarily routes work to the CPU; orderly shutdown remains an explicit lifecycle API as well as an exit default.
 
 ## Compiled witness programs
 
