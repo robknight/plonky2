@@ -116,6 +116,17 @@ pub(crate) struct FftJob<'a> {
     pub shift_out: Option<GoldilocksField>,
 }
 
+impl GpuContext {
+    /// The NTT kernel for `tiles_per_workgroup` (zero: one tile per workgroup).
+    pub(crate) fn fft_kernel_for(&self, tiles_per_workgroup: u32) -> &wgpu::ComputePipeline {
+        if tiles_per_workgroup == 0 {
+            &self.fft
+        } else {
+            &self.fft_pipelined
+        }
+    }
+}
+
 #[cfg(test)]
 impl GpuContext {
     fn fft_kernel(&self, tile_bits: u32) -> &wgpu::ComputePipeline {
@@ -152,13 +163,38 @@ pub(crate) fn fft_groups(
     #[cfg(test)] only: Option<usize>,
 ) {
     let plan = fft_plan(job.log_n);
+    let tiles_per_workgroup = ctx.options.fft_tiles_per_workgroup;
     record_fft(
         ctx,
         encoder,
         job,
         plan,
-        &ctx.fft,
+        ctx.fft_kernel_for(tiles_per_workgroup),
+        tiles_per_workgroup,
         #[cfg(test)]
+        only,
+    );
+}
+
+/// Records `job` with an explicit stage plan and `tiles_per_workgroup`
+/// (zero: one tile per workgroup), or only its group `only` (for benchmarks
+/// and tests).
+#[cfg(test)]
+pub(crate) fn fft_with_plan(
+    ctx: &GpuContext,
+    encoder: &mut wgpu::CommandEncoder,
+    job: FftJob<'_>,
+    plan: Vec<(u32, u32, u32)>,
+    only: Option<usize>,
+    tiles_per_workgroup: u32,
+) {
+    record_fft(
+        ctx,
+        encoder,
+        job,
+        plan,
+        ctx.fft_kernel_for(tiles_per_workgroup),
+        tiles_per_workgroup,
         only,
     );
 }
@@ -175,7 +211,7 @@ pub(crate) fn fft_groups_with_tile(
 ) {
     let plan = super::shader::fft_plan_with_tile(job.log_n, tile_bits);
     let kernel = kernel.unwrap_or_else(|| ctx.fft_kernel(tile_bits));
-    record_fft(ctx, encoder, job, plan, kernel, only);
+    record_fft(ctx, encoder, job, plan, kernel, 0, only);
 }
 
 fn record_fft(
@@ -184,6 +220,7 @@ fn record_fft(
     job: FftJob<'_>,
     plan: Vec<(u32, u32, u32)>,
     kernel: &wgpu::ComputePipeline,
+    tiles_per_workgroup: u32,
     #[cfg(test)] only: Option<usize>,
 ) {
     assert!(
@@ -247,7 +284,11 @@ fn record_fft(
                     0,
                 ],
             );
-            let workgroups = (n >> (stages + low_bits)) as u32;
+            let tiles = (n >> (stages + low_bits)) as u32;
+            // The pipelined kernel loops each workgroup over several tiles.
+            let workgroups = tiles
+                .checked_div(tiles_per_workgroup)
+                .map_or(tiles, |w| w.max(1));
             (
                 ctx.bind_fft(&params, job.input, job.data, output, &twiddles, &shift_pows),
                 workgroups,

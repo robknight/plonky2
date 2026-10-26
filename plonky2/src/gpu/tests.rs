@@ -470,6 +470,76 @@ fn zero_padded_fft_matches_cpu() {
     }
 }
 
+/// Both NTT kernels match the CPU on padded forward, plain and coset inverse
+/// transforms: one tile per workgroup, and the pipelined kernel with
+/// workgroups looping over one, several and all of a column's tiles.
+#[test]
+fn fft_kernels_match_cpu() {
+    use crate::gpu::lde::{fft_with_plan, FftJob};
+    let Some(ctx) = ctx() else { return };
+    let ctx = &*ctx;
+    let mut rng = StdRng::seed_from_u64(0x50495045);
+    for (log_n, rate_bits, inverse) in [
+        (4u32, 0usize, false),
+        (6, 3, false),
+        (10, 3, false),
+        (13, 3, false),
+        (12, 0, true),
+        (16, 0, true),
+        (17, 3, false),
+    ] {
+        let n = 1usize << log_n;
+        let len = n >> rate_bits;
+        let input = random_columns(&mut rng, 3, len);
+        let shift = F::coset_shift();
+        let expected: Vec<Vec<F>> = input
+            .iter()
+            .map(|c| {
+                if inverse {
+                    PolynomialValues::new(c.clone()).coset_ifft(shift).coeffs
+                } else {
+                    PolynomialCoeffs::new(c.clone())
+                        .lde(rate_bits)
+                        .coset_fft_with_options(shift, Some(rate_bits), None)
+                        .values
+                }
+            })
+            .collect();
+        let columns = input.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let values = lde::upload_columns(ctx, "pipelined test input", &columns);
+        let data = ctx.storage("pipelined test data", (3 * n * 8) as u64);
+        let out = ctx.storage("pipelined test output", (3 * n * 8) as u64);
+        for tiles_per_workgroup in [0u32, 1, 3, 1000] {
+            let mut encoder = ctx.encoder("pipelined test");
+            fft_with_plan(
+                ctx,
+                &mut encoder,
+                FftJob {
+                    log_n,
+                    columns: 3,
+                    input: &values,
+                    in_len: len as u32,
+                    in_stride: len as u32,
+                    data: &data,
+                    output: inverse.then_some(&*out),
+                    shift_in: (!inverse).then_some(shift),
+                    inverse,
+                    shift_out: inverse.then(|| shift.inverse()),
+                },
+                shader::fft_plan(log_n),
+                None,
+                tiles_per_workgroup,
+            );
+            ctx.submit(encoder);
+            let actual = lde::read_columns::<F>(ctx, if inverse { &out } else { &data }, 3, n);
+            assert_eq!(
+                actual, expected,
+                "log_n={log_n} rate_bits={rate_bits} inverse={inverse} tiles_per_workgroup={tiles_per_workgroup}"
+            );
+        }
+    }
+}
+
 #[test]
 fn coset_ifft_matches_cpu() {
     let Some(ctx) = ctx() else { return };

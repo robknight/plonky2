@@ -320,15 +320,58 @@ fn bench_fft_passes() {
         eprintln!("{label:40} best {:8.2} ms", best * 1e3);
         best
     };
-    time("whole LDE (coset shift in)", &|e| {
-        fft_groups(ctx, e, job(true), None)
+    let variants = [("one tile per workgroup", 0u32), ("pipelined, 8 tiles/workgroup", 8)];
+    for (label, tpw) in variants {
+        time(&format!("whole LDE (coset shift in), {label}"), &|e| {
+            lde::fft_with_plan(ctx, e, job(true), plan.clone(), None, tpw)
+        });
+        for g in 0..plan.len() {
+            time(&format!("group {g} {:?}, {label}", plan[g]), &|e| {
+                lde::fft_with_plan(ctx, e, job(true), plan.clone(), Some(g), tpw)
+            });
+        }
+    }
+    time("whole LDE (no shift), pipelined", &|e| {
+        lde::fft_with_plan(ctx, e, job(false), plan.clone(), None, 8)
     });
-    time("whole LDE (no shift)", &|e| {
-        fft_groups(ctx, e, job(false), None)
-    });
-    for g in 0..plan.len() {
-        time(&format!("group {g} {:?}", plan[g]), &|e| {
-            fft_groups(ctx, e, job(true), Some(g))
+    for tpw in [4u32, 16] {
+        time(&format!("whole LDE, pipelined, {tpw} tiles/workgroup"), &|e| {
+            lde::fft_with_plan(ctx, e, job(true), plan.clone(), None, tpw)
+        });
+    }
+    // The IFFT of the values (2^16 per column).
+    let values = random_columns(&mut rng, columns, degree);
+    let refs = values.iter().map(|v| v.as_slice()).collect::<Vec<_>>();
+    let vals = lde::upload_columns(ctx, "values", &refs);
+    let coeffs_out = ctx.storage("ifft coeffs", (columns * degree * 8) as u64);
+    let work = ctx.storage("ifft work", (columns * degree * 8) as u64);
+    let ifft = || FftJob {
+        log_n: log_d,
+        columns: columns as u32,
+        input: &vals,
+        in_len: degree as u32,
+        in_stride: degree as u32,
+        data: &work,
+        output: Some(&coeffs_out),
+        shift_in: None,
+        inverse: true,
+        shift_out: None,
+    };
+    let ifft_plan = shader::fft_plan(log_d);
+    eprintln!("IFFT plan {ifft_plan:?}");
+    for (label, tpw) in variants {
+        time(&format!("IFFT whole, {label}"), &|e| {
+            lde::fft_with_plan(ctx, e, ifft(), ifft_plan.clone(), None, tpw)
+        });
+        for g in 0..ifft_plan.len() {
+            time(&format!("IFFT group {g} {:?}, {label}", ifft_plan[g]), &|e| {
+                lde::fft_with_plan(ctx, e, ifft(), ifft_plan.clone(), Some(g), tpw)
+            });
+        }
+    }
+    for tpw in [4u32, 16] {
+        time(&format!("IFFT whole, pipelined, {tpw} tiles/workgroup"), &|e| {
+            lde::fft_with_plan(ctx, e, ifft(), ifft_plan.clone(), None, tpw)
         });
     }
     // Zero stages: every workgroup loads a contiguous tile and stores it back.

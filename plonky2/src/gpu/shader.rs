@@ -880,6 +880,8 @@ const SHIFT_IN: u32 = 2u;
 const INVERSE: u32 = 4u;
 const SHIFT_OUT: u32 = 8u;
 const TO_OUTPUT: u32 = 16u;
+// Tile slots per thread of the pipelined kernel.
+const SLOTS: u32 = FFT_TILE_SIZE / 256u;
 
 @group(0) @binding(0) var<uniform> fp: FftParams;
 @group(0) @binding(1) var<storage, read> input: array<Field>;
@@ -889,6 +891,31 @@ const TO_OUTPUT: u32 = 16u;
 @group(0) @binding(5) var<storage, read> shift_pows: array<Field>;
 
 var<workgroup> tile: array<Field, FFT_TILE_SIZE>;
+
+// The element at natural index `i` of the transform's first stage, gathered
+// from `input` in bit-reversed order; zero beyond the input.
+fn load_input(col: u32, i: u32) -> Field {
+    var v = Field(0u, 0u);
+    let x = rev_bits(i, fp.log_n);
+    if (x < fp.in_len) {
+        v = input[col * fp.in_stride + x];
+        if ((fp.flags & SHIFT_IN) != 0u) { v = mul_field(v, shift_pows[x]); }
+    }
+    return v;
+}
+
+// Tile `t` of a group holds the indices base | (j << s0) | low for
+// j < 2^stages and low < 2^low_bits.
+fn tile_base(t: u32) -> u32 {
+    let s0 = fp.s0;
+    let bl = fp.low_bits;
+    return ((t & ((1u << (s0 - bl)) - 1u)) << bl) | ((t >> (s0 - bl)) << (s0 + fp.stages));
+}
+
+fn slot_index(base: u32, l: u32) -> u32 {
+    let bl = fp.low_bits;
+    return base | ((l >> bl) << fp.s0) | (l & ((1u << bl) - 1u));
+}
 
 @compute @workgroup_size(256)
 fn fft_group(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
@@ -900,7 +927,7 @@ fn fft_group(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id
     let bl = fp.low_bits;
     let tile_size = 1u << (fp.stages + bl);
     let low_mask = (1u << bl) - 1u;
-    let base = ((w & ((1u << (s0 - bl)) - 1u)) << bl) | ((w >> (s0 - bl)) << (s0 + fp.stages));
+    let base = tile_base(w);
     let col_off = col * n;
     if (fp.skip != 0u) {
         // Zero-padded input in bit-reversed order: the coefficients that can be
@@ -912,12 +939,7 @@ fn fft_group(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id
         for (var g = tid; g < (tile_size >> fp.skip); g += 256u) {
             let l = g << fp.skip;
             let i = base | ((l >> bl) << s0) | (l & low_mask);
-            let x = rev_bits(i, fp.log_n);
-            var v = Field(0u, 0u);
-            if (x < fp.in_len) {
-                v = input[col * fp.in_stride + x];
-                if ((fp.flags & SHIFT_IN) != 0u) { v = mul_field(v, shift_pows[x]); }
-            }
+            let v = load_input(col, i);
             for (var k = 0u; k < rep; k++) { tile[l | k] = v; }
         }
     } else {
@@ -925,11 +947,7 @@ fn fft_group(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id
             let i = base | ((l >> bl) << s0) | (l & low_mask);
             var v = Field(0u, 0u);
             if ((fp.flags & LOAD_BITREV) != 0u) {
-                let x = rev_bits(i, fp.log_n);
-                if (x < fp.in_len) {
-                    v = input[col * fp.in_stride + x];
-                    if ((fp.flags & SHIFT_IN) != 0u) { v = mul_field(v, shift_pows[x]); }
-                }
+                v = load_input(col, i);
             } else {
                 v = data[col_off + i];
             }
@@ -970,6 +988,109 @@ fn fft_group(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id
         } else {
             data[col_off + o] = v;
         }
+    }
+}
+
+// The value of tile slot `l` on load: from `input` through the first
+// group's layout (replicated over the skipped stages) or from `data`.
+fn load_slot(col: u32, col_off: u32, base: u32, l: u32) -> Field {
+    if ((fp.flags & LOAD_BITREV) != 0u) {
+        return load_input(col, slot_index(base, l & ~((1u << fp.skip) - 1u)));
+    }
+    return data[col_off + slot_index(base, l)];
+}
+
+// `fft_group` with each workgroup looping over the tiles `stride` apart and
+// loading the next tile into registers while the current one's butterflies
+// run, so that memory traffic overlaps arithmetic. Each thread owns `slots`
+// contiguous slots of the tile.
+@compute @workgroup_size(256)
+fn fft_group_pipelined(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let tid = lid.x;
+    let col = wid.y;
+    let n = 1u << fp.log_n;
+    let s0 = fp.s0;
+    let bl = fp.low_bits;
+    let tile_size = 1u << (fp.stages + bl);
+    let low_mask = (1u << bl) - 1u;
+    let col_off = col * n;
+    let tiles = n >> (fp.stages + bl);
+    let stride = nwg.x;
+    let slots = max(tile_size >> 8u, 1u);
+    let rep_mask = (1u << fp.skip) - 1u;
+    var next: array<Field, SLOTS>;
+    var t = wid.x;
+    if (t < tiles) {
+        let base = tile_base(t);
+        var v = Field(0u, 0u);
+        for (var j = 0u; j < SLOTS; j++) {
+            let l = tid * slots + j;
+            if (j < slots && l < tile_size) {
+                if (j == 0u || (l & rep_mask) == 0u) { v = load_slot(col, col_off, base, l); }
+                next[j] = v;
+            }
+        }
+    }
+    loop {
+        if (t >= tiles) { break; }
+        let base = tile_base(t);
+        // The previous tile's stores have read the tile.
+        workgroupBarrier();
+        for (var j = 0u; j < SLOTS; j++) {
+            let l = tid * slots + j;
+            if (j < slots && l < tile_size) { tile[l] = next[j]; }
+        }
+        workgroupBarrier();
+        let tn = t + stride;
+        if (tn < tiles) {
+            let basen = tile_base(tn);
+            var v = Field(0u, 0u);
+            for (var j = 0u; j < SLOTS; j++) {
+                let l = tid * slots + j;
+                if (j < slots && l < tile_size) {
+                    if (j == 0u || (l & rep_mask) == 0u) { v = load_slot(col, col_off, basen, l); }
+                    next[j] = v;
+                }
+            }
+        }
+        let half = tile_size >> 1u;
+        for (var st = fp.skip; st < fp.stages; st++) {
+            let s = s0 + st;
+            for (var b = tid; b < half; b += 256u) {
+                let low = b & low_mask;
+                let jp = b >> bl;
+                let j0 = ((jp >> st) << (st + 1u)) | (jp & ((1u << st) - 1u));
+                let j1 = j0 | (1u << st);
+                let l0 = (j0 << bl) | low;
+                let l1 = (j1 << bl) | low;
+                let i0 = base | (j0 << s0) | low;
+                let omega = twiddles[(i0 & ((1u << s) - 1u)) << (fp.log_n - s - 1u)];
+                let u = tile[l0];
+                let m = mul_field(omega, tile[l1]);
+                tile[l0] = add_field(u, m);
+                tile[l1] = sub_field(u, m);
+            }
+            workgroupBarrier();
+        }
+        for (var j = 0u; j < SLOTS; j++) {
+            let l = tid * slots + j;
+            if (j < slots && l < tile_size) {
+                let i = slot_index(base, l);
+                var v = tile[l];
+                var o = i;
+                if ((fp.flags & INVERSE) != 0u) {
+                    o = (n - i) & (n - 1u);
+                    v = mul_field(v, fp.n_inv);
+                }
+                if ((fp.flags & SHIFT_OUT) != 0u) { v = mul_field(v, shift_pows[o]); }
+                if ((fp.flags & TO_OUTPUT) != 0u) {
+                    output[col_off + o] = v;
+                } else {
+                    data[col_off + o] = v;
+                }
+            }
+        }
+        t = tn;
     }
 }
 "#;

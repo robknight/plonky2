@@ -79,7 +79,7 @@ A circuit can be compiled only over the Goldilocks field, if every generator des
 - The `gpu-profiling` feature adds measurement switches (device timestamps, a per-pass timeline, Metal captures, program dumps), listed in the `plonky2::gpu` module documentation. They change what is measured, never the proof.
 - `tools/gpu/gpu-timeline`: summarises a per-pass GPU timeline or an Instruments trace, and measures which prover phases are on the critical path.
 - `tools/gpu/nvidia-check`: packages this repository and runs its GPU library suites and recursive proof example on a disposable NVIDIA machine.
-- `cargo test --release --features gpu-profiling bench_fft_tile_plans -- --ignored --nocapture --test-threads=1` compares warmed 1024- and 2048-element FFT tiles on identical buffers. Larger tiles remain experimental: the M4 measurements regressed with both 256- and 512-thread workgroups, so production retains the 1024-element plan.
+- `cargo test --release --features gpu-profiling bench_fft_tile_plans -- --ignored --nocapture --test-threads=1` compares warmed 1024- and 2048-element FFT tiles on identical buffers. Larger tiles remain experimental: the M4 measurements regressed with both 256- and 512-thread workgroups, so production retains the 1024-element plan. `bench_fft_passes` times each stage group of a wires-sized LDE and IFFT with one tile per workgroup and with the pipelined kernel, whose workgroups each loop over several tiles and load the next one while transforming the current one (`PLONKY2_GPU_FFT_TILES_PER_WORKGROUP`; the default is 8 on unified-memory adapters, where the M4's wires LDE takes about 50 ms instead of 60 and its IFFT 7 ms instead of 11, and one tile per workgroup on discrete adapters until measured there).
 
 ## Testing
 

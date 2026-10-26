@@ -393,6 +393,9 @@ pub struct GpuContext {
     pub(crate) fft: wgpu::ComputePipeline,
     #[cfg(test)]
     fft_large: OnceLock<wgpu::ComputePipeline>,
+    /// The NTT kernel whose workgroups each loop over several tiles,
+    /// prefetching the next (`GpuOptions::fft_tiles_per_workgroup`).
+    pub(crate) fft_pipelined: wgpu::ComputePipeline,
     fold_layout: wgpu::BindGroupLayout,
     pub(crate) fold: wgpu::ComputePipeline,
     /// The proof-of-work search, compiled on first use.
@@ -555,6 +558,7 @@ pub(crate) struct GpuOptions {
     pub mode: ExecutionMode,
     pub proving_workers: usize,
     pub retained_bytes: u64,
+    pub fft_tiles_per_workgroup: u32,
 }
 
 impl GpuOptions {
@@ -566,6 +570,9 @@ impl GpuOptions {
             mode: config.mode,
             proving_workers: config.proving_workers,
             retained_bytes: config.retained_bytes_limit(),
+            fft_tiles_per_workgroup: config
+                .fft_tiles_per_workgroup
+                .unwrap_or(if mappable { 8 } else { 0 }),
         }
     }
 
@@ -810,6 +817,7 @@ impl GpuContext {
         );
         let fft_module = module(&device, "plonky2 fft", &shader::fft_module(flavor));
         let fft = pipeline(&device, &fft_layout, &fft_module, "fft_group");
+        let fft_pipelined = pipeline(&device, &fft_layout, &fft_module, "fft_group_pipelined");
 
         let fold_layout = storage_layout(
             &device,
@@ -926,6 +934,7 @@ impl GpuContext {
             fft,
             #[cfg(test)]
             fft_large: OnceLock::new(),
+            fft_pipelined,
             fold_layout,
             fold,
             pow_kernel: OnceLock::new(),
