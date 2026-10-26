@@ -784,9 +784,16 @@ fn bench_quotient_program() {
     });
     let params = lines.next().unwrap();
     let columns = lines.next().unwrap();
-    let ops = lines
+    // The executable ops end at the end marker; the round constant blocks
+    // of the packed MDS ops follow it in the same buffer.
+    let all_ops = lines
         .map(|op| [op[0], op[1], op[2], op[3]])
         .collect::<Vec<_>>();
+    let num_ops = all_ops
+        .iter()
+        .position(|op| op[0] & quotient::BASE_MASK == 21)
+        .unwrap_or(all_ops.len());
+    let ops = &all_ops[..num_ops];
     let (n, n_lde) = (params[0] as usize, params[2] as usize);
     let (cs_cols, w_cols, z_cols, chal_len, nc, registers) = (
         columns[0] as usize,
@@ -824,9 +831,11 @@ fn bench_quotient_program() {
         "qmul",
         "mulsub",
         "mulrsub",
+        "mdsp",
+        "end",
     ];
     let mut counts = vec![0usize; names.len()];
-    for op in &ops {
+    for op in ops {
         counts[(op[0] & quotient::BASE_MASK) as usize] += 1;
     }
     for (name, count) in names.iter().zip(&counts) {
@@ -858,7 +867,7 @@ fn bench_quotient_program() {
                 usage: wgpu::BufferUsages::STORAGE,
             })
     };
-    let ops_buffer = upload_ops(&ops);
+    let ops_buffer = upload_ops(&all_ops);
     let layout = storage_layout(
         &ctx.device,
         "quotient bench",
@@ -1000,6 +1009,28 @@ fn bench_quotient_program() {
                     let mut s = format!("{{ let m = mds12(array<Field, 12>({inputs}));");
                     for k in 0..12 {
                         write!(s, " r{} = m[{k}];", y + k).unwrap();
+                    }
+                    s.push_str(" }");
+                    s
+                }
+                20 => {
+                    let inputs = (0..12)
+                        .map(|i| format!("r{}", ([y, z, w][i / 4] >> (8 * (i % 4))) & 0xff))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let block = dst & 0xff;
+                    let table = (op[0] >> 16) as usize;
+                    let mut s = format!("{{ let m = mds12(array<Field, 12>({inputs}));");
+                    for k in 0..12 {
+                        let c = all_ops[table + k / 2];
+                        write!(
+                            s,
+                            " r{} = add_const(m[{k}], Field({}u, {}u));",
+                            block + k as u32,
+                            c[2 * (k % 2)],
+                            c[2 * (k % 2) + 1]
+                        )
+                        .unwrap();
                     }
                     s.push_str(" }");
                     s
@@ -1166,9 +1197,16 @@ fn bench_quotient_occupancy() {
     });
     let params = lines.next().unwrap();
     let columns = lines.next().unwrap();
-    let ops = lines
+    // The executable ops end at the end marker; the round constant blocks
+    // of the packed MDS ops follow it in the same buffer.
+    let all_ops = lines
         .map(|op| [op[0], op[1], op[2], op[3]])
         .collect::<Vec<_>>();
+    let num_ops = all_ops
+        .iter()
+        .position(|op| op[0] & quotient::BASE_MASK == 21)
+        .unwrap_or(all_ops.len());
+    let ops = &all_ops[..num_ops];
     let (n, n_lde) = (params[0] as usize, params[2] as usize);
     let (cs_cols, w_cols, z_cols, chal_len, nc, registers) = (
         columns[0] as usize,
@@ -1195,7 +1233,7 @@ fn bench_quotient_occupancy() {
     let row_table = ctx.upload("rows", &random(3 * n));
     let chal = ctx.upload("chal", &random(chal_len));
     let out = ctx.storage("out", (nc as usize * n * 8) as u64);
-    let bytes = quotient::program_words(&ops)
+    let bytes = quotient::program_words(&all_ops)
         .iter()
         .flat_map(|w| w.to_le_bytes())
         .collect::<Vec<_>>();

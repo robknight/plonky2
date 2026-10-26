@@ -1336,6 +1336,30 @@ fn quintic_program_rejects_wide_indices() {
     );
 }
 
+/// The Poseidon gate's MDS layers read their inputs in place and add the
+/// next round's constants themselves: no moves into a block, no unpacked
+/// layer, and only the first round's constant additions remain.
+#[test]
+fn mds_layers_pack_inputs_and_fold_round_constants() {
+    use crate::gates::poseidon::PoseidonGate;
+    use crate::plonk::circuit_data::CircuitConfig;
+    let config = CircuitConfig::standard_recursion_config();
+    let gate = crate::gates::gate::GateRef::new(PoseidonGate::<F, 2>::new());
+    let trace = trace::trace_gate(&gate, &config, 0).unwrap();
+    let trace = trace::mds_matched_trace(&trace).unwrap_or(trace);
+    let (ops, _) = quotient::gate_program(&trace, 0, &[], 0).unwrap();
+    let count = |code: u32| {
+        ops.iter()
+            .take_while(|op| op[0] & quotient::BASE_MASK != 21)
+            .filter(|op| op[0] & quotient::BASE_MASK == code)
+            .count()
+    };
+    assert_eq!(count(13), 0, "unpacked MDS layers");
+    assert!(count(20) >= 30, "{} packed MDS layers", count(20));
+    assert_eq!(count(14), 0, "moves into MDS blocks");
+    assert!(count(10) <= 12, "{} constant additions left", count(10));
+}
+
 #[test]
 fn quintic_retry_discards_partial_program() {
     use crate::gates::gate::GateRef;

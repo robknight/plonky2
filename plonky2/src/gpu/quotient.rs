@@ -80,6 +80,14 @@ const OP_QMUL: u32 = 17;
 const OP_MULSUB: u32 = 18;
 /// `dst = regs[y] * regs[z] - regs[w]`.
 const OP_MULRSUB: u32 = 19;
+/// `regs[block..block + 12] = mds12(inputs) + constants`: the Poseidon MDS
+/// layer over the twelve registers packed as bytes of `y`, `z` and `w`,
+/// written to the block in bits 8..16 of the first word with the twelve
+/// round constants at `ops[table..table + 6]` added (`table` in bits 16..32,
+/// a block of the table after the end marker).
+const OP_MDSP: u32 = 20;
+/// Ends the program; the constant blocks of the packed MDS ops follow.
+const OP_END: u32 = 21;
 
 // The opcode byte is the base op in bits 0..5 and, in bits 5..8, one bit per
 // operand slot (y, z, w) that names a wire column instead of a register:
@@ -125,14 +133,37 @@ impl Literals {
     }
 }
 
+/// The blocks of twelve round constants the packed MDS ops add, deduplicated.
+#[derive(Default, Debug)]
+struct MdsTables {
+    blocks: Vec<[u64; 12]>,
+    index: std::collections::HashMap<[u64; 12], u32>,
+}
+
+impl MdsTables {
+    fn intern(&mut self, block: [u64; 12]) -> u32 {
+        *self.index.entry(block).or_insert_with(|| {
+            self.blocks.push(block);
+            self.blocks.len() as u32 - 1
+        })
+    }
+}
+
 /// The words of a program buffer.
 pub(crate) fn program_words(ops: &[[u32; 4]]) -> Vec<u32> {
     ops.iter().flatten().copied().collect()
 }
 
 /// Prepends the loads of the literals into registers `peak..` and points
-/// the literal operands at them; returns the register count.
-fn finish_program(ops: &mut Vec<[u32; 4]>, literals: &Literals, peak: u32) -> u32 {
+/// the literal operands at them; appends the end marker and the round
+/// constant blocks and points the packed MDS ops at their words. Returns
+/// the register count and the number of executable ops.
+fn finish_program(
+    ops: &mut Vec<[u32; 4]>,
+    literals: &Literals,
+    tables: &MdsTables,
+    peak: u32,
+) -> Result<(u32, u32), CompileError> {
     for o in ops.iter_mut() {
         let base = o[0] & BASE_MASK;
         for slot in 1..=arity(base) {
@@ -148,7 +179,29 @@ fn finish_program(ops: &mut Vec<[u32; 4]>, literals: &Literals, peak: u32) -> u3
         .enumerate()
         .map(|(i, &c)| op(OP_LITERAL, peak + i as u32, c as u32, (c >> 32) as u32, 0));
     ops.splice(0..0, preload);
-    peak + literals.table.len() as u32
+    let num_ops = ops.len() as u32;
+    let table_base = num_ops + 1;
+    for o in ops.iter_mut() {
+        if o[0] & BASE_MASK == OP_MDSP {
+            let offset = table_base + 6 * (o[0] >> 16);
+            if offset >= 1 << 16 {
+                return Err(CompileError::UnsupportedLimits);
+            }
+            o[0] = (o[0] & 0xffff) | (offset << 16);
+        }
+    }
+    ops.push(op(OP_END, 0, 0, 0, 0));
+    for block in &tables.blocks {
+        for pair in block.chunks(2) {
+            ops.push([
+                pair[0] as u32,
+                (pair[0] >> 32) as u32,
+                pair[1] as u32,
+                (pair[1] >> 32) as u32,
+            ]);
+        }
+    }
+    Ok((peak + literals.table.len() as u32, num_ops))
 }
 
 fn op(code: u32, dst: u32, y: u32, z: u32, w: u32) -> [u32; 4] {
@@ -325,6 +378,7 @@ enum Event {
 fn append_gate<F: RichField + Field64>(
     ops: &mut Vec<[u32; 4]>,
     literals: &mut Literals,
+    tables: &mut MdsTables,
     trace: &GateTrace<F>,
     selector_index: u32,
     filter_factors: &[u64],
@@ -415,6 +469,32 @@ fn append_gate<F: RichField + Field64>(
             },
             Event::Emit(k) => uses[trace.constraints[k as usize] as usize] += 1,
         }
+    }
+    // Round constants folded into the MDS layer: an output whose only use is
+    // an addition of a constant is produced with the constant added by the
+    // packed MDS op, and the addition is not emitted.
+    let mut mds_fold = vec![[u32::MAX; 12]; trace.dag.mds_groups.len()];
+    let mut mds_fold_const = vec![[0u64; 12]; trace.dag.mds_groups.len()];
+    let mut folded = vec![false; nodes.len()];
+    for (id, node) in nodes.iter().enumerate() {
+        let Node::Add(a, b) = *node else { continue };
+        let (x, c) = match (
+            constant_of(&nodes[b as usize]),
+            constant_of(&nodes[a as usize]),
+        ) {
+            (Some(c), _) => (a, c),
+            (None, Some(c)) => (b, c),
+            (None, None) => continue,
+        };
+        let Node::Mds(group, k) = nodes[x as usize] else {
+            continue;
+        };
+        if position[id] == usize::MAX || uses[x as usize] != 1 {
+            continue;
+        }
+        mds_fold[group as usize][k as usize] = id as u32;
+        mds_fold_const[group as usize][k as usize] = c;
+        folded[id] = true;
     }
     let mut fused_into = vec![u32::MAX; nodes.len()];
     // S-boxes: x^7 computed as x^3 * x^4 with x^2 = x * x, x^3 = x * x^2 and
@@ -554,7 +634,7 @@ fn append_gate<F: RichField + Field64>(
             Event::Node(id) => id,
         };
         let node = &nodes[id as usize];
-        if fused_into[id as usize] != u32::MAX || is_leaf(node) {
+        if fused_into[id as usize] != u32::MAX || folded[id as usize] || is_leaf(node) {
             continue;
         }
         if let Node::Qmul(group, _) = *node {
@@ -635,22 +715,68 @@ fn append_gate<F: RichField + Field64>(
             continue;
         }
         if let Node::Mds(group, _) = *node {
-            // The first output of a group computes the whole layer in a block
-            // of twelve registers; the outputs live there.
+            // The first output of a group computes the whole layer into a
+            // block of twelve registers; the outputs live there. The packed
+            // op reads its inputs where they are (leaves through temporaries)
+            // and adds the folded round constants; a block or an input beyond
+            // the byte range falls back to moves into the block and an
+            // unpacked layer, with the additions emitted as usual.
             if group_done[group as usize] {
                 continue;
             }
             group_done[group as usize] = true;
             let block = regs.alloc_block(12);
             let inputs = trace.dag.mds_groups[group as usize];
+            let mut temps = Vec::new();
+            let mut words = [0u32; 12];
+            let mut packable = block < 256;
             for (i, &input) in inputs.iter().enumerate() {
-                if is_leaf(&nodes[input as usize]) {
-                    ops.push(leaf_op(&nodes[input as usize], block + i as u32));
+                let node = &nodes[input as usize];
+                words[i] = if is_leaf(node) {
+                    let r = regs.alloc();
+                    temps.push((r, input));
+                    r
                 } else {
                     let r = register[input as usize];
                     assert!(r != u32::MAX, "MDS input not yet computed");
-                    ops.push(op(OP_MOV, block + i as u32, r, 0, 0));
+                    r
+                };
+                packable &= words[i] < 256;
+            }
+            if packable {
+                for &(r, input) in &temps {
+                    ops.push(leaf_op(&nodes[input as usize], r));
                 }
+                let packed = |bytes: &[u32]| {
+                    bytes
+                        .iter()
+                        .enumerate()
+                        .fold(0u32, |acc, (i, &b)| acc | (b << (8 * i)))
+                };
+                let table = tables.intern(mds_fold_const[group as usize]);
+                ops.push([
+                    OP_MDSP | (block << 8) | (table << 16),
+                    packed(&words[0..4]),
+                    packed(&words[4..8]),
+                    packed(&words[8..12]),
+                ]);
+            } else {
+                for (i, &input) in inputs.iter().enumerate() {
+                    if is_leaf(&nodes[input as usize]) {
+                        ops.push(leaf_op(&nodes[input as usize], block + i as u32));
+                    } else {
+                        ops.push(op(OP_MOV, block + i as u32, words[i], 0, 0));
+                    }
+                }
+                ops.push(op(OP_MDS, 0, block, 0, 0));
+                for &id in &mds_fold[group as usize] {
+                    if id != u32::MAX {
+                        folded[id as usize] = false;
+                    }
+                }
+            }
+            for &(r, _) in &temps {
+                regs.release(r);
             }
             for &input in &inputs {
                 if !is_leaf(&nodes[input as usize])
@@ -661,8 +787,17 @@ fn append_gate<F: RichField + Field64>(
                     register[input as usize] = u32::MAX;
                 }
             }
-            ops.push(op(OP_MDS, 0, block, 0, 0));
             for k in 0..12u32 {
+                let addition = mds_fold[group as usize][k as usize];
+                if packable && addition != u32::MAX {
+                    // The addition of the round constant is this output.
+                    if last_use[addition as usize] > pos {
+                        register[addition as usize] = block + k;
+                    } else {
+                        regs.release(block + k);
+                    }
+                    continue;
+                }
                 let output = trace.dag.index_of(Node::Mds(group, k));
                 match output {
                     Some(output)
@@ -884,15 +1019,17 @@ pub(crate) fn gate_program<F: RichField + Field64>(
 ) -> Option<(Vec<[u32; 4]>, u32)> {
     let mut ops = Vec::new();
     let mut literals = Literals::default();
+    let mut tables = MdsTables::default();
     let peak = append_gate(
         &mut ops,
         &mut literals,
+        &mut tables,
         trace,
         selector_index,
         filter_factors,
         weight_offset,
     )?;
-    let registers = finish_program(&mut ops, &literals, peak);
+    let (registers, _) = finish_program(&mut ops, &literals, &tables, peak).ok()?;
     Some((ops, registers))
 }
 
@@ -959,6 +1096,19 @@ pub(crate) fn run_program_host<F: RichField>(
                     regs[y as usize + k] = crate::gpu::trace::mds_row(&inputs, k);
                 }
             }
+            OP_MDSP => {
+                let block = dst & 0xff;
+                let table = (op[0] >> 16) as usize;
+                let inputs: [F; 12] = core::array::from_fn(|i| {
+                    regs[(([y, z, w][i / 4] >> (8 * (i % 4))) & 0xff) as usize]
+                });
+                for k in 0..12 {
+                    let words = ops[table + k / 2];
+                    let c = lit(words[2 * (k % 2)], words[2 * (k % 2) + 1]);
+                    regs[block + k] = crate::gpu::trace::mds_row(&inputs, k) + c;
+                }
+            }
+            OP_END => break,
             OP_QMUL => {
                 let dst = dst & 0xff;
                 let wire_mask = op[0] >> 16;
@@ -993,7 +1143,10 @@ pub(crate) struct TracedGate<F> {
 }
 
 pub(crate) struct HostProgram {
+    /// The executable ops, the end marker, then the round constant blocks.
     pub ops: Vec<[u32; 4]>,
+    /// The executable ops.
+    pub num_ops: u32,
     pub registers: u32,
     pub uses_qmul: bool,
 }
@@ -1005,7 +1158,9 @@ enum CompileError {
 }
 
 pub(crate) fn uses_qmul(ops: &[[u32; 4]]) -> bool {
-    ops.iter().any(|op| op[0] & BASE_MASK == OP_QMUL)
+    ops.iter()
+        .take_while(|op| op[0] & BASE_MASK != OP_END)
+        .any(|op| op[0] & BASE_MASK == OP_QMUL)
 }
 
 fn compile_attempt<F: RichField + Field64>(
@@ -1021,6 +1176,7 @@ fn compile_attempt<F: RichField + Field64>(
     // failed fused attempt cannot leave instructions in the unfused program.
     let mut ops = Vec::new();
     let mut literals = Literals::default();
+    let mut tables = MdsTables::default();
     let mut registers = 0;
     // The trace rewrites before linearization, in this order: written out MDS
     // layers become MDS ops (`trace::mds_matched_trace`), quintic products are
@@ -1040,6 +1196,7 @@ fn compile_attempt<F: RichField + Field64>(
         let peak = append_gate(
             &mut ops,
             &mut literals,
+            &mut tables,
             trace,
             gate.selector_index,
             &gate.filter_factors,
@@ -1055,17 +1212,19 @@ fn compile_attempt<F: RichField + Field64>(
         registers = registers.max(peak);
     }
     let working = registers;
-    let registers = finish_program(&mut ops, &literals, registers);
+    let (registers, num_ops) = finish_program(&mut ops, &literals, &tables, registers)?;
     if registers > MAX_REGISTERS {
         return Err(CompileError::UnsupportedLimits);
     }
     log::debug!(
-        "plonky2 gpu: quotient registers: {working} working, {} literals",
-        literals.table.len()
+        "plonky2 gpu: quotient registers: {working} working, {} literals; {} round constant blocks",
+        literals.table.len(),
+        tables.blocks.len()
     );
     Ok(HostProgram {
         uses_qmul: uses_qmul(&ops),
         ops,
+        num_ops,
         registers: registers.next_power_of_two().max(32),
     })
 }
@@ -1123,6 +1282,7 @@ fn build_program<F: RichField + Extendable<D>, const D: usize>(
     }
     let HostProgram {
         ops,
+        num_ops,
         registers,
         uses_qmul,
     } = compile_program(&gates, weight_offset, num_challenges)?;
@@ -1139,7 +1299,7 @@ fn build_program<F: RichField + Extendable<D>, const D: usize>(
     ctx.queue.write_buffer(&buffer, 0, &bytes);
     Some(QuotientProgram {
         ops: DeviceBuffer::unpooled(buffer),
-        num_ops: ops.len() as u32,
+        num_ops,
         registers,
         uses_qmul,
         #[cfg(feature = "gpu-profiling")]
@@ -1302,6 +1462,22 @@ fn quotient(@builtin(global_invocation_id) id: vec3<u32>) {
                     regs[op.y + 4u], regs[op.y + 5u], regs[op.y + 6u], regs[op.y + 7u],
                     regs[op.y + 8u], regs[op.y + 9u], regs[op.y + 10u], regs[op.y + 11u]));
                 for (var k = 0u; k < 12u; k++) { regs[op.y + k] = m[k]; }
+            }
+            case 20u: {
+                // Twelve input registers as the bytes of y, z and w; the
+                // outputs plus the round constants after the program go
+                // into the block in the second byte of x.
+                let m = mds12(array<Field, 12>(
+                    regs[op.y & 0xffu], regs[(op.y >> 8u) & 0xffu], regs[(op.y >> 16u) & 0xffu], regs[op.y >> 24u],
+                    regs[op.z & 0xffu], regs[(op.z >> 8u) & 0xffu], regs[(op.z >> 16u) & 0xffu], regs[op.z >> 24u],
+                    regs[op.w & 0xffu], regs[(op.w >> 8u) & 0xffu], regs[(op.w >> 16u) & 0xffu], regs[op.w >> 24u]));
+                let block = dst & 0xffu;
+                let table = op.x >> 16u;
+                for (var j = 0u; j < 6u; j++) {
+                    let c = ops[table + j];
+                    regs[block + 2u * j] = add_const(m[2u * j], Field(c.x, c.y));
+                    regs[block + 2u * j + 1u] = add_const(m[2u * j + 1u], Field(c.z, c.w));
+                }
             }
             // QMUL_CASE
             // CASES
