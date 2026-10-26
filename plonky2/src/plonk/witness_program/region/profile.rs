@@ -60,9 +60,9 @@ mod enabled {
         active: bool,
         slots: u32,
         stage: [AtomicU64; 6],
-        cpu: [AtomicU64; 27],
-        tasks: [AtomicU64; 27],
-        lanes: [AtomicU64; 27],
+        cpu: [AtomicU64; super::super::Kind::COUNT],
+        tasks: [AtomicU64; super::super::Kind::COUNT],
+        lanes: [AtomicU64; super::super::Kind::COUNT],
         poseidon: [AtomicU64; 3],
         layers: Mutex<Vec<(usize, u64, u64)>>,
     }

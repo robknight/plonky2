@@ -1013,10 +1013,115 @@ mod tests {
     }
 
     #[test]
+    fn binary_sums_round_trip_and_match_worklist() {
+        for width in [32, 63] {
+            let mut builder =
+                CircuitBuilder::<G, 2>::new(CircuitConfig::standard_recursion_config());
+            let bits = (0..width)
+                .map(|_| builder.add_virtual_bool_target_safe())
+                .collect::<Vec<_>>();
+            let sum = builder.le_sum(bits.iter());
+            builder.register_public_input(sum);
+            let data = builder.build::<C>();
+            assert!(data.prover_only.generators.iter().any(|g| matches!(
+                g.0.witness_operation(),
+                Some(crate::iop::generator::WitnessOperation::BitSum { .. })
+            )));
+            let targets = bits.iter().map(|b| b.target).collect::<Vec<_>>();
+            let program = data.compile_witness_program(&targets).unwrap();
+            let program = data
+                .witness_program_from_bytes(&program.to_bytes())
+                .unwrap();
+            for execution in [
+                policy::WitnessExecution::Auto,
+                policy::WitnessExecution::Checked,
+            ] {
+                let mut config = program.config().clone();
+                config.policy.execution = execution;
+                data.install_witness_program(program.with_execution_config(config).unwrap())
+                    .unwrap();
+                for case in [
+                    0u64,
+                    1u64 << (width - 1),
+                    (1u64 << width) - 1,
+                    0x5555_5555_5555_5555,
+                ] {
+                    let mut pw = PartialWitness::new();
+                    for (i, &bit) in bits.iter().enumerate() {
+                        pw.set_bool_target(bit, (case >> i) & 1 != 0).unwrap();
+                    }
+                    check_against_worklist(&pw, &data.prover_only, &data.common).unwrap();
+                    assert!(prove_and_verify(&data, pw));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn binary_sums_reject_non_boolean_inputs() {
+        let mut builder = CircuitBuilder::<G, 2>::new(CircuitConfig::standard_recursion_config());
+        let bits = (0..32)
+            .map(|_| builder.add_virtual_bool_target_unsafe())
+            .collect::<Vec<_>>();
+        let sum = builder.le_sum(bits.iter());
+        builder.register_public_input(sum);
+        let data = builder.build::<C>();
+        let targets = bits.iter().map(|b| b.target).collect::<Vec<_>>();
+        let program = data.compile_witness_program(&targets).unwrap();
+        for execution in [
+            policy::WitnessExecution::Auto,
+            policy::WitnessExecution::Checked,
+        ] {
+            let mut config = program.config().clone();
+            config.policy.execution = execution;
+            config.fallback = WitnessFallback::Error;
+            data.install_witness_program(program.with_execution_config(config).unwrap())
+                .unwrap();
+            let mut pw = PartialWitness::new();
+            for (i, &bit) in bits.iter().enumerate() {
+                pw.set_target(bit.target, if i == 0 { G::TWO } else { G::ZERO })
+                    .unwrap();
+            }
+            let error = data.prove(pw).unwrap_err();
+            assert!(format!("{error:#}").contains("not Boolean"));
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct UnsupportedTestGenerator;
+    impl crate::iop::generator::SimpleGenerator<G, 2> for UnsupportedTestGenerator {
+        fn id(&self) -> String {
+            "UnsupportedTestGenerator".into()
+        }
+        fn dependencies(&self) -> Vec<Target> {
+            Vec::new()
+        }
+        fn run_once(
+            &self,
+            _: &crate::iop::witness::PartitionWitness<G>,
+            _: &mut crate::iop::generator::GeneratedValues<G>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn serialize(
+            &self,
+            _: &mut Vec<u8>,
+            _: &crate::plonk::circuit_data::CommonCircuitData<G, 2>,
+        ) -> crate::util::serialization::IoResult<()> {
+            Ok(())
+        }
+        fn deserialize(
+            _: &mut crate::util::serialization::Buffer,
+            _: &crate::plonk::circuit_data::CommonCircuitData<G, 2>,
+        ) -> crate::util::serialization::IoResult<Self> {
+            Ok(Self)
+        }
+    }
+
+    #[test]
     fn unsupported_generator_is_named() {
         let mut builder = CircuitBuilder::<G, 2>::new(CircuitConfig::standard_recursion_config());
-        // Summing more bits than one arithmetic gate holds adds a
-        // `BaseSumGenerator`, which does not describe its operation.
+        builder.add_simple_generator(UnsupportedTestGenerator);
         let bits = (0..32)
             .map(|_| builder.add_virtual_bool_target_safe())
             .collect::<Vec<_>>();
@@ -1027,7 +1132,7 @@ mod tests {
         let WitnessProgramError::UnsupportedGenerator { id, .. } = &error else {
             panic!("unexpected {error}");
         };
-        assert!(id.contains("BaseSumGenerator"), "{id}");
+        assert!(id.contains("UnsupportedTestGenerator"), "{id}");
         assert_eq!(data.compile_witness_program(&[]).unwrap_err(), error);
         assert_eq!(
             data.witness_program_status(),

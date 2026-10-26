@@ -62,6 +62,11 @@ pub enum WitnessOperation {
         num_copies: usize,
         num_extra_constants: usize,
     },
+    /// Sum at most 63 Boolean inputs in little-endian order.
+    BitSum {
+        bits: Vec<Target>,
+        output: Target,
+    },
     BaseSplit {
         row: usize,
         num_limbs: usize,
@@ -164,6 +169,7 @@ impl WitnessOperation {
             Self::ExtensionMultiply { .. } => "extension_multiply",
             Self::RandomAccess { .. } => "random_access",
             Self::BaseSplit { .. } => "base_split",
+            Self::BitSum { .. } => "bit_sum",
             Self::WireSplit { .. } => "wire_split",
             Self::LowHigh { .. } => "low_high",
             Self::Reducing {
@@ -209,6 +215,7 @@ impl WitnessOperation {
                     .collect()
             }
             Self::BaseSplit { row, .. } => vec![Target::wire(*row, 0)],
+            Self::BitSum { bits, .. } => bits.clone(),
             Self::WireSplit { integer, .. } => vec![*integer],
             Self::LowHigh { integer, .. } => vec![*integer],
             Self::Reducing {
@@ -266,6 +273,7 @@ impl WitnessOperation {
                     .chain((0..*bits).map(|i| Target::wire(*row, bit_start + i)))
                     .collect()
             }
+            Self::BitSum { output, .. } => vec![*output],
             Self::BaseSplit { row, num_limbs, .. } => (1..=*num_limbs)
                 .map(|column| Target::wire(*row, column))
                 .collect(),

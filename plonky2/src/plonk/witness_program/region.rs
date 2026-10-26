@@ -80,6 +80,7 @@ operation_kinds! {
     CosetInterpolation = 24,
     Comparison = 25,
     ArithmeticChain = 26,
+    BitSum = 27,
 }
 use OperationKind as Kind;
 
@@ -446,6 +447,7 @@ impl Lane {
             Op::ExtensionMultiply { .. } => Kind::ExtensionMultiply,
             Op::RandomAccess { .. } => Kind::RandomAccess,
             Op::BaseSplit { .. } => Kind::BaseSplit,
+            Op::BitSum { .. } => Kind::BitSum,
             Op::WireSplit { .. } => Kind::WireSplit,
             Op::LowHigh { .. } => Kind::LowHigh,
             Op::Reducing {

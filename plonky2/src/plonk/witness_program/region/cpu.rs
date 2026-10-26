@@ -816,6 +816,16 @@ impl Executor<'_> {
                 }
                 Ok(())
             }
+            Kind::BitSum => {
+                ensure!(group.inputs <= 63, "invalid bit sum width");
+                let mut word = 0u64;
+                for i in (0..group.inputs).rev() {
+                    let bit = self.input(offset, i, count, k)?.to_canonical_u64();
+                    ensure!(bit <= 1, "invalid arithmetic: bit sum input is not Boolean");
+                    word = (word << 1) | bit;
+                }
+                self.output(offset, group.inputs, count, k, G::from_canonical_u64(word))
+            }
             Kind::BaseSplit => {
                 let co = group.parameter()?;
                 let limb_bits = co & 255;
@@ -1304,6 +1314,16 @@ impl Executor<'_> {
                     self.output(offset, 2 + vec_size + i, count, k, bit)?;
                 }
                 Ok(())
+            }
+            Kind::BitSum => {
+                ensure!(group.inputs <= 63, "invalid bit sum width");
+                let mut word = 0u64;
+                for i in (0..group.inputs).rev() {
+                    let bit = self.input(offset, i, count, k)?.to_canonical_u64();
+                    ensure!(bit <= 1, "invalid arithmetic: bit sum input is not Boolean");
+                    word = (word << 1) | bit;
+                }
+                self.output(offset, group.inputs, count, k, G::from_canonical_u64(word))
             }
             Kind::BaseSplit => {
                 let co = group.parameter()?;

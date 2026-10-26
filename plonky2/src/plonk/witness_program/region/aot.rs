@@ -321,6 +321,10 @@ fn validate_shape(p: &RegionProgram, g: &Group) -> Result<()> {
         Kind::EcAddHomogOffset => (20, 20),
         Kind::EcScalarMul => (10, 10),
         Kind::LowHigh => (1, 2),
+        Kind::BitSum => {
+            ensure!(g.inputs <= 63, "invalid bit sum width");
+            (g.inputs as u64, 1)
+        }
         Kind::BaseSplit | Kind::WireSplit => {
             let parameter = g.parameter()?;
             if g.kind == Kind::BaseSplit {
@@ -576,6 +580,7 @@ fn run_dynamic(e: &Executor<'_>, g: &Group) -> Result<()> {
         Kind::CosetInterpolation => run_fixed::<24>(e, g),
         Kind::Comparison => run_fixed::<25>(e, g),
         Kind::ArithmeticChain => run_fixed::<26>(e, g),
+        Kind::BitSum => run_fixed::<27>(e, g),
     }
 }
 
@@ -838,7 +843,7 @@ pub(super) fn run_range(e: &Executor<'_>, g: &Group, start: u32, end: u32) -> Re
     macro_rules! run {($($k:literal),*)=>{match g.kind.code(){$($k=>{for k in start..end{e.step_fixed::<$k>(g,k)?;}},)*_=>unreachable!()}}}
     run!(
         0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-        25, 26
+        25, 26, 27
     );
     Ok(())
 }

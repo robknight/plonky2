@@ -71,7 +71,7 @@ circuit_data.install_witness_program(program)?;
 
 Compilation time and stored program size depend on the circuit. Loading checks the circuit, the build (`witness_program::FORMAT`, which callers can put in cache keys) and the generators' operations. Stored programs are a trusted input, like serialized circuit data: a checksum detects damage, not tampering.
 
-A circuit can be compiled only over the Goldilocks field, if every generator describes its computation through `WitnessGenerator::witness_operation` and it has no lookup tables. Most of plonky2's own generators do (not those of lookups, the dummy-proof generator or the `BaseSumGenerator` in `gadgets/split_base.rs`); `witness_program_support` checks a circuit without compiling and names the first generator that does not. Libraries with custom generators implement `witness_operation` and can test their implementations on real circuits with `witness_program::check_against_worklist`, which fails on any value that differs from the worklist.
+A circuit can be compiled only over the Goldilocks field, if every generator describes its computation through `WitnessGenerator::witness_operation` and it has no lookup tables. Most of plonky2's own generators do (not those of lookups, the dummy-proof generator or nonbinary `BaseSumGenerator`s); `witness_program_support` checks a circuit without compiling and names the first generator that does not. Libraries with custom generators implement `witness_operation` and can test their implementations on real circuits with `witness_program::check_against_worklist`, which fails on any value that differs from the worklist.
 
 ## Diagnostics and tools
 

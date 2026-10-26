@@ -98,6 +98,15 @@ impl<F: RichField + Extendable<D>, const B: usize, const D: usize> SimpleGenerat
         self.limbs.iter().map(|b| b.target).collect()
     }
 
+    fn witness_operation(&self) -> Option<crate::iop::generator::WitnessOperation> {
+        (B == 2 && self.limbs.len() <= 63).then(|| {
+            crate::iop::generator::WitnessOperation::BitSum {
+                bits: self.limbs.iter().map(|b| b.target).collect(),
+                output: Target::wire(self.row, BaseSumGate::<B>::WIRE_SUM),
+            }
+        })
+    }
+
     fn run_once(
         &self,
         witness: &PartitionWitness<F>,
