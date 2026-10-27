@@ -20,9 +20,7 @@ pub(crate) struct Tail {
     metadata: Vec<u32>,
     runs: Vec<(u32, u32, bool)>,
     run_kinds: Vec<u8>,
-    /// Every run's parameters, one uniform block per run at the device's
-    /// dynamic offset alignment, for unseeded and seeded randomness.
-    params_cache: [DeviceCache; 2],
+    params_cache: Vec<[DeviceCache; 2]>,
     metadata_device: DeviceCache,
     targets_device: DeviceCache,
     coefficients_device: DeviceCache,
@@ -196,7 +194,10 @@ impl Tail {
             cpu_slots,
             cpu_slots_device: Default::default(),
             metadata,
-            params_cache: Default::default(),
+            params_cache: runs
+                .iter()
+                .map(|_| [Default::default(), Default::default()])
+                .collect(),
             runs,
             run_kinds,
             metadata_device: Default::default(),
@@ -322,66 +323,47 @@ impl Tail {
         let error = ctx.storage("tail errors", 16);
         let mut encoder = ctx.encoder("terminal witness regions");
         encoder.clear_buffer(&error, 0, None);
-        // One bind group serves every dispatch; each selects its run's
-        // parameters by dynamic offset. They are fixed per seed mode and
-        // cached; fresh keys are bound separately.
-        let stride = ctx
-            .device
-            .limits()
-            .min_uniform_buffer_offset_alignment
-            .max(16);
-        let cache = &self.params_cache[usize::from(seed.is_some())];
-        let params = cache.get().unwrap_or_else(|| {
-            let mut words = vec![0u32; self.runs.len() * stride as usize / 4];
-            for (block, &(base, count, _)) in words.chunks_mut(stride as usize / 4).zip(&self.runs)
-            {
-                block[..4].copy_from_slice(&[
-                    base,
-                    count,
-                    u32::from(seed.is_some()),
-                    e.program.roots.len() as u32,
-                ]);
-            }
-            let p = DeviceBuffer::unpooled(ctx.uniform("tail ranges", &words));
-            cache.set_if_within_limit(ctx, p.clone());
-            p
-        });
-        let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &kernels.layout,
-            entries: &[
-                &params as &wgpu::Buffer,
-                &meta,
-                &targets,
-                &coefficients,
-                &random,
-                state,
-                &error,
-                &key,
-            ]
-            .iter()
-            .enumerate()
-            .map(|(binding, buffer)| wgpu::BindGroupEntry {
-                binding: binding as u32,
-                resource: if binding == 0 {
-                    wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer,
-                        offset: 0,
-                        size: std::num::NonZeroU64::new(16),
-                    })
-                } else {
-                    buffer.as_entire_binding()
-                },
-            })
-            .collect::<Vec<_>>(),
-        });
-        let dispatches = self
+        let binds = self
             .runs
             .iter()
-            .zip(&self.run_kinds)
             .enumerate()
-            .map(|(index, (&(_, count, poseidon), &kind))| {
-                (index as u32 * stride, count, poseidon, kind)
+            .map(|(index, &(base, count, poseidon))| {
+                let create = || {
+                    DeviceBuffer::unpooled(ctx.uniform(
+                        "tail range",
+                        &[
+                            base,
+                            count,
+                            u32::from(seed.is_some()),
+                            e.program.roots.len() as u32,
+                        ],
+                    ))
+                };
+                // Fixed per run and seed mode; fresh keys are bound separately.
+                let cache = &self.params_cache[index][usize::from(seed.is_some())];
+                let params = cache.get().unwrap_or_else(|| {
+                    let p = create();
+                    cache.set_if_within_limit(ctx, p.clone());
+                    p
+                });
+                (
+                    ctx.bind(
+                        &kernels.layout,
+                        &[
+                            &params,
+                            &meta,
+                            &targets,
+                            &coefficients,
+                            &random,
+                            state,
+                            &error,
+                            &key,
+                        ],
+                    ),
+                    count,
+                    poseidon,
+                    self.run_kinds[index],
+                )
             })
             .collect::<Vec<_>>();
         #[cfg(feature = "gpu-profiling")]
@@ -390,7 +372,7 @@ impl Tail {
         #[cfg(not(feature = "gpu-profiling"))]
         let detailed = false;
         if detailed {
-            for (offset, count, poseidon, kind) in &dispatches {
+            for (bind, count, poseidon, kind) in &binds {
                 let label = if *kind == 0 {
                     "witness Poseidon"
                 } else {
@@ -402,20 +384,20 @@ impl Tail {
                 } else {
                     &kernels.cheap
                 });
-                pass.set_bind_group(0, &bind, &[*offset]);
+                pass.set_bind_group(0, bind, &[]);
                 let groups = count.div_ceil(128);
                 let width = groups.min(65535);
                 pass.dispatch_workgroups(width, groups.div_ceil(width), 1);
             }
         } else {
             let mut pass = ctx.begin_pass(&mut encoder, "terminal witness regions", None);
-            for (offset, count, poseidon, _) in &dispatches {
+            for (bind, count, poseidon, _) in &binds {
                 pass.set_pipeline(if *poseidon {
                     &kernels.poseidon
                 } else {
                     &kernels.cheap
                 });
-                pass.set_bind_group(0, &bind, &[*offset]);
+                pass.set_bind_group(0, bind, &[]);
                 let groups = count.div_ceil(128);
                 let width = groups.min(65535);
                 pass.dispatch_workgroups(width, groups.div_ceil(width), 1);
@@ -450,42 +432,20 @@ pub(crate) struct Kernels {
 }
 impl Kernels {
     fn new(ctx: &GpuContext) -> Self {
-        // Binding 0 holds each run's parameters at a dynamic offset.
-        let entries = [
-            (true, true),
-            (false, true),
-            (false, true),
-            (false, true),
-            (false, true),
-            (false, false),
-            (false, false),
-            (true, true),
-        ]
-        .iter()
-        .enumerate()
-        .map(
-            |(binding, &(uniform, read_only))| wgpu::BindGroupLayoutEntry {
-                binding: binding as u32,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: if uniform {
-                        wgpu::BufferBindingType::Uniform
-                    } else {
-                        wgpu::BufferBindingType::Storage { read_only }
-                    },
-                    has_dynamic_offset: binding == 0,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-        )
-        .collect::<Vec<_>>();
-        let layout = ctx
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("witness tail"),
-                entries: &entries,
-            });
+        let layout = crate::gpu::storage_layout(
+            &ctx.device,
+            "witness tail",
+            &[
+                (true, true),
+                (false, true),
+                (false, true),
+                (false, true),
+                (false, true),
+                (false, false),
+                (false, false),
+                (true, true),
+            ],
+        );
         let mut source = crate::gpu::shader::prelude_with_mds(ctx.flavor);
         source.push_str(crate::gpu::random::CHACHA);
         source.push_str(KERNEL);
