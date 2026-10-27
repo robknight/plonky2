@@ -35,10 +35,6 @@ pub(super) fn prepare(p: &RegionProgram) -> Result<&Schedule> {
 }
 
 pub(super) fn run(e: &Executor<'_>) -> Result<bool> {
-    #[cfg(feature = "witness-benchmarks")]
-    if !BENCH_ENABLED.load(Ordering::Relaxed) {
-        return Ok(false);
-    }
     let requested = e.program.runtime.config.policy.schedule;
     if requested == WitnessSchedule::Layers
         || (requested == WitnessSchedule::Auto && rayon::current_num_threads() == 1)
@@ -47,13 +43,6 @@ pub(super) fn run(e: &Executor<'_>) -> Result<bool> {
     }
     prepare(e.program)?.execute(e)?;
     Ok(true)
-}
-
-#[cfg(feature = "witness-benchmarks")]
-static BENCH_ENABLED: AtomicBool = AtomicBool::new(true);
-#[cfg(feature = "witness-benchmarks")]
-pub(crate) fn benchmark_enabled(enabled: bool) {
-    BENCH_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
 impl Schedule {

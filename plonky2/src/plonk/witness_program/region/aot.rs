@@ -75,7 +75,7 @@ pub(super) fn run_fixed<const K: u8>(executor: &Executor<'_>, group: &Group) -> 
     } else {
         super::cpu::lane_chunk(kind)
     };
-    if K == 17 && group.count >= 512 && random_spans_enabled() {
+    if K == 17 && group.count >= 512 {
         if let Some(&(source, destination)) =
             random_spans(executor.program).get(&group.targets_offset)
         {
@@ -160,20 +160,6 @@ pub(super) fn run_fixed<const K: u8>(executor: &Executor<'_>, group: &Group) -> 
         })
 }
 
-#[cfg(feature = "witness-benchmarks")]
-static RANDOM_SPANS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-#[cfg(feature = "witness-benchmarks")]
-pub(crate) fn benchmark_random_spans(enabled: bool) {
-    RANDOM_SPANS.store(enabled, std::sync::atomic::Ordering::Relaxed);
-}
-fn random_spans_enabled() -> bool {
-    #[cfg(feature = "witness-benchmarks")]
-    {
-        RANDOM_SPANS.load(std::sync::atomic::Ordering::Relaxed)
-    }
-    #[cfg(not(feature = "witness-benchmarks"))]
-    true
-}
 fn random_spans(p: &RegionProgram) -> &HashMap<u32, (u32, u32)> {
     let fast = p.fast.get().expect("certified plan");
     fast.random_spans.get_or_init(|| {
@@ -855,7 +841,7 @@ fn run_range_inner(e: &Executor<'_>, g: &Group, start: u32, end: u32) -> Result<
             }
             return Ok(());
         }
-        Kind::RandomValue if g.count >= 512 && random_spans_enabled() => {
+        Kind::RandomValue if g.count >= 512 => {
             if let Some(&(src, dst)) = random_spans(e.program).get(&g.targets_offset) {
                 return e.step_random_span(src, dst, start, end);
             }

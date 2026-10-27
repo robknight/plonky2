@@ -37,54 +37,8 @@ use crate::plonk::config::GenericConfig;
 
 type Q = QuinticExtension<G>;
 
-#[cfg(feature = "witness-benchmarks")]
-static INPUT_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
-#[cfg(feature = "witness-benchmarks")]
-pub(crate) fn benchmark_input_binding(direct: bool) {
-    INPUT_OVERRIDE.store(u8::from(direct), Ordering::Relaxed);
-}
-fn direct_binding() -> bool {
-    #[cfg(feature = "witness-benchmarks")]
-    {
-        let mode = INPUT_OVERRIDE.load(Ordering::Relaxed);
-        if mode != 255 {
-            return mode != 0;
-        }
-        static MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        return *MODE
-            .get_or_init(|| std::env::var("P2_WITNESS_INPUT_BINDING").as_deref() != Ok("legacy"));
-    }
-    #[cfg(not(feature = "witness-benchmarks"))]
-    true
-}
-
-#[cfg(feature = "witness-benchmarks")]
-static COMPACT_READINESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-#[cfg(feature = "witness-benchmarks")]
-pub(crate) fn benchmark_compact_readiness(enabled: bool) {
-    COMPACT_READINESS.store(enabled, Ordering::Relaxed);
-}
-fn compact_readiness_enabled() -> bool {
-    #[cfg(feature = "witness-benchmarks")]
-    {
-        COMPACT_READINESS.load(Ordering::Relaxed)
-    }
-    #[cfg(not(feature = "witness-benchmarks"))]
-    true
-}
-
-#[cfg(all(feature = "gpu", feature = "witness-benchmarks"))]
-static GATHER_TILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-#[cfg(all(feature = "gpu", feature = "witness-benchmarks"))]
-pub(crate) fn benchmark_gather_tiling(current: bool) {
-    GATHER_TILING.store(current, Ordering::Relaxed);
-}
 #[cfg(feature = "gpu")]
 fn gather_tiling(_config: &crate::plonk::witness_program::WitnessConfig) -> (usize, usize) {
-    #[cfg(feature = "witness-benchmarks")]
-    if !GATHER_TILING.load(Ordering::Relaxed) {
-        return (2, 1024);
-    }
     #[cfg(test)]
     return _config.policy.gather_tiles;
     #[cfg(not(test))]
@@ -271,8 +225,7 @@ impl RegionProgram {
         };
         let profile = profile::Execution::new(self.state_slots);
         let allocation = profile.stage(Stage::Allocate);
-        let compact_readiness =
-            fast.is_some_and(|f| f.sparse_ready.is_some()) && compact_readiness_enabled();
+        let compact_readiness = fast.is_some_and(|f| f.sparse_ready.is_some());
         let (state, ready) = self.runtime.buffers.acquire(
             self.state_slots as usize,
             if compact_readiness {
@@ -2126,7 +2079,7 @@ pub(crate) fn generate_wires_with<
         ..Default::default()
     };
 
-    let mut direct = direct_binding();
+    let mut direct = true;
     let started = Instant::now();
     let input_discovery = profile::Pipeline::new("input-discovery", prover.generators.len());
     let lookup = || -> Result<Option<std::sync::Arc<RegionProgram>>> {
@@ -3633,18 +3586,7 @@ pub(crate) fn replay_snapshot(stem: &std::path::Path, iterations: usize) -> Resu
         program.layer_count(),
         program.state_slots
     );
-    let paired = std::env::var_os("P2_BENCH_RANDOM_SPANS_PAIR").is_some();
-    let ready_paired = std::env::var_os("P2_BENCH_READINESS_PAIR").is_some();
     for iteration in 0..iterations {
-        #[cfg(feature = "parallel")]
-        let dependencies = std::env::var_os("P2_BENCH_SCHEDULE_PAIR").is_none()
-            || ((iteration ^ (iteration >> 1)) & 1) != 0;
-        #[cfg(feature = "parallel")]
-        super::schedule::benchmark_enabled(dependencies);
-        let spans = !paired || ((iteration ^ (iteration >> 1)) & 1) != 0;
-        super::aot::benchmark_random_spans(spans);
-        let compact = !ready_paired || ((iteration ^ (iteration >> 1)) & 1) != 0;
-        benchmark_compact_readiness(compact);
         let started = Instant::now();
         let actual = program.execute_state(&roots, &random)?;
         let ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -3655,14 +3597,12 @@ pub(crate) fn replay_snapshot(stem: &std::path::Path, iterations: usize) -> Resu
             );
         }
         eprintln!(
-            "AOT_EXECUTE generators={} layers={} slots={} iteration={} ms={ms:.6} equal=true random_spans={spans} compact_readiness={compact}",
+            "AOT_EXECUTE generators={} layers={} slots={} iteration={} ms={ms:.6} equal=true",
             key.generators,
             program.layer_count(),
             program.state_slots,
             iteration
         );
-        #[cfg(feature = "parallel")]
-        eprintln!("DEPENDENCY_EXEC iteration={iteration} dependencies={dependencies} ms={ms:.6}");
     }
     Ok(())
 }

@@ -1170,40 +1170,9 @@ pub fn benchmark_profile(active: bool) {
     region::benchmark_profile(active);
 }
 
-/// Benchmark-only input binding control. Change only between serial proofs.
-#[doc(hidden)]
-#[cfg(feature = "witness-benchmarks")]
-pub fn benchmark_input_binding(direct: bool) {
-    region::cpu::benchmark_input_binding(direct);
-}
-
 /// Benchmark-only buffer reuse control. Change only between serial proofs.
 #[doc(hidden)]
 #[cfg(feature = "witness-benchmarks")]
 pub fn benchmark_buffer_reuse(enabled: bool) {
     region::buffers::benchmark_override(enabled);
-}
-
-#[doc(hidden)]
-#[cfg(feature = "witness-benchmarks")]
-pub fn benchmark_random_spans(enabled: bool) {
-    region::aot::benchmark_random_spans(enabled);
-}
-
-#[doc(hidden)]
-#[cfg(feature = "witness-benchmarks")]
-pub fn benchmark_compact_readiness(enabled: bool) {
-    region::cpu::benchmark_compact_readiness(enabled);
-}
-
-#[doc(hidden)]
-#[cfg(all(feature = "gpu", feature = "witness-benchmarks"))]
-pub fn benchmark_gather_tiling(current: bool) {
-    region::cpu::benchmark_gather_tiling(current);
-}
-
-#[doc(hidden)]
-#[cfg(all(feature = "parallel", feature = "witness-benchmarks"))]
-pub fn benchmark_dependency_schedule(enabled: bool) {
-    region::schedule::benchmark_enabled(enabled);
 }

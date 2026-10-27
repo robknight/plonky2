@@ -44,8 +44,8 @@ profiling between proofs. Call it only while no witness execution is active.
 It has no effect when the profiling feature is absent.
 
 Installed programs bind inputs through the existing canonical slot map when
-their input mask matches the full boundary-root set. Set
-`P2_WITNESS_INPUT_BINDING=legacy` for a comparison with sorting and binary search.
+their input mask matches the full boundary-root set; other masks sort and
+binary-search their inputs.
 
 `PLONKY2_EXECUTOR_BUFFER_BYTES=67108864` enables bounded reuse of wiped witness buffers. The
 default uses fresh allocations. The pool retains at most 64 MiB of buffer
