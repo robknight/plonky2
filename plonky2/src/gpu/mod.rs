@@ -525,6 +525,25 @@ impl StoragePool {
     }
 }
 
+/// A readback queued by [`GpuContext::read_later`]. The source stays alive
+/// until it is finished.
+pub(crate) struct PendingRead {
+    source: DeviceBuffer,
+    staging: Option<wgpu::Buffer>,
+    bytes: u64,
+    index: wgpu::SubmissionIndex,
+}
+
+impl PendingRead {
+    /// Waits for the read and calls `f` with the bytes.
+    pub(crate) fn finish<R>(self, ctx: &GpuContext, f: impl FnOnce(&[u8]) -> R) -> R {
+        match self.staging {
+            Some(staging) => ctx.read_staged_with_timing(staging, self.bytes, &self.index, None, f),
+            None => ctx.map_and_read(&self.source, self.bytes, Some(&self.index), None, f),
+        }
+    }
+}
+
 const UPLOAD_PENDING: u8 = 0;
 const UPLOAD_MAPPED: u8 = 1;
 const UPLOAD_FAILED: u8 = 2;
@@ -1234,6 +1253,34 @@ impl GpuContext {
             },
         );
         self.read_staged_with_timing(staging, bytes, &copied, timing, f)
+    }
+
+    /// Queues a read of the first `bytes` of `buffer` once submission `index`
+    /// has executed. On a discrete adapter the copy to a readback buffer is
+    /// submitted now; [`PendingRead::finish`] waits and decodes, so several
+    /// reads can be queued before the host waits for the first.
+    pub(crate) fn read_later(
+        &self,
+        buffer: &DeviceBuffer,
+        bytes: u64,
+        index: wgpu::SubmissionIndex,
+    ) -> PendingRead {
+        let staging = (!self.mappable && bytes > 0).then(|| {
+            let staging = self.readback_buffer(bytes);
+            let mut encoder = self.encoder("readback");
+            encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, bytes.next_multiple_of(16));
+            (staging, self.submit_async(encoder))
+        });
+        let (staging, index) = match staging {
+            Some((staging, copied)) => (Some(staging), copied),
+            None => (None, index),
+        };
+        PendingRead {
+            source: buffer.clone(),
+            staging,
+            bytes,
+            index,
+        }
     }
 
     /// A host-mappable buffer of at least `bytes`, from the readback pool when

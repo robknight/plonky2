@@ -328,41 +328,49 @@ impl<F: Copy> MerkleLeaves<F> {
     /// Gather all queried rows in one submission/readback. A full CPU request
     /// still works. Only the first nonempty query set is cached; accessing a
     /// row outside that set materializes the full host data.
+    #[cfg(test)]
     pub(crate) fn prepare_queries(&self, indices: &[usize]) {
-        let Some(d) = &self.values.device else { return };
-        if d.full.get().is_some() || indices.is_empty() {
-            return;
+        if let Some(finish) = self.queue_queries(indices) {
+            finish();
         }
-        d.queries.get_or_init(|| {
-            let mut indices = indices.to_vec();
-            indices.sort_unstable();
-            indices.dedup();
-            assert!(indices.iter().all(|&i| i < self.num_leaves));
-            let resident = d.resident.lock().unwrap();
-            // Materialization may have won the lock. row() will use host data.
-            let Some(buffer) = resident.as_ref() else {
-                return Default::default();
-            };
-            let ctx = &buffer.context;
-            let row_bytes = (self.leaf_len * 8) as u64;
-            let (compact, done) =
-                crate::gpu::merkle::gather_leaves(ctx, &buffer.buffer, d.source, &indices);
-            ctx.read_after(
-                &compact,
-                row_bytes * indices.len() as u64,
-                Some(&done),
-                |bytes| {
+    }
+
+    /// Submits the gather of the queried rows and queues their readback; the
+    /// returned step waits for it and caches the rows. `None` when nothing
+    /// needs reading. Queueing several trees before finishing any keeps the
+    /// device busy instead of waiting for the host between gathers.
+    pub(crate) fn queue_queries(&self, indices: &[usize]) -> Option<Box<dyn FnOnce() + '_>> {
+        let d = self.values.device.as_ref()?;
+        if d.full.get().is_some() || d.queries.get().is_some() || indices.is_empty() {
+            return None;
+        }
+        let mut indices = indices.to_vec();
+        indices.sort_unstable();
+        indices.dedup();
+        assert!(indices.iter().all(|&i| i < self.num_leaves));
+        let resident = d.resident.lock().unwrap();
+        // Materialization may have won the lock; row() then uses host data.
+        let buffer = resident.as_ref()?;
+        let ctx = buffer.context.clone();
+        let row_bytes = self.leaf_len * 8;
+        let (compact, done) =
+            crate::gpu::merkle::gather_leaves(&ctx, &buffer.buffer, d.source, &indices);
+        drop(resident);
+        let read = ctx.read_later(&compact, (row_bytes * indices.len()) as u64, done);
+        Some(Box::new(move || {
+            d.queries.get_or_init(|| {
+                read.finish(&ctx, |bytes| {
                     indices
                         .iter()
                         .enumerate()
                         .map(|(j, &index)| {
-                            let start = j * row_bytes as usize;
-                            (index, (d.decode)(&bytes[start..start + row_bytes as usize]))
+                            let start = j * row_bytes;
+                            (index, (d.decode)(&bytes[start..start + row_bytes]))
                         })
                         .collect()
-                },
-            )
-        });
+                })
+            });
+        }))
     }
 
     /// Copies the rows a CPU computation will read into a compact host table
@@ -845,23 +853,48 @@ impl<T: Copy> MerkleDigests<T> {
     /// submission and one small readback, so that `MerkleTree::prove` need
     /// not download the full array. Each call replaces the previous set;
     /// other indices fall back to the full download.
+    #[cfg(test)]
     pub(crate) fn prepare_paths(&self, indices: &[usize], leaves_len: usize, cap_height: usize) {
-        let Some(d) = &self.device else { return };
-        if d.full.get().is_some() || indices.is_empty() {
-            return;
+        if let Some(finish) = self.queue_paths(indices, leaves_len, cap_height) {
+            finish();
         }
-        let resident = d.resident.lock().unwrap();
-        let Some(r) = resident.as_ref() else { return };
+    }
+
+    /// Submits the gather of the authentication paths of `indices` and
+    /// queues their readback; the returned step waits for it and stores the
+    /// paths. `None` when nothing needs reading.
+    pub(crate) fn queue_paths(
+        &self,
+        indices: &[usize],
+        leaves_len: usize,
+        cap_height: usize,
+    ) -> Option<Box<dyn FnOnce() + '_>> {
+        let d = self.device.as_ref()?;
+        if d.full.get().is_some() || indices.is_empty() {
+            return None;
+        }
         let mut indices = indices.to_vec();
         indices.sort_unstable();
         indices.dedup();
         assert_eq!(d.count, 2 * (leaves_len - (1 << cap_height)));
-        let paths = crate::gpu::merkle::read_query_paths(
-            &r.context, &r.buffer, leaves_len, cap_height, &indices, d.decode,
+        let resident = d.resident.lock().unwrap();
+        let r = resident.as_ref()?;
+        let ctx = r.context.clone();
+        let queued = crate::gpu::merkle::queue_query_paths(
+            &ctx, &r.buffer, leaves_len, cap_height, &indices,
         );
-        let paths = indices.into_iter().zip(paths).collect();
         drop(resident);
-        *d.paths.lock().unwrap() = paths;
+        Some(Box::new(move || {
+            let paths = match queued {
+                Some((read, depth)) => read
+                    .finish(&ctx, d.decode)
+                    .chunks_exact(depth)
+                    .map(<[T]>::to_vec)
+                    .collect::<Vec<_>>(),
+                None => vec![Vec::new(); indices.len()],
+            };
+            *d.paths.lock().unwrap() = indices.into_iter().zip(paths).collect();
+        }))
     }
 
     /// A prepared authentication path, if `leaf_index` was prepared.

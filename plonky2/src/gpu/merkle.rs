@@ -293,8 +293,10 @@ fn read_hashes<F: RichField, H: Hasher<F>>(
     })
 }
 
-/// Reads authentication siblings in query order, including duplicate queries.
-/// Both resident prover trees and profiling readbacks use this layout.
+/// Reads authentication siblings in query order, including duplicate queries,
+/// for profiling readbacks; the prover queues the same gather through
+/// `queue_query_paths`.
+#[cfg(all(test, feature = "gpu-profiling"))]
 pub(crate) fn read_query_paths<T: Copy>(
     ctx: &GpuContext,
     digests: &wgpu::Buffer,
@@ -303,6 +305,26 @@ pub(crate) fn read_query_paths<T: Copy>(
     indices: &[usize],
     decode: impl FnOnce(&[u8]) -> Vec<T>,
 ) -> Vec<Vec<T>> {
+    match queue_query_paths(ctx, digests, leaves_len, cap_height, indices) {
+        Some((read, depth)) => read
+            .finish(ctx, decode)
+            .chunks_exact(depth)
+            .map(<[T]>::to_vec)
+            .collect(),
+        None => vec![Vec::new(); indices.len()],
+    }
+}
+
+/// Submits the gather of the authentication paths of `indices` and queues
+/// their readback; the paths are `depth` digests each. `None` when there is
+/// nothing to read.
+pub(crate) fn queue_query_paths(
+    ctx: &GpuContext,
+    digests: &wgpu::Buffer,
+    leaves_len: usize,
+    cap_height: usize,
+    indices: &[usize],
+) -> Option<(super::PendingRead, usize)> {
     let log_leaves = log2_strict(leaves_len);
     assert!(cap_height <= log_leaves);
     let depth = log_leaves - cap_height;
@@ -310,7 +332,7 @@ pub(crate) fn read_query_paths<T: Copy>(
     assert!(digests.size() >= (num_digests * 32) as u64);
     assert!(indices.iter().all(|&i| i < leaves_len));
     if depth == 0 || indices.is_empty() {
-        return vec![Vec::new(); indices.len()];
+        return None;
     }
     let compact = ctx.storage("merkle query siblings", (indices.len() * depth * 32) as u64);
     let mut encoder = ctx.encoder("gather merkle query siblings");
@@ -333,13 +355,8 @@ pub(crate) fn read_query_paths<T: Copy>(
         }
     }
     let done = ctx.submit_async(encoder);
-    let hashes = ctx.read_after(
-        &compact,
-        (indices.len() * depth * 32) as u64,
-        Some(&done),
-        decode,
-    );
-    hashes.chunks_exact(depth).map(<[T]>::to_vec).collect()
+    let read = ctx.read_later(&compact, (indices.len() * depth * 32) as u64, done);
+    Some((read, depth))
 }
 
 impl DeviceTree {
@@ -379,7 +396,7 @@ impl DeviceTree {
 
     /// Benchmark helper: copy only authentication siblings from the resident digest
     /// array into one compact readback. Duplicate queries retain their order.
-    /// The prover gathers paths through `MerkleDigests::prepare_paths`;
+    /// The prover gathers paths through `MerkleDigests::queue_paths`;
     /// this helper measures sparse readback directly from a `DeviceTree`.
     #[cfg(all(test, feature = "gpu-profiling"))]
     pub(crate) fn read_query_paths<F: RichField, H: Hasher<F>>(
