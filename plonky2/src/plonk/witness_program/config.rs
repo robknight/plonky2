@@ -387,7 +387,6 @@ mod tests {
         let values = [
             ("PLONKY2_WITNESS_BENCH_MODE", "checked"),
             ("PLONKY2_WITNESS_BENCH_SCHEDULE", "layers"),
-            ("PLONKY2_WITNESS_BENCH_POSEIDON", "scalar"),
             ("PLONKY2_WITNESS_BENCH_GATHER", "gpu"),
         ];
         let c = read(WitnessConfig::default(), &values).unwrap();
@@ -400,10 +399,6 @@ mod tests {
             assert_eq!(
                 c.policy.schedule,
                 super::super::policy::WitnessSchedule::Layers
-            );
-            assert_eq!(
-                c.policy.poseidon,
-                super::super::policy::WitnessPoseidon::Scalar
             );
             assert_eq!(c.policy.gather, super::super::policy::WitnessGather::Gpu);
             assert!(read(

@@ -100,8 +100,7 @@ caller-owned pool, wiped-buffer retention and fallback. Layout, chain length,
 chunk scaling, simplification and gather tiles are not public settings.
 Automatic scheduling, batching and CPU gathering retain the measured defaults.
 The private comparison controls `PLONKY2_WITNESS_BENCH_MODE`,
-`PLONKY2_WITNESS_BENCH_SCHEDULE`, `PLONKY2_WITNESS_BENCH_POSEIDON` and
-`PLONKY2_WITNESS_BENCH_GATHER` are read only in `witness-benchmarks` builds.
+`PLONKY2_WITNESS_BENCH_SCHEDULE` and `PLONKY2_WITNESS_BENCH_GATHER` are read only in `witness-benchmarks` builds.
 They are excluded from normal application parsing and the public config schema.
 Earlier audit counts and experimental tuning in the history refer to the API
 before this reduction.

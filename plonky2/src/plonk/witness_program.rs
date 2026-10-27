@@ -936,7 +936,6 @@ mod tests {
             loaded.config().policy.execution,
             policy::WitnessExecution::Checked
         );
-        assert_eq!(loaded.config().policy.chain_length, 4);
         checked.data.install_witness_program(loaded).unwrap();
         assert!(prove_and_verify(&fast.data, inputs(&fast)));
         assert!(prove_and_verify(&checked.data, inputs(&checked)));

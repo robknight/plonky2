@@ -2,42 +2,12 @@
 use super::config::invalid;
 use super::WitnessProgramError;
 
-/// Placement of witness values. `Outputs` is the measured general default.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum WitnessLayout {
-    /// Keep the compiler's original canonical ordering.
-    Canonical,
-    /// Place each operation's outputs together.
-    #[default]
-    Outputs,
-    /// Sort non-root values by copy-constraint representative.
-    Representatives,
-    /// Interleave outputs in blocks of four operations.
-    Block4,
-    /// Interleave outputs in blocks of eight operations.
-    Block8,
-}
-impl WitnessLayout {
-    pub(crate) fn code(self) -> u32 {
-        match self {
-            Self::Canonical => 0,
-            Self::Outputs => 1,
-            Self::Representatives => 2,
-            Self::Block4 => 3,
-            Self::Block8 => 4,
-        }
-    }
-    pub(super) fn from_code(code: u32) -> Result<Self, WitnessProgramError> {
-        match code {
-            0 => Ok(Self::Canonical),
-            1 => Ok(Self::Outputs),
-            2 => Ok(Self::Representatives),
-            3 => Ok(Self::Block4),
-            4 => Ok(Self::Block8),
-            _ => Err(invalid("invalid stored witness layout")),
-        }
-    }
-}
+/// Value placement and arithmetic fusion are fixed: each operation's outputs
+/// are placed together and arithmetic chains fuse up to four operations. The
+/// stored compilation key records them so programs compiled by other choices
+/// are rejected.
+pub(crate) const CHAIN_LENGTH: usize = 4;
+const COMPILATION_KEY: u32 = 1 | ((CHAIN_LENGTH as u32) << 3);
 
 /// Execution policy. Automatic execution retains checks for aliases and inputs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -60,17 +30,6 @@ pub(crate) enum WitnessSchedule {
     /// Schedule ready chunks without global barriers (requires `parallel`).
     #[cfg(any(test, feature = "witness-benchmarks"))]
     Dependencies,
-}
-
-/// Poseidon selection, independent of the serialized circuit program.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum WitnessPoseidon {
-    /// Batch independent permutations when the compiled backend supports it.
-    #[default]
-    Auto,
-    /// Use individual permutations.
-    #[cfg(any(test, feature = "witness-benchmarks"))]
-    Scalar,
 }
 
 /// Destination for the final witness gather.
@@ -96,11 +55,8 @@ pub(crate) enum WitnessGather {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Policy {
-    pub layout: WitnessLayout,
-    pub chain_length: u8,
     pub execution: WitnessExecution,
     pub schedule: WitnessSchedule,
-    pub poseidon: WitnessPoseidon,
     pub gather: WitnessGather,
     #[cfg(test)]
     pub gather_tiles: (usize, usize),
@@ -108,11 +64,8 @@ pub(crate) struct Policy {
 impl Default for Policy {
     fn default() -> Self {
         Self {
-            layout: WitnessLayout::Outputs,
-            chain_length: 4,
             execution: WitnessExecution::Auto,
             schedule: WitnessSchedule::Auto,
-            poseidon: WitnessPoseidon::Auto,
             gather: WitnessGather::Auto,
             #[cfg(test)]
             gather_tiles: (16, 256),
@@ -127,18 +80,15 @@ impl Policy {
                 "dependency scheduling requires the parallel feature",
             ));
         }
-        if self.chain_length == 1 || self.chain_length > 8 {
-            return Err(invalid("invalid stored chain length"));
-        }
         Ok(())
     }
     pub(super) fn compilation_key(&self) -> u32 {
-        self.layout.code() | (u32::from(self.chain_length) << 3)
+        COMPILATION_KEY
     }
-    pub(super) fn with_compilation_key(mut self, key: u32) -> Result<Self, WitnessProgramError> {
-        self.layout = WitnessLayout::from_code(key & 7)?;
-        self.chain_length =
-            u8::try_from(key >> 3).map_err(|_| invalid("invalid stored chain length"))?;
+    pub(super) fn with_compilation_key(self, key: u32) -> Result<Self, WitnessProgramError> {
+        if key != COMPILATION_KEY {
+            return Err(invalid("unsupported stored compilation policy"));
+        }
         self.validate()?;
         Ok(self)
     }
@@ -169,16 +119,6 @@ impl Policy {
             self.schedule = v;
         }
         if let Some(v) = env.choice(
-            "PLONKY2_WITNESS_BENCH_POSEIDON",
-            "PLONKY2_WITNESS_BENCH_POSEIDON",
-            &[
-                ("auto", WitnessPoseidon::Auto),
-                ("scalar", WitnessPoseidon::Scalar),
-            ],
-        )? {
-            self.poseidon = v;
-        }
-        if let Some(v) = env.choice(
             "PLONKY2_WITNESS_BENCH_GATHER",
             "PLONKY2_WITNESS_BENCH_GATHER",
             &[
@@ -201,7 +141,6 @@ mod tests {
         let env = crate::util::environment::Environment::with_lookup(|key: &str| match key {
             "PLONKY2_WITNESS_BENCH_MODE" => Some("checked".into()),
             "PLONKY2_WITNESS_BENCH_SCHEDULE" => Some("layers".into()),
-            "PLONKY2_WITNESS_BENCH_POSEIDON" => Some("scalar".into()),
             "PLONKY2_WITNESS_BENCH_GATHER" => Some("gpu".into()),
             _ => None,
         });
@@ -210,7 +149,6 @@ mod tests {
         assert_eq!(p.compilation_key(), Policy::default().compilation_key());
         assert_eq!(p.execution, WitnessExecution::Checked);
         assert_eq!(p.schedule, WitnessSchedule::Layers);
-        assert_eq!(p.poseidon, WitnessPoseidon::Scalar);
         assert_eq!(p.gather, WitnessGather::Gpu);
         let env = crate::util::environment::Environment::with_lookup(|key: &str| {
             (key == "PLONKY2_WITNESS_BENCH_MODE").then(|| "bad".into())

@@ -335,17 +335,6 @@ pub fn reference(mut s: [G; 12], swap: G) -> [G; 122] {
     out
 }
 
-// Benchmark-only per-proof control. Call only while no witness execution is active.
-#[doc(hidden)]
-#[cfg(feature = "witness-benchmarks")]
-pub static BENCH_MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(255);
-#[doc(hidden)]
-#[cfg(feature = "witness-benchmarks")]
-pub fn benchmark_override(mode: u8, _minimum: u32) {
-    assert!(matches!(mode, 0 | 5 | 255));
-    BENCH_MODE.store(mode, core::sync::atomic::Ordering::Relaxed);
-}
-
 #[cfg(all(
     feature = "std",
     feature = "rand_chacha",

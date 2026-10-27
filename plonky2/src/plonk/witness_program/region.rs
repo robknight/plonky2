@@ -560,12 +560,8 @@ impl Lane {
 fn fuse_arithmetic<F: RichField>(
     nodes: Vec<Lane>,
     entry: &PartitionWitness<F>,
-    config: &super::WitnessConfig,
 ) -> Result<Vec<Lane>> {
-    if config.policy.chain_length == 0 {
-        return Ok(nodes);
-    }
-    let limit = config.policy.chain_length as usize;
+    let limit = super::policy::CHAIN_LENGTH;
     const MANY: u32 = u32::MAX - 1;
     let mut producer = vec![NONE; entry.values.len()];
     let mut consumer = vec![NONE; entry.values.len()];
@@ -740,7 +736,7 @@ impl RegionProgram {
                 Ok(Lane::new(index, &op, input, output))
             })
             .collect::<Result<Vec<_>>>()?;
-        let nodes = fuse_arithmetic(nodes, entry, &runtime.config)?;
+        let nodes = fuse_arithmetic(nodes, entry)?;
         let mut produced = vec![false; reps];
         for lane in &nodes {
             for &r in &lane.outputs {

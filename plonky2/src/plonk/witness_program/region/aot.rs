@@ -69,7 +69,7 @@ pub(super) fn run_fixed<const K: u8>(executor: &Executor<'_>, group: &Group) -> 
     }
 
     let kind = Kind::from_code(K as usize)?;
-    let use_simd = K == 0 && poseidon_mode(executor) != 0 && group.count >= poseidon_min_group();
+    let use_simd = K == 0 && poseidon_mode() != 0 && group.count >= poseidon_min_group();
     let chunk = if use_simd {
         poseidon_chunk()
     } else {
@@ -128,7 +128,7 @@ pub(super) fn run_fixed<const K: u8>(executor: &Executor<'_>, group: &Group) -> 
                 let begin = c * chunk;
                 let end = chunk_end(c * chunk, chunk, group.count);
                 let _profile = executor.profile.kind(K, end - begin);
-                let mode = if use_simd { poseidon_mode(executor) } else { 0 };
+                let mode = if use_simd { poseidon_mode() } else { 0 };
                 if mode != 0 {
                     return executor.step_poseidon_simd(group, begin, end, starts, mode);
                 }
@@ -513,46 +513,31 @@ pub(super) fn certify(p: &RegionProgram) -> Result<FastLayout> {
     })
 }
 
-/// Changes value placement while retaining operand and group ordering.
+/// Places each operation's outputs together while retaining operand and
+/// group ordering.
 pub(super) fn reorder(p: &mut RegionProgram) -> Result<()> {
-    let mode = p.runtime.config.policy.layout.code();
-    if mode == 0 {
-        return Ok(());
-    }
     let canonical = p.representatives.len();
     let mut order = (0..p.roots.len() as u32).collect::<Vec<_>>();
     let mut seen = vec![false; canonical];
     seen[..p.roots.len()].fill(true);
-    if mode == 1 || mode >= 3 {
-        let block = match mode {
-            3 => 4,
-            4 => 8,
-            _ => 1,
-        };
-        for layer in &p.groups {
-            for g in layer {
-                for start in (0..g.count).step_by(block as usize) {
-                    for pos in g.inputs..g.inputs + g.outputs {
-                        for k in start..(start + block).min(g.count) {
-                            let slot =
-                                p.targets[(g.targets_offset + pos * g.count + k) as usize] as usize;
-                            if slot < canonical && !seen[slot] {
-                                order.push(slot as u32);
-                                seen[slot] = true;
-                            }
-                        }
+    for layer in &p.groups {
+        for g in layer {
+            for k in 0..g.count {
+                for pos in g.inputs..g.inputs + g.outputs {
+                    let slot = p.targets[(g.targets_offset + pos * g.count + k) as usize] as usize;
+                    if slot < canonical && !seen[slot] {
+                        order.push(slot as u32);
+                        seen[slot] = true;
                     }
                 }
             }
         }
     }
-    let mut rest = (p.roots.len()..canonical)
-        .filter(|&i| !seen[i])
-        .collect::<Vec<_>>();
-    if mode == 2 {
-        rest.sort_unstable_by_key(|&i| p.representatives[i]);
-    }
-    order.extend(rest.into_iter().map(|i| i as u32));
+    order.extend(
+        (p.roots.len()..canonical)
+            .filter(|&i| !seen[i])
+            .map(|i| i as u32),
+    );
     ensure!(order.len() == canonical, "incomplete layout");
     order.extend(canonical as u32..p.state_slots);
     let mut remap = vec![0u32; p.state_slots as usize];
@@ -824,18 +809,8 @@ pub(super) fn gather_on_gpu(
     Ok(out)
 }
 
-fn poseidon_mode(e: &Executor<'_>) -> u8 {
-    #[cfg(feature = "witness-benchmarks")]
-    {
-        let override_mode =
-            crate::hash::poseidon_trace_simd::BENCH_MODE.load(std::sync::atomic::Ordering::Relaxed);
-        if override_mode != 255 {
-            return override_mode;
-        }
-    }
-    if e.program.runtime.config.policy.poseidon == super::super::policy::WitnessPoseidon::Auto
-        && crate::hash::poseidon_trace_simd::native_available()
-    {
+fn poseidon_mode() -> u8 {
+    if crate::hash::poseidon_trace_simd::native_available() {
         5
     } else {
         0
@@ -864,7 +839,7 @@ fn run_range_inner(e: &Executor<'_>, g: &Group, start: u32, end: u32) -> Result<
         Kind::Poseidon => {
             let starts = &poseidon_bases(e.program)[&g.targets_offset];
             let mode = if g.count >= poseidon_min_group() {
-                poseidon_mode(e)
+                poseidon_mode()
             } else {
                 0
             };

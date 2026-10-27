@@ -70,7 +70,6 @@ With `witness-benchmarks`, comparisons can be selected at preparation/replay:
 | --- | --- |
 | `PLONKY2_WITNESS_BENCH_MODE` | `auto`, `checked` |
 | `PLONKY2_WITNESS_BENCH_SCHEDULE` | `auto`, `layers`, `dependencies` |
-| `PLONKY2_WITNESS_BENCH_POSEIDON` | `auto`, `scalar` |
 | `PLONKY2_WITNESS_BENCH_GATHER` | `auto`, `cpu`, `gpu` (gather comparison requires GPU proving) |
 
 Normal builds ignore these. The retired `PLONKY2_EXECUTOR_*` tuning names and
