@@ -36,7 +36,7 @@ These variables work in ordinary `gpu` builds, through POD2 or any other consume
 | `PLONKY2_GPU_QUOTIENT_CPU_SHARE` | Finite fraction in `[0, 1]` | `0.10` |
 | `PLONKY2_GPU_SHUTDOWN_AT_EXIT` | Boolean | `true` |
 | `PLONKY2_GPU_FFT_TILES_PER_WORKGROUP` | `auto` or non-negative integer; zero dispatches one NTT workgroup per 1024-element tile without prefetching | 8 on unified memory, zero on discrete |
-| `PLONKY2_GPU_WITNESS` | `auto`, `host`, `device` | `auto`, the host path on every adapter |
+| `PLONKY2_GPU_WITNESS` | `auto`, `host`, `device` | `auto`: device on discrete, host on unified memory |
 
 Booleans accept exactly `true`, `false`, `1` and `0`. Numeric settings use Rust's integer/float parsing, followed by range validation. Empty numeric/boolean/enum settings are errors. Overflow, negative byte budgets, NaN and out-of-range fractions are rejected. Unknown enum values and non-Unicode textual settings are errors naming the actual variable. No environment value is printed in these errors. Cache paths preserve non-Unicode OS paths; absent/empty cache paths disable persistent executor storage.
 

@@ -378,6 +378,18 @@ mod tests {
         let c = read(&[("PLONKY2_GPU_PROVING_WORKERS", "3")]).unwrap();
         assert_eq!(c.retained_bytes_limit(), 6 << 30);
     }
+    #[test]
+    fn witness_placement_follows_memory_type() {
+        // (setting, on unified memory, on discrete memory)
+        for (placement, unified, discrete) in [
+            (WitnessPlacement::Auto, false, true),
+            (WitnessPlacement::Host, false, false),
+            (WitnessPlacement::Device, true, true),
+        ] {
+            assert_eq!(placement.on_device(true), unified, "{placement:?}");
+            assert_eq!(placement.on_device(false), discrete, "{placement:?}");
+        }
+    }
     /// Isolated children exercise real process defaults without racing GPU tests.
     #[test]
     fn global_environment_is_captured_and_explicit_settings_override_it() {

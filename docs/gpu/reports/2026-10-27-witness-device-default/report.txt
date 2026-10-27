@@ -1,0 +1,78 @@
+GPU witness device path as the discrete-GPU default — 2026-10-27
+
+Result
+======
+PLONKY2_GPU_WITNESS=auto now selects the device witness path on discrete
+adapters and keeps the host path on unified memory. Same-binary comparisons on
+two NVIDIA hosts favoured the device path in every adjacent process pair, in
+every setting:
+
+  Host, setting              Host path (ms)   Device path (ms)   Change
+  RTX 4090, default pool          131.09            118.96        -9.3%
+  RTX 4090, 4 GiB pool            104.24             89.06       -14.6%
+  A40, default pool               230.00            221.43        -3.7%
+  A40, 4 GiB pool                 199.63            178.49       -10.6%
+
+  Two proving workers (proofs per second, mean of two processes)
+  RTX 4090                          8.52              9.73       +14%
+  A40                               4.96              5.19        +5%
+
+Warm medians pool 28 proofs from each of four processes per cell (31 proofs
+per process, first three discarded). Proofs within a process are correlated;
+these are descriptive medians, not confidence intervals. The default discrete
+storage pool is zero; the 4 GiB rows show the earlier campaigns' setting, under
+which the device path gains more because its uploads and kernels reuse pooled
+buffers. The CPU witness phases fall on both hosts (4090: execute 16.8 to
+5.1 ms, gather 7.9 to 2.0 ms; A40: execute 23.0 to 9.1 ms, gather 7.6 to
+2.6 ms). On the M4 the device path measured neutral on 26 October and auto
+keeps the host path there.
+
+What was measured
+=================
+The binary is the pod2 MainPod measurement test (empty frontend builder, full
+degree-16 recursive circuit, ZK, prepared executor with error fallback) built
+with gpu,time only: no benchmark or profiling features. plonky2 is a799f2d0,
+which holds the device path behind GpuConfig::witness with the host default;
+each process sets PLONKY2_GPU_WITNESS explicitly. Order per round: host,
+device, device, host for the default pool, then the same for 4 GiB; two rounds;
+then host, device, device, host with two proving workers. Every proof was
+CPU-verified (620 timed proofs per host). Eight Rayon threads pinned to
+physical cores on the GPU's NUMA node, Vulkan backend, one proving worker
+unless stated.
+
+  RTX 4090: Runpod Secure Cloud pod roep8usieub860, AMD EPYC 7K62, driver
+  595.91.07, $0.89/h.
+  A40: pod py0p82371iper8 (CA-MTL-1), Intel Xeon Gold 6342, driver 595.91.07,
+  $0.59/h.
+
+Correctness
+===========
+- The 16 pod2 MainPod tests (KYC, tickets, ethdos, custom predicates, set
+  membership, public statements and others; five distinct circuit sizes)
+  pass with prepared executors on both paths on both NVIDIA hosts and on the
+  M4. Every device-path proof used the tail.
+- A second-reader review of the device path found no soundness or
+  zero-knowledge defect: the device error flag is checked before any proof is
+  returned, per-proof error buffers keep concurrent proofs apart, the ChaCha20
+  kernel matches the CPU reference, rejection sampling is unbiased, and seeds
+  are fresh per proof and per commitment with separate domains. It found two
+  defects, fixed in 57b34ce5: layer-scheduled execution (one-thread pools or
+  the layers schedule) ran device-deferred arithmetic chain lanes on the CPU,
+  which failed with a conflicting root write; and check_against_worklist read
+  compact device state as a dense matrix. A new native test reproduces the
+  first and fails without the fix.
+- The final tree (57b34ce5 plus this default) on the RTX 4090: the plonky2
+  library suite with gpu passes (228 tests), the five native GPU witness
+  tests pass, and the pod2 MainPod tests with no witness setting select the
+  device path (every proof used the tail) and pass. A first library run
+  failed 12 tests because the harness exported PLONKY2_GPU_BACKEND, which one
+  environment-defaults test rejects and whose failure poisoned a shared test
+  lock; the rerun without it is the result above.
+- Known limit, unchanged from the host path: witness values and device keys
+  pass through driver-managed staging memory that plonky2 does not wipe.
+
+Artifacts
+=========
+.benchmark-artifacts/witness-device-default-2026-10-27/ holds the bundle,
+scripts (measure.py, analyze_adopt.py, suite.sh, final.sh), raw logs and
+hardware receipts for both hosts. Both pods were deleted after the runs.

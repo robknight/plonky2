@@ -40,7 +40,9 @@ impl ExecutionMode {
 /// only to proofs that use a prepared witness program and resident wires.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WitnessPlacement {
-    /// The host path on every adapter.
+    /// The device path on discrete-memory adapters, where it removes most of
+    /// the wire upload; the host path on unified-memory ones, where the CPU
+    /// already writes the device's memory directly and it measured neutral.
     #[default]
     Auto,
     /// The CPU executes the whole witness program and gathers the wire
@@ -54,8 +56,8 @@ pub enum WitnessPlacement {
 }
 
 impl WitnessPlacement {
-    pub(crate) fn on_device(self, _mappable: bool) -> bool {
-        self == Self::Device
+    pub(crate) fn on_device(self, mappable: bool) -> bool {
+        self == Self::Device || (self == Self::Auto && !mappable)
     }
 }
 
