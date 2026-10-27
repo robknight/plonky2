@@ -616,10 +616,12 @@ pub(crate) struct GpuOptions {
 impl GpuOptions {
     fn new(config: &GpuConfig, mappable: bool) -> Self {
         Self {
-            pool_bytes: config
-                .pool_bytes
-                .unwrap_or_else(|| Self::default_pool_bytes(mappable)),
-            pool_max_idle_proofs: config.pool_max_idle_proofs,
+            pool_bytes: config.pool_bytes.unwrap_or(Self::DEFAULT_POOL_BYTES),
+            pool_max_idle_proofs: Some(
+                config
+                    .pool_max_idle_proofs
+                    .unwrap_or(config.proving_workers as u64),
+            ),
             pool_min_degree_bits: config.pool_min_degree_bits.unwrap_or(0),
             mode: config.mode,
             proving_workers: config.proving_workers,
@@ -633,13 +635,7 @@ impl GpuOptions {
         }
     }
 
-    fn default_pool_bytes(mappable: bool) -> u64 {
-        if mappable {
-            4 << 30
-        } else {
-            0
-        }
-    }
+    const DEFAULT_POOL_BYTES: u64 = 4 << 30;
 
     /// Whether a commitment made outside a proof keeps its leaf rows on the
     /// device. Proofs decide through `ExecutionPlan::retain_leaves`, which

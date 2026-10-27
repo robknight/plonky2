@@ -729,9 +729,16 @@ fn upload_staging_reuse_keeps_uploads_apart() {
 }
 
 #[test]
-fn storage_pool_defaults_follow_memory_type() {
-    assert_eq!(GpuOptions::default_pool_bytes(true), 4 << 30);
-    assert_eq!(GpuOptions::default_pool_bytes(false), 0);
+fn storage_pool_defaults() {
+    let config = GpuConfig {
+        proving_workers: 2,
+        ..Default::default()
+    };
+    for mappable in [false, true] {
+        let options = GpuOptions::new(&config, mappable);
+        assert_eq!(options.pool_bytes, 4 << 30);
+        assert_eq!(options.pool_max_idle_proofs, Some(2));
+    }
 }
 
 /// Out-of-range settings are refused before anything is stored, so this does

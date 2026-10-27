@@ -32,8 +32,8 @@ These variables work in ordinary `gpu` builds, through POD2 or any other consume
 | `PLONKY2_GPU_MODE` | `auto`, `resident`, `hybrid` | `auto` |
 | `PLONKY2_GPU_PROVING_WORKERS` | Integer at least 1 | `1` |
 | `PLONKY2_GPU_RETAINED_BYTES` | `auto` or non-negative integer bytes; zero disables retention | 2 GiB per proving worker |
-| `PLONKY2_GPU_POOL_BYTES` | `auto` or non-negative integer bytes; zero disables pooling | 4 GiB on unified memory, zero on discrete |
-| `PLONKY2_GPU_POOL_MAX_IDLE_PROOFS` | `auto` or non-negative integer; idle pool buffers are released once that many later proofs have started without reusing them | no limit (only `PLONKY2_GPU_POOL_BYTES` evicts) |
+| `PLONKY2_GPU_POOL_BYTES` | `auto` or non-negative integer bytes; zero disables pooling | 4 GiB |
+| `PLONKY2_GPU_POOL_MAX_IDLE_PROOFS` | `auto` or non-negative integer; idle pool buffers are released once that many later proofs have started without reusing them | one per proving worker |
 | `PLONKY2_GPU_POOL_MIN_DEGREE_BITS` | `auto` or non-negative integer; proofs of circuits with fewer than 2^n rows bypass the pool (the most recently started proof decides) | 0 |
 | `PLONKY2_GPU_QUOTIENT_CPU_SHARE` | Finite fraction in `[0, 1]` | `0.10` |
 | `PLONKY2_GPU_SHUTDOWN_AT_EXIT` | Boolean | `true` |

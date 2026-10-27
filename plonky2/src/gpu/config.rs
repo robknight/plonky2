@@ -57,12 +57,10 @@ pub struct GpuConfig {
     /// uploaded per proof. Each context cache also holds at most 128 entries.
     /// `None` is 2 GiB per proving worker.
     pub retained_bytes: Option<u64>,
-    /// Idle storage buffers kept for reuse. `None` is 4 GiB on unified-memory
-    /// adapters and 0 (no pooling) on discrete ones.
+    /// Idle storage buffers kept for reuse. `None` is 4 GiB.
     pub pool_bytes: Option<u64>,
     /// Idle storage buffers are released once they have stayed unused while
-    /// this many later proofs started. `None` keeps them until `pool_bytes`
-    /// evicts them.
+    /// this many later proofs started. `None` is one per proving worker.
     pub pool_max_idle_proofs: Option<u64>,
     /// Proofs of circuits with fewer than `2^pool_min_degree_bits` rows
     /// neither take buffers from the pool nor return them. The most recently
