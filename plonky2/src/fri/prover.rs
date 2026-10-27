@@ -285,31 +285,25 @@ pub(crate) fn fri_prover_query_rounds<
         .iter()
         .map(|rand| rand.to_canonical_u64() as usize % n)
         .collect::<Vec<_>>();
-    // Every tree's gathers are queued before the host waits for any of them.
     #[cfg(feature = "gpu")]
     {
-        let mut queries = initial_merkle_trees
-            .iter()
-            .map(|&tree| (tree, indices.clone()))
-            .collect::<Vec<_>>();
+        let prepare = |tree: &MerkleTree<F, C::Hasher>, indices: &[usize]| {
+            tree.leaves.prepare_queries(indices);
+            tree.digests.prepare_paths(
+                indices,
+                tree.leaves.len(),
+                crate::util::log2_strict(tree.cap.len()),
+            );
+        };
+        for tree in initial_merkle_trees {
+            prepare(tree, &indices);
+        }
         let mut layer_indices = indices.clone();
         for (tree, &arity) in trees.iter().zip(&fri_params.reduction_arity_bits) {
             for index in &mut layer_indices {
                 *index >>= arity;
             }
-            queries.push((tree, layer_indices.clone()));
-        }
-        let mut queued = Vec::new();
-        for (tree, indices) in &queries {
-            queued.extend(tree.leaves.queue_queries(indices));
-            queued.extend(tree.digests.queue_paths(
-                indices,
-                tree.leaves.len(),
-                crate::util::log2_strict(tree.cap.len()),
-            ));
-        }
-        for finish in queued {
-            finish();
+            prepare(tree, &layer_indices);
         }
     }
     indices
