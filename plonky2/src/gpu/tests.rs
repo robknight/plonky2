@@ -1474,11 +1474,26 @@ fn quintic_variants_prove_on_gpu() {
 
 #[test]
 fn quotient_shader_variants_and_cache() {
+    // Every case the kernel can hold, and the case list without the quintic op.
+    let every = quotient::every_case();
+    let plain = every
+        .iter()
+        .copied()
+        .filter(|&key| key & quotient::BASE_MASK != 17)
+        .collect::<Vec<_>>();
+    assert!(quotient::cases_use_qmul(&every));
+    assert!(!quotient::cases_use_qmul(&plain));
     for flavor in [Flavor::Native, Flavor::Portable] {
-        for uses_qmul in [false, true] {
-            let source = quotient::kernel_source(flavor, 64, 2, uses_qmul);
+        for cases in [&every, &plain] {
+            let uses_qmul = quotient::cases_use_qmul(cases);
+            let source = quotient::kernel_source(flavor, 64, 2, cases);
             assert_eq!(source.contains("fn qmul("), uses_qmul);
-            assert_eq!(source.contains("case 17u:"), uses_qmul);
+            assert_eq!(source.contains("let q = qmul("), uses_qmul);
+            // One case per entry, numbered by position.
+            for i in 0..cases.len() {
+                assert!(source.contains(&format!("case {i}u:")), "case {i}");
+            }
+            assert!(!source.contains(&format!("case {}u:", cases.len())));
             let module = naga::front::wgsl::parse_str(&source).unwrap();
             let capabilities = match flavor {
                 Flavor::Native => naga::valid::Capabilities::SHADER_INT64,
@@ -1490,11 +1505,60 @@ fn quotient_shader_variants_and_cache() {
         }
     }
     let Some(ctx) = ctx() else { return };
-    let plain = ctx.quotient_kernel(64, 2, false);
-    let quintic = ctx.quotient_kernel(64, 2, true);
-    assert!(!Arc::ptr_eq(&plain, &quintic));
-    assert!(Arc::ptr_eq(&plain, &ctx.quotient_kernel(64, 2, false)));
-    assert!(Arc::ptr_eq(&quintic, &ctx.quotient_kernel(64, 2, true)));
+    let with_quintic = ctx.quotient_kernel(64, 2, &every);
+    let without = ctx.quotient_kernel(64, 2, &plain);
+    assert!(!Arc::ptr_eq(&with_quintic, &without));
+    assert!(Arc::ptr_eq(&with_quintic, &ctx.quotient_kernel(64, 2, &every)));
+    assert!(Arc::ptr_eq(&without, &ctx.quotient_kernel(64, 2, &plain)));
+}
+
+/// The case list orders a program's opcodes by frequency, the device program
+/// uses their positions, and the constant blocks after the end marker are
+/// untouched.
+#[test]
+fn program_opcodes_are_numbered_by_frequency() {
+    use crate::gates::arithmetic_base::ArithmeticGate;
+    use crate::plonk::circuit_data::CircuitConfig;
+    let config = CircuitConfig::standard_recursion_config();
+    let gate = crate::gates::gate::GateRef::<F, 2>::new(ArithmeticGate::new_from_config(&config));
+    let trace = trace::trace_gate(&gate, &config, 0).unwrap();
+    let (ops, _) = quotient::gate_program(&trace, 0, &[3, 5], 7).unwrap();
+    let cases = quotient::case_list(&ops);
+    let executable = ops
+        .iter()
+        .take_while(|op| op[0] & quotient::BASE_MASK != 21)
+        .count();
+    let count = |key: u32| {
+        ops[..executable]
+            .iter()
+            .filter(|op| op[0] & 0xff == key)
+            .count()
+    };
+    assert!(cases.iter().all(|&key| count(key) > 0));
+    assert!(cases.windows(2).all(|w| count(w[0]) >= count(w[1])));
+    assert_eq!(
+        cases.len(),
+        ops[..executable]
+            .iter()
+            .map(|op| op[0] & 0xff)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    );
+    // The arithmetic gate's constraints are computed by the op before their
+    // weighting: one fused op each, no separate weighted ops.
+    assert!(count(8) == 0, "{} weighted ops", count(8));
+    assert!(cases.iter().any(|&key| (22..=27).contains(&(key & quotient::BASE_MASK))));
+    let words = quotient::program_words(&ops, &cases);
+    for (i, op) in ops.iter().enumerate() {
+        let word = words[4 * i];
+        if i < executable {
+            assert_eq!(cases[(word & 0xff) as usize], op[0] & 0xff);
+            assert_eq!(word >> 8, op[0] >> 8);
+        } else {
+            assert_eq!(word, op[0]);
+        }
+        assert_eq!(&words[4 * i + 1..4 * i + 4], &op[1..]);
+    }
 }
 
 pub(crate) fn traced_gates() -> Vec<crate::gates::gate::GateRef<F, 2>> {

@@ -50,10 +50,12 @@ const OP_LITERAL: u32 = 3;
 const OP_ADD: u32 = 4;
 const OP_SUB: u32 = 5;
 const OP_MUL: u32 = 6;
-/// `filter = regs[y]`.
+/// `filter = regs[y]; term = z`: starts a gate, whose constraints are
+/// weighted by consecutive alpha powers from `z`.
 const OP_FILTER: u32 = 7;
-/// `h[c] += regs[y] * alpha_c^z` for every challenge `c`: a constraint,
-/// weighted, added to the gate's accumulators.
+/// `h[c] += regs[y] * alpha_c^term` for every challenge `c`, then
+/// `term += 1`: a constraint, weighted, added to the gate's accumulators.
+/// `z` records the term for the host, which checks it against the counter.
 const OP_WEIGHTED: u32 = 8;
 /// `acc[c] += h[c] * filter` for every challenge `c`, ending a gate.
 const OP_FINISH: u32 = 12;
@@ -88,6 +90,51 @@ const OP_MULRSUB: u32 = 19;
 const OP_MDSP: u32 = 20;
 /// Ends the program; the constant blocks of the packed MDS ops follow.
 const OP_END: u32 = 21;
+/// Weighted forms of the arithmetic ops: the value is not stored but folded
+/// into the gate's accumulators like `OP_WEIGHTED`, with the term counter.
+/// A constraint computed by one of these ops and used nowhere else takes
+/// one op instead of two.
+const OP_ADDW: u32 = 22;
+const OP_SUBW: u32 = 23;
+const OP_MULW: u32 = 24;
+const OP_MULADDW: u32 = 25;
+const OP_MULSUBW: u32 = 26;
+const OP_MULRSUBW: u32 = 27;
+
+/// The weighted form of an arithmetic op, if it has one.
+fn weighted_form(base: u32) -> Option<u32> {
+    Some(match base {
+        OP_ADD => OP_ADDW,
+        OP_SUB => OP_SUBW,
+        OP_MUL => OP_MULW,
+        OP_MULADD => OP_MULADDW,
+        OP_MULSUB => OP_MULSUBW,
+        OP_MULRSUB => OP_MULRSUBW,
+        _ => return None,
+    })
+}
+
+/// Whether an op writes `dst` (one register) rather than nothing or a block.
+fn writes_register(base: u32) -> bool {
+    matches!(
+        base,
+        OP_WIRE
+            | OP_CONSTANT
+            | OP_PUBLIC_INPUT
+            | OP_LITERAL
+            | OP_ADD
+            | OP_SUB
+            | OP_MUL
+            | OP_MULC
+            | OP_ADDC
+            | OP_MULADD
+            | OP_MULSUB
+            | OP_MULRSUB
+            | OP_MOV
+            | OP_SQUARE
+            | OP_SBOX
+    )
+}
 
 // The opcode byte is the base op in bits 0..5 and, in bits 5..8, one bit per
 // operand slot (y, z, w) that names a wire column instead of a register:
@@ -101,8 +148,8 @@ pub(crate) const BASE_MASK: u32 = (1 << 5) - 1;
 /// Operand slots of a base op that hold a register or a wire.
 pub(crate) fn arity(base: u32) -> usize {
     match base {
-        OP_ADD | OP_SUB | OP_MUL => 2,
-        OP_MULADD | OP_MULSUB | OP_MULRSUB => 3,
+        OP_ADD | OP_SUB | OP_MUL | OP_ADDW | OP_SUBW | OP_MULW => 2,
+        OP_MULADD | OP_MULSUB | OP_MULRSUB | OP_MULADDW | OP_MULSUBW | OP_MULRSUBW => 3,
         OP_FILTER | OP_WEIGHTED | OP_MULC | OP_ADDC | OP_MOV | OP_SQUARE | OP_SBOX => 1,
         _ => 0,
     }
@@ -149,9 +196,50 @@ impl MdsTables {
     }
 }
 
-/// The words of a program buffer.
-pub(crate) fn program_words(ops: &[[u32; 4]]) -> Vec<u32> {
-    ops.iter().flatten().copied().collect()
+/// The opcode bytes a program uses, most frequent first (ties by value): the
+/// device program replaces each by its index in this list, and the kernel's
+/// switch has one case per entry. Low case values are reached faster, and
+/// the unused cases are not compiled.
+pub(crate) fn case_list(ops: &[[u32; 4]]) -> Vec<u32> {
+    let mut counts = [0u32; 256];
+    for op in ops.iter().take_while(|op| op[0] & BASE_MASK != OP_END) {
+        counts[(op[0] & 0xff) as usize] += 1;
+    }
+    let mut cases = (0..256u32)
+        .filter(|&key| counts[key as usize] > 0)
+        .collect::<Vec<_>>();
+    cases.sort_by_key(|&key| (core::cmp::Reverse(counts[key as usize]), key));
+    cases
+}
+
+/// The words of a program buffer: the executable ops with their opcode bytes
+/// replaced by their index in `cases`, then the end marker and the constant
+/// blocks unchanged.
+pub(crate) fn program_words(ops: &[[u32; 4]], cases: &[u32]) -> Vec<u32> {
+    let mut index = [u32::MAX; 256];
+    for (i, &key) in cases.iter().enumerate() {
+        index[key as usize] = i as u32;
+    }
+    let executable = ops
+        .iter()
+        .take_while(|op| op[0] & BASE_MASK != OP_END)
+        .count();
+    ops.iter()
+        .enumerate()
+        .flat_map(|(i, op)| {
+            let mut op = *op;
+            if i < executable {
+                let code = index[(op[0] & 0xff) as usize];
+                assert!(
+                    code != u32::MAX,
+                    "opcode {:#x} not in the case list",
+                    op[0] & 0xff
+                );
+                op[0] = (op[0] & !0xff) | code;
+            }
+            op
+        })
+        .collect()
 }
 
 /// Prepends the loads of the literals into registers `peak..` and points
@@ -180,6 +268,8 @@ fn finish_program(
         .map(|(i, &c)| op(OP_LITERAL, peak + i as u32, c as u32, (c >> 32) as u32, 0));
     ops.splice(0..0, preload);
     let num_ops = ops.len() as u32;
+    let registers = peak + literals.table.len() as u32;
+    let registers = reallocate_registers(ops, registers).unwrap_or(registers);
     let table_base = num_ops + 1;
     for o in ops.iter_mut() {
         if o[0] & BASE_MASK == OP_MDSP {
@@ -201,7 +291,187 @@ fn finish_program(
             ]);
         }
     }
-    Ok((peak + literals.table.len() as u32, num_ops))
+    Ok((registers, num_ops))
+}
+
+/// The register operands of an op in slot order (`None` for a wire operand)
+/// and the registers it writes.
+fn op_registers(op: &[u32; 4]) -> (Vec<Option<u32>>, Vec<u32>) {
+    let base = op[0] & BASE_MASK;
+    let wires = (op[0] & 0xff) >> 5;
+    let dst = op[0] >> 8;
+    let packed = |n: usize, wire_mask: u32| -> Vec<Option<u32>> {
+        (0..n)
+            .map(|i| {
+                let index = ([op[1], op[2], op[3]][i / 4] >> (8 * (i % 4))) & 0xff;
+                (wire_mask >> i & 1 == 0).then_some(index)
+            })
+            .collect()
+    };
+    match base {
+        OP_QMUL => (
+            packed(10, op[0] >> 16),
+            (0..5).map(|k| (dst & 0xff) + k).collect(),
+        ),
+        OP_MDSP => (packed(12, 0), (0..12).map(|k| (dst & 0xff) + k).collect()),
+        OP_MDS => (
+            (0..12).map(|k| Some(op[1] + k)).collect(),
+            (0..12).map(|k| op[1] + k).collect(),
+        ),
+        _ => {
+            let reads = (0..arity(base))
+                .map(|slot| (wires >> slot & 1 == 0).then_some(op[1 + slot]))
+                .collect();
+            let writes = if writes_register(base) {
+                vec![dst]
+            } else {
+                vec![]
+            };
+            (reads, writes)
+        }
+    }
+}
+
+/// Reassigns the registers of the executable ops (the program before its
+/// end marker) by a linear scan in program order, each value taking the
+/// lowest free register at its definition and freeing it at its last use,
+/// blocks (quintic products, packed MDS layers) taking the lowest free run.
+/// The gates' allocations reuse few registers each but start from the same
+/// base, and the literals hold registers for the whole program; the scan
+/// touches fewer distinct registers. Returns the new register count, or
+/// `None` to keep the original allocation (in-place MDS layers, whose block
+/// must stay where its inputs are, or a scan that does not fit the packed
+/// encodings or beats the original count).
+fn reallocate_registers(ops: &mut [[u32; 4]], registers: u32) -> Option<u32> {
+    let end = ops
+        .iter()
+        .position(|op| op[0] & BASE_MASK == OP_END)
+        .unwrap_or(ops.len());
+    let ops = &mut ops[..end];
+    if ops.iter().any(|op| op[0] & BASE_MASK == OP_MDS) {
+        return None;
+    }
+    // Values: each write defines one; a read of a register never written
+    // reads the zero the kernel initializes registers to.
+    let mut current: Vec<Option<usize>> = vec![None; registers as usize];
+    let mut last_use: Vec<usize> = Vec::new();
+    let mut zero_value: Vec<bool> = Vec::new();
+    let mut reads: Vec<Vec<Option<usize>>> = Vec::with_capacity(ops.len());
+    let mut writes: Vec<Vec<usize>> = Vec::with_capacity(ops.len());
+    for (i, op) in ops.iter().enumerate() {
+        let (op_reads, op_writes) = op_registers(op);
+        let mut values = Vec::with_capacity(op_reads.len());
+        for read in op_reads {
+            values.push(read.map(|r| {
+                let r = r as usize;
+                if r >= current.len() {
+                    current.resize(r + 1, None);
+                }
+                let value = *current[r].get_or_insert_with(|| {
+                    last_use.push(i);
+                    zero_value.push(true);
+                    last_use.len() - 1
+                });
+                last_use[value] = i;
+                value
+            }));
+        }
+        reads.push(values);
+        let mut defined = Vec::with_capacity(op_writes.len());
+        for w in op_writes {
+            let w = w as usize;
+            if w >= current.len() {
+                current.resize(w + 1, None);
+            }
+            last_use.push(i);
+            zero_value.push(false);
+            let value = last_use.len() - 1;
+            current[w] = Some(value);
+            defined.push(value);
+        }
+        writes.push(defined);
+    }
+    // The scan.
+    let mut physical = vec![u32::MAX; last_use.len()];
+    let mut free: Vec<bool> = vec![true; registers as usize];
+    let mut peak = 0u32;
+    let lowest_run = |free: &[bool], len: usize| -> Option<usize> {
+        (0..free.len().saturating_sub(len - 1)).find(|&s| free[s..s + len].iter().all(|&f| f))
+    };
+    for i in 0..ops.len() {
+        for value in reads[i].iter().flatten() {
+            if physical[*value] == u32::MAX {
+                // A never-written register: reserved for the whole program.
+                assert!(zero_value[*value]);
+                let r = lowest_run(&free, 1)?;
+                free[r] = false;
+                physical[*value] = r as u32;
+                peak = peak.max(r as u32 + 1);
+            }
+        }
+        for value in reads[i].iter().flatten() {
+            if last_use[*value] == i && !zero_value[*value] {
+                free[physical[*value] as usize] = true;
+            }
+        }
+        let run = writes[i].len();
+        if run > 0 {
+            let start = lowest_run(&free, run)?;
+            for (k, &value) in writes[i].iter().enumerate() {
+                free[start + k] = false;
+                physical[value] = (start + k) as u32;
+            }
+            peak = peak.max((start + run) as u32);
+            for &value in &writes[i] {
+                if last_use[value] == i {
+                    free[physical[value] as usize] = true;
+                }
+            }
+        }
+    }
+    if peak > registers {
+        return None;
+    }
+    // Rewrite the operands.
+    for (i, op) in ops.iter_mut().enumerate() {
+        let base = op[0] & BASE_MASK;
+        let read = |slot: usize| physical[reads[i][slot].unwrap()];
+        match base {
+            OP_QMUL | OP_MDSP => {
+                let n = if base == OP_QMUL { 10 } else { 12 };
+                let mut words = [0u32; 3];
+                for slot in 0..n {
+                    let index = match reads[i][slot] {
+                        Some(_) => read(slot),
+                        None => ([op[1], op[2], op[3]][slot / 4] >> (8 * (slot % 4))) & 0xff,
+                    };
+                    if index >= 256 {
+                        return None;
+                    }
+                    words[slot / 4] |= index << (8 * (slot % 4));
+                }
+                let block = physical[writes[i][0]];
+                if block >= 256 {
+                    return None;
+                }
+                op[0] = (op[0] & !0xff00) | (block << 8);
+                op[1] = words[0];
+                op[2] = words[1];
+                op[3] = words[2];
+            }
+            _ => {
+                for slot in 0..arity(base) {
+                    if reads[i][slot].is_some() {
+                        op[1 + slot] = read(slot);
+                    }
+                }
+                if writes_register(base) {
+                    op[0] = (op[0] & 0xff) | (physical[writes[i][0]] << 8);
+                }
+            }
+        }
+    }
+    Some(peak.max(1))
 }
 
 fn op(code: u32, dst: u32, y: u32, z: u32, w: u32) -> [u32; 4] {
@@ -222,6 +492,8 @@ pub struct QuotientProgram {
     pub registers: u32,
     /// Whether the finished bytecode needs the quintic interpreter case.
     pub uses_qmul: bool,
+    /// The opcodes the program uses, in the device program's numbering.
+    pub cases: Vec<u32>,
     /// The ops as uploaded, for dumps and experiments.
     #[cfg(feature = "gpu-profiling")]
     pub host_ops: Vec<[u32; 4]>,
@@ -384,17 +656,24 @@ fn append_gate<F: RichField + Field64>(
     filter_factors: &[u64],
     weight_offset: u32,
 ) -> Option<u32> {
-    // Filter: product of (factor - selector) over the given factors, in registers 0..3.
+    // Filter: product of (factor - selector) over the given factors, in
+    // registers 0..3. The filter op also starts the gate's term counter.
     ops.push(op(OP_CONSTANT, 0, selector_index, 0, 0));
     match filter_factors {
-        [] => ops.push(op(OP_FILTER, 0, SRC_LITERAL | literals.intern(1), 0, 0)),
+        [] => ops.push(op(
+            OP_FILTER,
+            0,
+            SRC_LITERAL | literals.intern(1),
+            weight_offset,
+            0,
+        )),
         [first, rest @ ..] => {
             ops.push(op(OP_SUB, 1, SRC_LITERAL | literals.intern(*first), 0, 0));
             for &factor in rest {
                 ops.push(op(OP_SUB, 2, SRC_LITERAL | literals.intern(factor), 0, 0));
                 ops.push(op(OP_MUL, 1, 1, 2, 0));
             }
-            ops.push(op(OP_FILTER, 0, 1, 0, 0));
+            ops.push(op(OP_FILTER, 0, 1, weight_offset, 0));
         }
     }
 
@@ -611,9 +890,13 @@ fn append_gate<F: RichField + Field64>(
 
     let mut register = vec![u32::MAX; nodes.len()];
     let mut regs = Registers::new(3);
+    let mut emitted = 0;
     for (pos, event) in events.iter().enumerate() {
         let id = match *event {
             Event::Emit(k) => {
+                // The kernel weights the constraints by consecutive terms.
+                assert_eq!(k, emitted, "constraints emitted out of order");
+                emitted += 1;
                 let id = trace.constraints[k as usize];
                 let weight = weight_offset + k;
                 if is_leaf(&nodes[id as usize]) {
@@ -623,8 +906,22 @@ fn append_gate<F: RichField + Field64>(
                 } else {
                     let r = register[id as usize];
                     assert!(r != u32::MAX, "constraint not yet computed");
-                    ops.push(op(OP_WEIGHTED, 0, r, weight, 0));
-                    if last_use[id as usize] == pos {
+                    let dead = last_use[id as usize] == pos;
+                    // A constraint computed by the previous op and used
+                    // nowhere else is weighted by that op itself.
+                    let producer = ops.last().and_then(|last| {
+                        (dead && last[0] >> 8 == r)
+                            .then(|| weighted_form(last[0] & BASE_MASK))
+                            .flatten()
+                    });
+                    match producer {
+                        Some(fused) => {
+                            let last = ops.last_mut().unwrap();
+                            last[0] = (last[0] & 0xe0) | fused;
+                        }
+                        None => ops.push(op(OP_WEIGHTED, 0, r, weight, 0)),
+                    }
+                    if dead {
                         regs.release(r);
                         register[id as usize] = u32::MAX;
                     }
@@ -1048,6 +1345,7 @@ pub(crate) fn run_program_host<F: RichField>(
     let mut acc = vec![F::ZERO; alphas.len()];
     let mut h = vec![F::ZERO; alphas.len()];
     let mut filter = F::ONE;
+    let mut term = 0u32;
     for op in ops {
         let code = op[0] & BASE_MASK;
         let wires_mask = (op[0] & 0xff) >> 5;
@@ -1073,12 +1371,25 @@ pub(crate) fn run_program_host<F: RichField>(
             OP_FILTER => {
                 filter = src(0, y, &regs);
                 h.iter_mut().for_each(|h| *h = F::ZERO);
+                term = z;
             }
-            OP_WEIGHTED => {
-                let value = src(0, y, &regs);
+            OP_WEIGHTED | OP_ADDW | OP_SUBW | OP_MULW | OP_MULADDW | OP_MULSUBW | OP_MULRSUBW => {
+                let value = match code {
+                    OP_WEIGHTED => {
+                        assert_eq!(z, term, "weighted op out of term order");
+                        src(0, y, &regs)
+                    }
+                    OP_ADDW => src(0, y, &regs) + src(1, z, &regs),
+                    OP_SUBW => src(0, y, &regs) - src(1, z, &regs),
+                    OP_MULW => src(0, y, &regs) * src(1, z, &regs),
+                    OP_MULADDW => src(0, y, &regs) * src(1, z, &regs) + src(2, w, &regs),
+                    OP_MULSUBW => src(2, w, &regs) - src(0, y, &regs) * src(1, z, &regs),
+                    _ => src(0, y, &regs) * src(1, z, &regs) - src(2, w, &regs),
+                };
                 for (h, &alpha) in h.iter_mut().zip(alphas) {
-                    *h += value * alpha.exp_u64(z as u64);
+                    *h += value * alpha.exp_u64(term as u64);
                 }
+                term += 1;
             }
             OP_MULC => regs[dst] = src(0, y, &regs) * F::from_canonical_u64(z as u64),
             OP_ADDC => regs[dst] = src(0, y, &regs) + lit(z, w),
@@ -1149,6 +1460,8 @@ pub(crate) struct HostProgram {
     pub num_ops: u32,
     pub registers: u32,
     pub uses_qmul: bool,
+    /// The opcodes used, most frequent first ([`case_list`]).
+    pub cases: Vec<u32>,
 }
 
 #[derive(Debug)]
@@ -1216,13 +1529,16 @@ fn compile_attempt<F: RichField + Field64>(
     if registers > MAX_REGISTERS {
         return Err(CompileError::UnsupportedLimits);
     }
+    let cases = case_list(&ops);
     log::debug!(
-        "plonky2 gpu: quotient registers: {working} working, {} literals; {} round constant blocks",
+        "plonky2 gpu: quotient registers: {working} working, {} literals, {registers} after reallocation; {} round constant blocks; {} opcodes",
         literals.table.len(),
-        tables.blocks.len()
+        tables.blocks.len(),
+        cases.len()
     );
     Ok(HostProgram {
         uses_qmul: uses_qmul(&ops),
+        cases,
         ops,
         num_ops,
         registers: registers.next_power_of_two().max(32),
@@ -1285,8 +1601,9 @@ fn build_program<F: RichField + Extendable<D>, const D: usize>(
         num_ops,
         registers,
         uses_qmul,
+        cases,
     } = compile_program(&gates, weight_offset, num_challenges)?;
-    let bytes = program_words(&ops)
+    let bytes = program_words(&ops, &cases)
         .iter()
         .flat_map(|w| w.to_le_bytes())
         .collect::<Vec<_>>();
@@ -1302,6 +1619,7 @@ fn build_program<F: RichField + Extendable<D>, const D: usize>(
         num_ops,
         registers,
         uses_qmul,
+        cases,
         #[cfg(feature = "gpu-profiling")]
         host_ops: ops,
     })
@@ -1319,8 +1637,8 @@ fn shader_identity(source: &str) -> (String, String) {
     )
 }
 
-const QUINTIC_CASE: &str = r#"
-            case 17u: {
+/// The body of the quintic product case.
+const QUINTIC_BODY: &str = r#"
                 let d = dst & 0xffu;
                 let mask = op.x >> 16u;
                 var v: array<Field, 10>;
@@ -1338,7 +1656,32 @@ const QUINTIC_CASE: &str = r#"
                     array<Field, 5>(v[0], v[1], v[2], v[3], v[4]),
                     array<Field, 5>(v[5], v[6], v[7], v[8], v[9]));
                 for (var k = 0u; k < 5u; k++) { regs[d + k] = q[k]; }
-            }
+"#;
+
+/// The body of the in-place MDS layer case.
+const MDS_BODY: &str = r#"
+                let m = mds12(array<Field, 12>(
+                    regs[op.y], regs[op.y + 1u], regs[op.y + 2u], regs[op.y + 3u],
+                    regs[op.y + 4u], regs[op.y + 5u], regs[op.y + 6u], regs[op.y + 7u],
+                    regs[op.y + 8u], regs[op.y + 9u], regs[op.y + 10u], regs[op.y + 11u]));
+                for (var k = 0u; k < 12u; k++) { regs[op.y + k] = m[k]; }
+"#;
+
+/// The body of the packed MDS layer case: twelve input registers as the
+/// bytes of y, z and w; the outputs plus the round constants after the
+/// program go into the block in the second byte of x.
+const MDSP_BODY: &str = r#"
+                let m = mds12(array<Field, 12>(
+                    regs[op.y & 0xffu], regs[(op.y >> 8u) & 0xffu], regs[(op.y >> 16u) & 0xffu], regs[op.y >> 24u],
+                    regs[op.z & 0xffu], regs[(op.z >> 8u) & 0xffu], regs[(op.z >> 16u) & 0xffu], regs[op.z >> 24u],
+                    regs[op.w & 0xffu], regs[(op.w >> 8u) & 0xffu], regs[(op.w >> 16u) & 0xffu], regs[op.w >> 24u]));
+                let block = dst & 0xffu;
+                let table = op.x >> 16u;
+                for (var j = 0u; j < 6u; j++) {
+                    let c = ops[table + j];
+                    regs[block + 2u * j] = add_const(m[2u * j], Field(c.x, c.y));
+                    regs[block + 2u * j + 1u] = add_const(m[2u * j + 1u], Field(c.z, c.w));
+                }
 "#;
 
 const QUOTIENT_KERNEL: &str = r#"
@@ -1445,41 +1788,13 @@ fn quotient(@builtin(global_invocation_id) id: vec3<u32>) {
     var regs: array<Field, NREGS>;
     var gate_filter = Field(1u, 0u);
     var h: array<Field, NC>;
+    // The alpha power of the next constraint.
+    var term = 0u;
     for (var p = 0u; p < qp.num_ops; p++) {
         let op = ops[p];
         let dst = op.x >> 8u;
+        // One case per opcode the program uses, numbered by frequency.
         switch (op.x & 0xffu) {
-            case 0u: { regs[dst] = wire(row, op.y); }
-            case 1u: { regs[dst] = constant(row, op.y); }
-            case 2u: { regs[dst] = chal[PIH_OFFSET + op.y]; }
-            case 3u: { regs[dst] = Field(op.y, op.z); }
-            case 12u: {
-                for (var d = 0u; d < NC; d++) { acc[d] = mul_add(acc[d], h[d], gate_filter); }
-            }
-            case 13u: {
-                let m = mds12(array<Field, 12>(
-                    regs[op.y], regs[op.y + 1u], regs[op.y + 2u], regs[op.y + 3u],
-                    regs[op.y + 4u], regs[op.y + 5u], regs[op.y + 6u], regs[op.y + 7u],
-                    regs[op.y + 8u], regs[op.y + 9u], regs[op.y + 10u], regs[op.y + 11u]));
-                for (var k = 0u; k < 12u; k++) { regs[op.y + k] = m[k]; }
-            }
-            case 20u: {
-                // Twelve input registers as the bytes of y, z and w; the
-                // outputs plus the round constants after the program go
-                // into the block in the second byte of x.
-                let m = mds12(array<Field, 12>(
-                    regs[op.y & 0xffu], regs[(op.y >> 8u) & 0xffu], regs[(op.y >> 16u) & 0xffu], regs[op.y >> 24u],
-                    regs[op.z & 0xffu], regs[(op.z >> 8u) & 0xffu], regs[(op.z >> 16u) & 0xffu], regs[op.z >> 24u],
-                    regs[op.w & 0xffu], regs[(op.w >> 8u) & 0xffu], regs[(op.w >> 16u) & 0xffu], regs[op.w >> 24u]));
-                let block = dst & 0xffu;
-                let table = op.x >> 16u;
-                for (var j = 0u; j < 6u; j++) {
-                    let c = ops[table + j];
-                    regs[block + 2u * j] = add_const(m[2u * j], Field(c.x, c.y));
-                    regs[block + 2u * j + 1u] = add_const(m[2u * j + 1u], Field(c.z, c.w));
-                }
-            }
-            // QMUL_CASE
             // CASES
             default: {}
         }
@@ -1491,36 +1806,19 @@ fn quotient(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
-/// The interpreter's WGSL for a register count and a number of challenges.
-pub fn kernel_source(
-    flavor: shader::Flavor,
-    registers: u32,
-    num_challenges: u32,
-    uses_qmul: bool,
-) -> String {
-    let mut out = shader::prelude_with_mds(flavor);
-    if uses_qmul {
-        out.push_str(shader::QMUL);
-    }
-    out.push_str(&format!(
-        "const NC: u32 = {num_challenges}u;\nconst NREGS: u32 = {registers}u;\nconst PIH_OFFSET: u32 = {}u;\n",
-        2 * num_challenges
-    ));
-    let kernel = QUOTIENT_KERNEL
-        .replace("            // CASES\n", &interpreter_cases())
-        .replace(
-            "            // QMUL_CASE\n",
-            if uses_qmul { QUINTIC_CASE } else { "" },
-        );
-    out.push_str(&kernel);
-    out
-}
-
-/// The switch cases of the ops with register or wire operands, one per
-/// base op and wire-bit combination.
-fn interpreter_cases() -> String {
-    use std::fmt::Write;
-    let mut out = String::new();
+/// Every opcode the kernel can interpret, for shader tests and dumps.
+#[cfg(test)]
+pub(crate) fn every_case() -> Vec<u32> {
+    let mut cases = vec![
+        OP_WIRE,
+        OP_CONSTANT,
+        OP_PUBLIC_INPUT,
+        OP_LITERAL,
+        OP_FINISH,
+        OP_MDS,
+        OP_QMUL,
+        OP_MDSP,
+    ];
     for base in [
         OP_ADD,
         OP_SUB,
@@ -1535,38 +1833,103 @@ fn interpreter_cases() -> String {
         OP_MOV,
         OP_SQUARE,
         OP_SBOX,
+        OP_ADDW,
+        OP_SUBW,
+        OP_MULW,
+        OP_MULADDW,
+        OP_MULSUBW,
+        OP_MULRSUBW,
     ] {
         for mask in 0..1u32 << arity(base) {
-            let operand = |slot: u32, word: &str| {
-                if mask >> slot & 1 != 0 {
-                    format!("wire(row, op.{word})")
-                } else {
-                    format!("regs[op.{word}]")
-                }
-            };
-            let (y, z, w) = (operand(0, "y"), operand(1, "z"), operand(2, "w"));
-            let body = match base {
-                OP_ADD => format!("regs[dst] = add_field({y}, {z});"),
-                OP_SUB => format!("regs[dst] = sub_field({y}, {z});"),
-                OP_MUL => format!("regs[dst] = mul_field({y}, {z});"),
-                OP_FILTER => {
-                    format!("gate_filter = {y}; for (var d = 0u; d < NC; d++) {{ h[d] = Field(0u, 0u); }}")
-                }
-                OP_WEIGHTED => format!(
-                    "let v = {y}; for (var d = 0u; d < NC; d++) {{ h[d] = mul_add(h[d], v, alpha_pow(d, op.z)); }}"
-                ),
-                OP_MULC => format!("regs[dst] = mul_small({y}, op.z);"),
-                OP_ADDC => format!("regs[dst] = add_const({y}, Field(op.z, op.w));"),
-                OP_MULADD => format!("regs[dst] = mul_add({w}, {y}, {z});"),
-                OP_MULSUB => format!("regs[dst] = mul_sub({w}, {y}, {z});"),
-                OP_MULRSUB => format!("regs[dst] = mul_rsub({w}, {y}, {z});"),
-                OP_MOV => format!("regs[dst] = {y};"),
-                OP_SQUARE => format!("regs[dst] = square_field({y});"),
-                OP_SBOX => format!("regs[dst] = sbox({y});"),
-                _ => unreachable!(),
-            };
-            writeln!(out, "            case {}u: {{ {body} }}", base | mask << 5).unwrap();
+            cases.push(base | mask << 5);
         }
+    }
+    cases
+}
+
+/// Whether a case list includes the quintic product op.
+pub(crate) fn cases_use_qmul(cases: &[u32]) -> bool {
+    cases.iter().any(|&key| key & BASE_MASK == OP_QMUL)
+}
+
+/// The interpreter's WGSL for a register count, a number of challenges and
+/// the opcodes of a program (see [`case_list`]).
+pub fn kernel_source(
+    flavor: shader::Flavor,
+    registers: u32,
+    num_challenges: u32,
+    cases: &[u32],
+) -> String {
+    let mut out = shader::prelude_with_mds(flavor);
+    if cases_use_qmul(cases) {
+        out.push_str(shader::QMUL);
+    }
+    out.push_str(&format!(
+        "const NC: u32 = {num_challenges}u;\nconst NREGS: u32 = {registers}u;\nconst PIH_OFFSET: u32 = {}u;\n",
+        2 * num_challenges
+    ));
+    let kernel = QUOTIENT_KERNEL.replace("            // CASES\n", &interpreter_cases(cases));
+    out.push_str(&kernel);
+    out
+}
+
+/// The switch cases of a program's opcodes, case `i` for the `i`th entry.
+fn interpreter_cases(cases: &[u32]) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    for (i, &key) in cases.iter().enumerate() {
+        let base = key & BASE_MASK;
+        let mask = key >> 5;
+        let operand = |slot: u32, word: &str| {
+            if mask >> slot & 1 != 0 {
+                format!("wire(row, op.{word})")
+            } else {
+                format!("regs[op.{word}]")
+            }
+        };
+        let (y, z, w) = (operand(0, "y"), operand(1, "z"), operand(2, "w"));
+        // Folds `v` into the gate's accumulators as the next term.
+        let weight = "for (var d = 0u; d < NC; d++) { h[d] = mul_add(h[d], v, alpha_pow(d, term)); } term++;";
+        let body = match base {
+            OP_WIRE => "regs[dst] = wire(row, op.y);".to_owned(),
+            OP_CONSTANT => "regs[dst] = constant(row, op.y);".to_owned(),
+            OP_PUBLIC_INPUT => "regs[dst] = chal[PIH_OFFSET + op.y];".to_owned(),
+            OP_LITERAL => "regs[dst] = Field(op.y, op.z);".to_owned(),
+            OP_FINISH => {
+                "for (var d = 0u; d < NC; d++) { acc[d] = mul_add(acc[d], h[d], gate_filter); }"
+                    .to_owned()
+            }
+            OP_MDS => MDS_BODY.to_owned(),
+            OP_MDSP => MDSP_BODY.to_owned(),
+            OP_QMUL => QUINTIC_BODY.to_owned(),
+            OP_ADD => format!("regs[dst] = add_field({y}, {z});"),
+            OP_SUB => format!("regs[dst] = sub_field({y}, {z});"),
+            OP_MUL => format!("regs[dst] = mul_field({y}, {z});"),
+            OP_FILTER => format!(
+                "gate_filter = {y}; term = op.z; for (var d = 0u; d < NC; d++) {{ h[d] = Field(0u, 0u); }}"
+            ),
+            OP_WEIGHTED => format!("let v = {y}; {weight}"),
+            OP_MULC => format!("regs[dst] = mul_small({y}, op.z);"),
+            OP_ADDC => format!("regs[dst] = add_const({y}, Field(op.z, op.w));"),
+            OP_MULADD => format!("regs[dst] = mul_add({w}, {y}, {z});"),
+            OP_MULSUB => format!("regs[dst] = mul_sub({w}, {y}, {z});"),
+            OP_MULRSUB => format!("regs[dst] = mul_rsub({w}, {y}, {z});"),
+            OP_MOV => format!("regs[dst] = {y};"),
+            OP_SQUARE => format!("regs[dst] = square_field({y});"),
+            OP_SBOX => format!("regs[dst] = sbox({y});"),
+            OP_ADDW => format!("let v = add_field({y}, {z}); {weight}"),
+            OP_SUBW => format!("let v = sub_field({y}, {z}); {weight}"),
+            OP_MULW => format!("let v = mul_field({y}, {z}); {weight}"),
+            OP_MULADDW => format!("let v = mul_add({w}, {y}, {z}); {weight}"),
+            OP_MULSUBW => format!("let v = mul_sub({w}, {y}, {z}); {weight}"),
+            OP_MULRSUBW => format!("let v = mul_rsub({w}, {y}, {z}); {weight}"),
+            _ => unreachable!("opcode {key:#x} has no case"),
+        };
+        assert!(
+            mask < 1 << arity(base),
+            "opcode {key:#x} has operand bits beyond its arity"
+        );
+        writeln!(out, "            case {i}u: {{ {body} }}").unwrap();
     }
     out
 }
@@ -1579,10 +1942,10 @@ pub(crate) fn kernel_source_with_program(
     flavor: shader::Flavor,
     registers: u32,
     num_challenges: u32,
-    uses_qmul: bool,
+    cases: &[u32],
     program: Option<&str>,
 ) -> String {
-    let kernel = kernel_source(flavor, registers, num_challenges, uses_qmul);
+    let kernel = kernel_source(flavor, registers, num_challenges, cases);
     let Some(program) = program else {
         return kernel;
     };
@@ -1617,16 +1980,16 @@ impl GpuContext {
     }
 
     /// The interpreter specialized to the program's register count, challenge
-    /// count and use of quintic instructions.
+    /// count and opcodes.
     pub(crate) fn quotient_kernel(
         &self,
         registers: u32,
         num_challenges: u32,
-        uses_qmul: bool,
+        cases: &[u32],
     ) -> Arc<QuotientKernel> {
         self.quotient_kernels
-            .get_or_init((registers, num_challenges, uses_qmul), || {
-                let source = kernel_source(self.flavor, registers, num_challenges, uses_qmul);
+            .get_or_init((registers, num_challenges, cases.to_vec()), || {
+                let source = kernel_source(self.flavor, registers, num_challenges, cases);
                 #[cfg(feature = "gpu-profiling")]
                 let (source, entry) = shader_identity(&source);
                 #[cfg(not(feature = "gpu-profiling"))]
@@ -2001,7 +2364,7 @@ pub(crate) fn try_compute_quotient<
     let n = 1usize << log_n;
     let n_lde = 1usize << (degree_bits + rate_bits);
     let num_challenges = common_data.config.num_challenges;
-    let kernel = ctx.quotient_kernel(program.registers, num_challenges as u32, program.uses_qmul);
+    let kernel = ctx.quotient_kernel(program.registers, num_challenges as u32, &program.cases);
 
     let num_routed_wires = common_data.config.num_routed_wires;
     let step = 1 << (rate_bits - quotient_degree_bits);

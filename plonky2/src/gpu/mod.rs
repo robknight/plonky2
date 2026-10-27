@@ -435,8 +435,8 @@ pub struct GpuContext {
     shift_pows: cache::GpuCache<(u64, u32), DeviceBuffer>,
     /// Quotient programs by circuit key (`None` when a circuit cannot be traced).
     quotient_programs: cache::GpuCache<u64, Option<Arc<quotient::QuotientProgram>>>,
-    /// Quotient kernels by register count, challenge count and quintic usage.
-    quotient_kernels: cache::GpuCache<(u32, u32, bool), Arc<quotient::QuotientKernel>>,
+    /// Quotient kernels by register count, challenge count and opcode list.
+    quotient_kernels: cache::GpuCache<(u32, u32, Vec<u32>), Arc<quotient::QuotientKernel>>,
     row_tables: cache::GpuCache<(u32, u32), DeviceBuffer>,
     /// The whole-proof pass timeline (`PLONKY2_GPU_PASS_TIMELINE=1`).
     #[cfg(feature = "gpu-profiling")]

@@ -161,7 +161,7 @@ fn bench_merkle_query_readback() {
 #[ignore]
 fn dump_hash_msl() {
     let source = match std::env::var("PLONKY2_GPU_MSL_MODULE").as_deref() {
-        Ok("quotient") => quotient::kernel_source(Flavor::Native, 64, 2, true),
+        Ok("quotient") => quotient::kernel_source(Flavor::Native, 64, 2, &quotient::every_case()),
         _ => shader::hash_module(Flavor::Native),
     };
     let module = naga::front::wgsl::parse_str(&source)
@@ -306,7 +306,23 @@ fn bench_fft_passes() {
         inverse: false,
         shift_out: None,
     };
-    let plan = shader::fft_plan(log_n);
+    // PLONKY2_GPU_BENCH_FFT_PLAN="s0,stages,low_bits;..." times another
+    // stage plan (each group's tile must fit the kernel's workgroup array).
+    let plan = match std::env::var("PLONKY2_GPU_BENCH_FFT_PLAN") {
+        Ok(text) => text
+            .split(';')
+            .map(|group| {
+                let v = group
+                    .split(',')
+                    .map(|x| x.trim().parse::<u32>().expect("plan group"))
+                    .collect::<Vec<_>>();
+                assert!(v[1] + v[2] <= shader::FFT_TILE_BITS);
+                (v[0], v[1], v[2])
+            })
+            .collect::<Vec<_>>(),
+        Err(_) => shader::fft_plan(log_n),
+    };
+    assert_eq!(plan.iter().map(|g| g.1).sum::<u32>(), log_n);
     eprintln!("plan {plan:?} (s0, stages, low_bits); {columns} columns, n = 2^{log_n}");
     let time = |label: &str, record: &dyn Fn(&mut wgpu::CommandEncoder)| {
         let mut best = f64::MAX;
@@ -537,6 +553,58 @@ fn bench_int_throughput() {
     kernel("bench_add_wrap", &|k, j| {
         format!("{{ let p = add_wrap(Field(a{k}, a{j}), Field(a{j}, a{k})); a{k} = p.x ^ p.y; }}")
     });
+    // Float chains beside integer chains. A mixed kernel whose rate is the sum
+    // of the two kinds alone shows the GPU issuing them concurrently; a rate
+    // between them shows a shared pipeline. The float values stay in
+    // (0.11, 0.89): x * y + 0.1 maps that interval into itself.
+    let mut kernel_mixed = |name: &str, step: &dyn Fn(usize) -> String| {
+        writeln!(source, "\n@compute @workgroup_size(64)\nfn {name}(@builtin(global_invocation_id) id: vec3<u32>) {{").unwrap();
+        source.push_str("    let t = id.x;\n    if (t >= hp.count) { return; }\n");
+        for k in 0..chains {
+            writeln!(source, "    var a{k} = src[t * 8u + {k}u].x;").unwrap();
+            writeln!(
+                source,
+                "    var f{k} = 0.2 + f32(src[t * 8u + {k}u].y & 0xffffu) * (0.6 / 65536.0);"
+            )
+            .unwrap();
+        }
+        source.push_str("    for (var i = 0u; i < hp.leaf_len; i++) {\n");
+        for _ in 0..unroll {
+            for k in 0..chains {
+                writeln!(source, "        {}", step(k)).unwrap();
+            }
+        }
+        source.push_str("    }\n    digests[t] = Field(");
+        source.push_str(
+            &(0..chains)
+                .map(|k| format!("a{k}"))
+                .collect::<Vec<_>>()
+                .join(" ^ "),
+        );
+        source.push_str(", bitcast<u32>(");
+        source.push_str(
+            &(0..chains)
+                .map(|k| format!("f{k}"))
+                .collect::<Vec<_>>()
+                .join(" + "),
+        );
+        source.push_str("));\n}\n");
+    };
+    let fma = |k: usize| format!("f{k} = fma(f{k}, f{}, 0.1);", 4 + (k + 1) % 4);
+    let iadd = |k: usize| format!("a{k} = a{k} + a{};", (k + 1) % 4);
+    let imul = |k: usize| format!("a{k} = a{k} * a{};", (k + 1) % 4);
+    kernel_mixed("bench_fma", &|k| {
+        format!("f{k} = fma(f{k}, f{}, 0.1);", (k + 1) % 8)
+    });
+    kernel_mixed("bench_mixed_add_fma", &|k| if k < 4 { iadd(k) } else { fma(k) });
+    kernel_mixed("bench_mixed_mul_fma", &|k| if k < 4 { imul(k) } else { fma(k) });
+    kernel_mixed("bench_mixed_mul_add", &|k| {
+        if k < 4 {
+            imul(k)
+        } else {
+            format!("a{k} = a{k} + a{};", 4 + (k + 1) % 4)
+        }
+    });
     if ctx.flavor == Flavor::Native {
         // The same chains over 64-bit words.
         let mut kernel64 = |name: &str, step: &dyn Fn(usize, usize) -> String| {
@@ -601,6 +669,10 @@ fn bench_int_throughput() {
         ("bench_reduce128", 256, 1.0, chains * unroll),
         ("bench_mulhi", 256, 1.0, chains * unroll),
         ("bench_add_wrap", 256, 1.0, chains * unroll),
+        ("bench_fma", 256, 1.0, chains * unroll),
+        ("bench_mixed_add_fma", 256, 1.0, chains * unroll),
+        ("bench_mixed_mul_fma", 256, 1.0, chains * unroll),
+        ("bench_mixed_mul_add", 256, 1.0, chains * unroll),
         ("bench_add64", 256, 1.0, chains * unroll),
         ("bench_cmp64", 256, 1.0, chains * unroll),
         ("bench_mul64", 256, 1.0, chains * unroll),
@@ -833,6 +905,12 @@ fn bench_quotient_program() {
         "mulrsub",
         "mdsp",
         "end",
+        "addw",
+        "subw",
+        "mulw",
+        "muladdw",
+        "mulsubw",
+        "mulrsubw",
     ];
     let mut counts = vec![0usize; names.len()];
     for op in ops {
@@ -855,8 +933,10 @@ fn bench_quotient_program() {
     let row_table = ctx.upload("rows", &random(3 * n));
     let chal = ctx.upload("chal", &random(chal_len));
     let out = ctx.storage("out", (nc as usize * n * 8) as u64);
-    let upload_ops = |ops: &[[u32; 4]]| -> wgpu::Buffer {
-        let bytes = quotient::program_words(ops)
+    let cases = quotient::case_list(&all_ops);
+    eprintln!("{} opcodes in frequency order: {:?}", cases.len(), cases);
+    let upload_ops = |ops: &[[u32; 4]], cases: &[u32]| -> wgpu::Buffer {
+        let bytes = quotient::program_words(ops, cases)
             .iter()
             .flat_map(|w| w.to_le_bytes())
             .collect::<Vec<_>>();
@@ -867,7 +947,7 @@ fn bench_quotient_program() {
                 usage: wgpu::BufferUsages::STORAGE,
             })
     };
-    let ops_buffer = upload_ops(&all_ops);
+    let ops_buffer = upload_ops(&all_ops, &cases);
     let layout = storage_layout(
         &ctx.device,
         "quotient bench",
@@ -937,7 +1017,7 @@ fn bench_quotient_program() {
 
     let interpreter = compile(
         "interpreter",
-        &quotient::kernel_source(ctx.flavor, registers, nc, quotient::uses_qmul(&ops)),
+        &quotient::kernel_source(ctx.flavor, registers, nc, &cases),
     );
     let prologue = time(&interpreter, &ops_buffer, 0);
     eprintln!("interpreter: prologue (0 ops) {:.3} ms", prologue * 1e3);
@@ -950,14 +1030,86 @@ fn bench_quotient_program() {
             (t - prologue) / n as f64 / num_ops as f64 * 1e12
         );
     }
+    // PLONKY2_GPU_PROGRAM_VARIANTS=path,path: the same program in other
+    // orders or register assignments (the register count may differ), timed
+    // in alternation with the reference, each output compared with its.
+    let variants = std::env::var("PLONKY2_GPU_PROGRAM_VARIANTS")
+        .map(|v| v.split(',').map(str::to_owned).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if !variants.is_empty() {
+        let out_bytes = nc as u64 * n as u64 * 8;
+        let output = |pipeline: &wgpu::ComputePipeline, buffer: &wgpu::Buffer, num_ops: u32| {
+            time(pipeline, buffer, num_ops);
+            ctx.read(&out, out_bytes, |b| b.to_vec())
+        };
+        let reference = output(&interpreter, &ops_buffer, ops.len() as u32);
+        let mut owned: Vec<(wgpu::ComputePipeline, wgpu::Buffer)> = Vec::new();
+        let mut labels = vec!["reference".to_owned()];
+        let mut nums = vec![ops.len()];
+        for path in &variants {
+            let text = std::fs::read_to_string(path).expect("variant dump");
+            let mut lines = text.lines().map(|line| {
+                line.split_whitespace()
+                    .map(|w| w.parse::<u32>().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let vparams = lines.next().unwrap();
+            let vcolumns = lines.next().unwrap();
+            assert_eq!(vparams, params, "{path}: parameters differ");
+            let vops = lines
+                .map(|op| [op[0], op[1], op[2], op[3]])
+                .collect::<Vec<_>>();
+            let vnum = vops
+                .iter()
+                .position(|op| op[0] & quotient::BASE_MASK == 21)
+                .unwrap_or(vops.len());
+            let vregs = vcolumns[5];
+            let label = format!("{} ({} ops, {vregs} registers)", path.rsplit('/').next().unwrap(), vnum);
+            let vcases = quotient::case_list(&vops);
+            let pipeline = compile(
+                &label,
+                &quotient::kernel_source(ctx.flavor, vregs, nc, &vcases),
+            );
+            let buffer = upload_ops(&vops, &vcases);
+            let got = output(&pipeline, &buffer, vnum as u32);
+            let same = got == reference;
+            eprintln!("{label}: output {}", if same { "matches" } else { "DIFFERS" });
+            owned.push((pipeline, buffer));
+            labels.push(label);
+            nums.push(vnum);
+        }
+        let entries = std::iter::once((&interpreter, &ops_buffer))
+            .chain(owned.iter().map(|(p, b)| (p, b)))
+            .collect::<Vec<_>>();
+        let mut best = vec![f64::MAX; entries.len()];
+        for _ in 0..4 {
+            for (k, (pipeline, buffer)) in entries.iter().enumerate() {
+                best[k] = best[k].min(time(pipeline, buffer, nums[k] as u32));
+            }
+        }
+        for (k, label) in labels.iter().enumerate() {
+            eprintln!(
+                "{label}: {:8.3} ms ({:+.1}% vs reference)",
+                best[k] * 1e3,
+                (best[k] / best[0] - 1.0) * 100.0
+            );
+        }
+    }
 
     // Straight-line kernels of prefixes: registers as named variables.
+    // PLONKY2_GPU_BENCH_STRAIGHT_DEP=1 makes every wire load's address depend
+    // on the previous op's result (never true in practice), so the compiler
+    // cannot hoist the loads ahead of the chain.
+    let straight_dep = std::env::var("PLONKY2_GPU_BENCH_STRAIGHT_DEP").is_ok();
     let emit = |ops: &[[u32; 4]]| -> String {
         let mut body = String::new();
+        // The alpha power of the next constraint, as the kernel counts it.
+        let mut term = 0u32;
         for r in 0..registers {
             writeln!(body, "    var r{r} = Field(0u, 0u);").unwrap();
         }
         writeln!(body, "    var gate_filter = Field(1u, 0u);").unwrap();
+        writeln!(body, "    var dep = 0u;").unwrap();
         for d in 0..nc {
             writeln!(body, "    var h{d} = Field(0u, 0u);").unwrap();
         }
@@ -967,7 +1119,11 @@ fn bench_quotient_program() {
             let wires = (op[0] & 0xff) >> 5;
             let src = |slot: u32, s: u32| -> String {
                 if wires >> slot & 1 != 0 {
-                    format!("wire(row, {s}u)")
+                    if straight_dep {
+                        format!("wire(row, {s}u + dep)")
+                    } else {
+                        format!("wire(row, {s}u)")
+                    }
                 } else {
                     format!("r{s}")
                 }
@@ -982,16 +1138,38 @@ fn bench_quotient_program() {
                 5 => format!("r{dst} = sub_field({sy}, {sz});"),
                 6 => format!("r{dst} = mul_field({sy}, {sz});"),
                 7 => {
+                    term = z;
                     let mut s = format!("gate_filter = {sy};");
                     for d in 0..nc {
                         write!(s, " h{d} = Field(0u, 0u);").unwrap();
                     }
                     s
                 }
-                8 => (0..nc)
-                    .map(|d| format!("h{d} = mul_add(h{d}, {sy}, alpha_pow({d}u, {z}u));"))
-                    .collect::<Vec<_>>()
-                    .join(" "),
+                8 => {
+                    let s = (0..nc)
+                        .map(|d| format!("h{d} = mul_add(h{d}, {sy}, alpha_pow({d}u, {term}u));"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    term += 1;
+                    s
+                }
+                22..=27 => {
+                    let v = match code {
+                        22 => format!("add_field({sy}, {sz})"),
+                        23 => format!("sub_field({sy}, {sz})"),
+                        24 => format!("mul_field({sy}, {sz})"),
+                        25 => format!("mul_add({sw}, {sy}, {sz})"),
+                        26 => format!("mul_sub({sw}, {sy}, {sz})"),
+                        _ => format!("mul_rsub({sw}, {sy}, {sz})"),
+                    };
+                    let mut s = format!("{{ let v = {v};");
+                    for d in 0..nc {
+                        write!(s, " h{d} = mul_add(h{d}, v, alpha_pow({d}u, {term}u));").unwrap();
+                    }
+                    s.push_str(" }");
+                    term += 1;
+                    s
+                }
                 9 => format!("r{dst} = mul_small({sy}, {z}u);"),
                 10 => format!("r{dst} = add_const({sy}, Field({z}u, {w}u));"),
                 11 => format!("r{dst} = mul_add({sw}, {sy}, {sz});"),
@@ -1038,9 +1216,42 @@ fn bench_quotient_program() {
                 14 => format!("r{dst} = {sy};"),
                 15 => format!("r{dst} = square_field({sy});"),
                 16 => format!("r{dst} = sbox({sy});"),
+                17 => {
+                    let d = dst & 0xff;
+                    let mask = op[0] >> 16;
+                    let operand = |i: usize| -> String {
+                        let index = ([y, z, w][i / 4] >> (8 * (i % 4))) & 0xff;
+                        if mask >> i & 1 != 0 {
+                            format!("wire(row, {index}u)")
+                        } else {
+                            format!("r{index}")
+                        }
+                    };
+                    let list = |range: std::ops::Range<usize>| {
+                        range.map(operand).collect::<Vec<_>>().join(", ")
+                    };
+                    let mut s = format!(
+                        "{{ let q = qmul(array<Field, 5>({}), array<Field, 5>({}));",
+                        list(0..5),
+                        list(5..10)
+                    );
+                    for k in 0..5 {
+                        write!(s, " r{} = q[{k}];", d + k).unwrap();
+                    }
+                    s.push_str(" }");
+                    s
+                }
                 _ => unreachable!(),
             };
             writeln!(body, "    {line}").unwrap();
+            if straight_dep && !matches!(code, 7 | 8 | 12 | 22..=27) {
+                let first = if matches!(code, 17 | 20) { dst & 0xff } else { dst };
+                writeln!(
+                    body,
+                    "    dep = u32(r{first}.x == 0x9e3779b9u && r{first}.y == 0x7f4a7c15u);"
+                )
+                .unwrap();
+            }
         }
         body
     };
@@ -1071,7 +1282,7 @@ fn bench_quotient_program() {
         }
         let mut raw = 0.0;
         for chunk in &chunks {
-            let buffer = upload_ops(&ops[chunk.clone()]);
+            let buffer = upload_ops(&ops[chunk.clone()], &cases);
             raw += time(&interpreter, &buffer, chunk.len() as u32);
         }
         eprintln!(
@@ -1089,7 +1300,7 @@ fn bench_quotient_program() {
     }
     let empty = compile(
         "straight-line empty",
-        &quotient::kernel_source_with_program(ctx.flavor, registers, nc, false, Some("")),
+        &quotient::kernel_source_with_program(ctx.flavor, registers, nc, &cases, Some("")),
     );
     let straight_prologue = time(&empty, &ops_buffer, 0);
     eprintln!(
@@ -1103,7 +1314,7 @@ fn bench_quotient_program() {
     let (mut sum_interpreter, mut sum_straight) = (0.0, 0.0);
     for (g, range) in gates.iter().enumerate() {
         let gate_ops = &ops[range.clone()];
-        let buffer = upload_ops(gate_ops);
+        let buffer = upload_ops(gate_ops, &cases);
         let num_ops = gate_ops.len() as u32;
         let ti =
             time(&interpreter, &buffer, num_ops) - time_rows(&interpreter, &buffer, num_ops, half);
@@ -1111,7 +1322,7 @@ fn bench_quotient_program() {
             ctx.flavor,
             registers,
             nc,
-            quotient::uses_qmul(gate_ops),
+            &cases,
             Some(&emit(gate_ops)),
         );
         let label = format!("gate {g} ({} ops)", gate_ops.len());
@@ -1233,7 +1444,8 @@ fn bench_quotient_occupancy() {
     let row_table = ctx.upload("rows", &random(3 * n));
     let chal = ctx.upload("chal", &random(chal_len));
     let out = ctx.storage("out", (nc as usize * n * 8) as u64);
-    let bytes = quotient::program_words(&all_ops)
+    let cases = quotient::case_list(&all_ops);
+    let bytes = quotient::program_words(&all_ops, &cases)
         .iter()
         .flat_map(|w| w.to_le_bytes())
         .collect::<Vec<_>>();
@@ -1272,17 +1484,14 @@ fn bench_quotient_occupancy() {
             &out,
         ],
     );
-    // (label, workgroup size, include the quintic case)
-    let mut variants = [32u32, 64, 128, 256]
-        .map(|size| (format!("workgroup {size}"), size, uses_qmul))
+    // (label, workgroup size)
+    let variants = [32u32, 64, 128, 256]
+        .map(|size| (format!("workgroup {size}"), size))
         .to_vec();
-    if !uses_qmul {
-        variants.push(("workgroup 64, unused quintic case".to_string(), 64, true));
-    }
     let pipelines = variants
         .iter()
-        .map(|(label, size, qmul)| {
-            let source = quotient::kernel_source(ctx.flavor, registers, nc, *qmul).replace(
+        .map(|(label, size)| {
+            let source = quotient::kernel_source(ctx.flavor, registers, nc, &cases).replace(
                 "@compute @workgroup_size(64)\nfn quotient(",
                 &format!("@compute @workgroup_size({size})\nfn quotient("),
             );
@@ -1323,7 +1532,7 @@ fn bench_quotient_occupancy() {
             results[i].push(time(&pipelines[i].0, pipelines[i].1) * 1e3);
         }
     }
-    for ((label, _, _), times) in variants.iter().zip(&results) {
+    for ((label, _), times) in variants.iter().zip(&results) {
         let ns = times.iter().map(|t| t * 1e6 / n as f64).collect::<Vec<_>>();
         eprintln!(
             "{label:36} {} ms  ({} ns per point)",
