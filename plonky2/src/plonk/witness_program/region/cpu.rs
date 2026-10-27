@@ -2107,24 +2107,19 @@ pub(crate) fn generate_wires_with<
             },
         )
     };
-    let program = if direct {
-        match prover
-            .witness_program
-            .candidate_all(prover.generators.len())
-        {
-            Some(program) => program,
-            None => {
-                direct = false;
-                match lookup()? {
-                    Some(program) => program,
-                    None => return Ok(None),
-                }
+    // Bind directly when the installed program's inputs are exactly its
+    // boundary roots; otherwise look the program up by the inputs' targets.
+    let program = match prover
+        .witness_program
+        .candidate_all(prover.generators.len())
+    {
+        Some(program) => program,
+        None => {
+            direct = false;
+            match lookup()? {
+                Some(program) => program,
+                None => return Ok(None),
             }
-        }
-    } else {
-        match lookup()? {
-            Some(program) => program,
-            None => return Ok(None),
         }
     };
     report.compile_cached = true;
