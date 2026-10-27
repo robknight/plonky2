@@ -67,6 +67,11 @@ pub struct GpuConfig {
     /// Release the global context automatically at normal process exit,
     /// before graphics drivers run their own exit handlers.
     pub shutdown_at_exit: bool,
+    /// Tiles of 1024 elements each NTT workgroup loops over, prefetching the
+    /// next tile while it transforms the current one. Zero dispatches one
+    /// workgroup per tile without prefetching. `None` is 8 on unified-memory
+    /// adapters, where it was measured, and 0 on discrete ones.
+    pub fft_tiles_per_workgroup: Option<u32>,
 }
 
 impl Default for GpuConfig {
@@ -82,6 +87,7 @@ impl Default for GpuConfig {
             pool_bytes: None,
             quotient_cpu_share: 0.10,
             shutdown_at_exit: true,
+            fft_tiles_per_workgroup: None,
         }
     }
 }
@@ -175,6 +181,12 @@ impl GpuConfig {
             "PLONKY2_GPU_SHUTDOWN_AT_EXIT",
         )? {
             c.shutdown_at_exit = v;
+        }
+        if let Some(value) = env.optional_number(
+            "PLONKY2_GPU_FFT_TILES_PER_WORKGROUP",
+            "PLONKY2_GPU_FFT_TILES_PER_WORKGROUP",
+        )? {
+            c.fft_tiles_per_workgroup = value;
         }
         c.validate()?;
         Ok(c)
@@ -273,6 +285,7 @@ mod tests {
             pool_bytes: Some(2048),
             quotient_cpu_share: 0.3,
             shutdown_at_exit: false,
+            fft_tiles_per_workgroup: Some(5),
         };
         assert_eq!(read_defaults(defaults.clone(), &[]).unwrap(), defaults);
         let c = read_defaults(
@@ -298,6 +311,16 @@ mod tests {
         assert_eq!(c.quotient_cpu_share, defaults.quotient_cpu_share);
         assert_eq!(c.allow_software, defaults.allow_software);
         assert_eq!(c.shutdown_at_exit, defaults.shutdown_at_exit);
+        assert_eq!(c.fft_tiles_per_workgroup, Some(5));
+        assert_eq!(
+            read_defaults(
+                defaults.clone(),
+                &[("PLONKY2_GPU_FFT_TILES_PER_WORKGROUP", "auto")]
+            )
+            .unwrap()
+            .fft_tiles_per_workgroup,
+            None
+        );
         assert_eq!(
             read_defaults(defaults.clone(), &[("PLONKY2_GPU_POOL_BYTES", "auto")])
                 .unwrap()
@@ -320,6 +343,7 @@ mod tests {
             ("PLONKY2_GPU_POOL_BYTES", "4096"),
             ("PLONKY2_GPU_QUOTIENT_CPU_SHARE", "0.25"),
             ("PLONKY2_GPU_SHUTDOWN_AT_EXIT", "0"),
+            ("PLONKY2_GPU_FFT_TILES_PER_WORKGROUP", "0"),
         ])
         .unwrap();
         assert!(!c.enabled && c.allow_software && !c.shutdown_at_exit);
@@ -330,6 +354,8 @@ mod tests {
         assert_eq!(c.retained_bytes, Some(0));
         assert_eq!(c.pool_bytes, Some(4096));
         assert_eq!(c.quotient_cpu_share, 0.25);
+        assert_eq!(c.fft_tiles_per_workgroup, Some(0));
+        assert!(read(&[("PLONKY2_GPU_FFT_TILES_PER_WORKGROUP", "-1")]).is_err());
         let c = read(&[("PLONKY2_GPU_PROVING_WORKERS", "3")]).unwrap();
         assert_eq!(c.retained_bytes_limit(), 6 << 30);
     }

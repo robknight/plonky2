@@ -320,15 +320,58 @@ fn bench_fft_passes() {
         eprintln!("{label:40} best {:8.2} ms", best * 1e3);
         best
     };
-    time("whole LDE (coset shift in)", &|e| {
-        fft_groups(ctx, e, job(true), None)
+    let variants = [("one tile per workgroup", 0u32), ("pipelined, 8 tiles/workgroup", 8)];
+    for (label, tpw) in variants {
+        time(&format!("whole LDE (coset shift in), {label}"), &|e| {
+            lde::fft_with_plan(ctx, e, job(true), plan.clone(), None, tpw)
+        });
+        for g in 0..plan.len() {
+            time(&format!("group {g} {:?}, {label}", plan[g]), &|e| {
+                lde::fft_with_plan(ctx, e, job(true), plan.clone(), Some(g), tpw)
+            });
+        }
+    }
+    time("whole LDE (no shift), pipelined", &|e| {
+        lde::fft_with_plan(ctx, e, job(false), plan.clone(), None, 8)
     });
-    time("whole LDE (no shift)", &|e| {
-        fft_groups(ctx, e, job(false), None)
-    });
-    for g in 0..plan.len() {
-        time(&format!("group {g} {:?}", plan[g]), &|e| {
-            fft_groups(ctx, e, job(true), Some(g))
+    for tpw in [4u32, 16] {
+        time(&format!("whole LDE, pipelined, {tpw} tiles/workgroup"), &|e| {
+            lde::fft_with_plan(ctx, e, job(true), plan.clone(), None, tpw)
+        });
+    }
+    // The IFFT of the values (2^16 per column).
+    let values = random_columns(&mut rng, columns, degree);
+    let refs = values.iter().map(|v| v.as_slice()).collect::<Vec<_>>();
+    let vals = lde::upload_columns(ctx, "values", &refs);
+    let coeffs_out = ctx.storage("ifft coeffs", (columns * degree * 8) as u64);
+    let work = ctx.storage("ifft work", (columns * degree * 8) as u64);
+    let ifft = || FftJob {
+        log_n: log_d,
+        columns: columns as u32,
+        input: &vals,
+        in_len: degree as u32,
+        in_stride: degree as u32,
+        data: &work,
+        output: Some(&coeffs_out),
+        shift_in: None,
+        inverse: true,
+        shift_out: None,
+    };
+    let ifft_plan = shader::fft_plan(log_d);
+    eprintln!("IFFT plan {ifft_plan:?}");
+    for (label, tpw) in variants {
+        time(&format!("IFFT whole, {label}"), &|e| {
+            lde::fft_with_plan(ctx, e, ifft(), ifft_plan.clone(), None, tpw)
+        });
+        for g in 0..ifft_plan.len() {
+            time(&format!("IFFT group {g} {:?}, {label}", ifft_plan[g]), &|e| {
+                lde::fft_with_plan(ctx, e, ifft(), ifft_plan.clone(), Some(g), tpw)
+            });
+        }
+    }
+    for tpw in [4u32, 16] {
+        time(&format!("IFFT whole, pipelined, {tpw} tiles/workgroup"), &|e| {
+            lde::fft_with_plan(ctx, e, ifft(), ifft_plan.clone(), None, tpw)
         });
     }
     // Zero stages: every workgroup loads a contiguous tile and stores it back.
@@ -741,9 +784,16 @@ fn bench_quotient_program() {
     });
     let params = lines.next().unwrap();
     let columns = lines.next().unwrap();
-    let ops = lines
+    // The executable ops end at the end marker; the round constant blocks
+    // of the packed MDS ops follow it in the same buffer.
+    let all_ops = lines
         .map(|op| [op[0], op[1], op[2], op[3]])
         .collect::<Vec<_>>();
+    let num_ops = all_ops
+        .iter()
+        .position(|op| op[0] & quotient::BASE_MASK == 21)
+        .unwrap_or(all_ops.len());
+    let ops = &all_ops[..num_ops];
     let (n, n_lde) = (params[0] as usize, params[2] as usize);
     let (cs_cols, w_cols, z_cols, chal_len, nc, registers) = (
         columns[0] as usize,
@@ -781,9 +831,11 @@ fn bench_quotient_program() {
         "qmul",
         "mulsub",
         "mulrsub",
+        "mdsp",
+        "end",
     ];
     let mut counts = vec![0usize; names.len()];
-    for op in &ops {
+    for op in ops {
         counts[(op[0] & quotient::BASE_MASK) as usize] += 1;
     }
     for (name, count) in names.iter().zip(&counts) {
@@ -815,7 +867,7 @@ fn bench_quotient_program() {
                 usage: wgpu::BufferUsages::STORAGE,
             })
     };
-    let ops_buffer = upload_ops(&ops);
+    let ops_buffer = upload_ops(&all_ops);
     let layout = storage_layout(
         &ctx.device,
         "quotient bench",
@@ -957,6 +1009,28 @@ fn bench_quotient_program() {
                     let mut s = format!("{{ let m = mds12(array<Field, 12>({inputs}));");
                     for k in 0..12 {
                         write!(s, " r{} = m[{k}];", y + k).unwrap();
+                    }
+                    s.push_str(" }");
+                    s
+                }
+                20 => {
+                    let inputs = (0..12)
+                        .map(|i| format!("r{}", ([y, z, w][i / 4] >> (8 * (i % 4))) & 0xff))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let block = dst & 0xff;
+                    let table = (op[0] >> 16) as usize;
+                    let mut s = format!("{{ let m = mds12(array<Field, 12>({inputs}));");
+                    for k in 0..12 {
+                        let c = all_ops[table + k / 2];
+                        write!(
+                            s,
+                            " r{} = add_const(m[{k}], Field({}u, {}u));",
+                            block + k as u32,
+                            c[2 * (k % 2)],
+                            c[2 * (k % 2) + 1]
+                        )
+                        .unwrap();
                     }
                     s.push_str(" }");
                     s
@@ -1123,9 +1197,16 @@ fn bench_quotient_occupancy() {
     });
     let params = lines.next().unwrap();
     let columns = lines.next().unwrap();
-    let ops = lines
+    // The executable ops end at the end marker; the round constant blocks
+    // of the packed MDS ops follow it in the same buffer.
+    let all_ops = lines
         .map(|op| [op[0], op[1], op[2], op[3]])
         .collect::<Vec<_>>();
+    let num_ops = all_ops
+        .iter()
+        .position(|op| op[0] & quotient::BASE_MASK == 21)
+        .unwrap_or(all_ops.len());
+    let ops = &all_ops[..num_ops];
     let (n, n_lde) = (params[0] as usize, params[2] as usize);
     let (cs_cols, w_cols, z_cols, chal_len, nc, registers) = (
         columns[0] as usize,
@@ -1152,7 +1233,7 @@ fn bench_quotient_occupancy() {
     let row_table = ctx.upload("rows", &random(3 * n));
     let chal = ctx.upload("chal", &random(chal_len));
     let out = ctx.storage("out", (nc as usize * n * 8) as u64);
-    let bytes = quotient::program_words(&ops)
+    let bytes = quotient::program_words(&all_ops)
         .iter()
         .flat_map(|w| w.to_le_bytes())
         .collect::<Vec<_>>();
