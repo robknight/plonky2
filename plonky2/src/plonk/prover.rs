@@ -222,7 +222,7 @@ where
 {
     #[cfg(feature = "gpu")]
     if let Some(ctx) = crate::gpu::context() {
-        ctx.storage_pool.begin_proof(common_data.degree_bits());
+        ctx.storage_pool.begin_proof();
     }
     #[cfg(feature = "gpu")]
     let gpu_plan = timed!(

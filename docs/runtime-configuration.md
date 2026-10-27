@@ -34,7 +34,6 @@ These variables work in ordinary `gpu` builds, through POD2 or any other consume
 | `PLONKY2_GPU_RETAINED_BYTES` | `auto` or non-negative integer bytes; zero disables retention | 2 GiB per proving worker |
 | `PLONKY2_GPU_POOL_BYTES` | `auto` or non-negative integer bytes; zero disables pooling | 4 GiB |
 | `PLONKY2_GPU_POOL_MAX_IDLE_PROOFS` | `auto` or non-negative integer; idle pool buffers are released once that many later proofs have started without reusing them | one per proving worker |
-| `PLONKY2_GPU_POOL_MIN_DEGREE_BITS` | `auto` or non-negative integer; proofs of circuits with fewer than 2^n rows bypass the pool (the most recently started proof decides) | 0 |
 | `PLONKY2_GPU_QUOTIENT_CPU_SHARE` | Finite fraction in `[0, 1]` | `0.10` |
 | `PLONKY2_GPU_SHUTDOWN_AT_EXIT` | Boolean | `true` |
 | `PLONKY2_GPU_FFT_TILES_PER_WORKGROUP` | `auto` or non-negative integer; zero dispatches one NTT workgroup per 1024-element tile without prefetching | 8 on unified memory, zero on discrete |

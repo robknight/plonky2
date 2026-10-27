@@ -737,7 +737,7 @@ fn storage_pool_defaults() {
     for mappable in [false, true] {
         let options = GpuOptions::new(&config, mappable);
         assert_eq!(options.pool_bytes, 4 << 30);
-        assert_eq!(options.pool_max_idle_proofs, Some(2));
+        assert_eq!(options.pool_max_idle_proofs, 2);
     }
 }
 
@@ -797,7 +797,7 @@ fn storage_pool_reuses_buffers() {
     // changing this pool's contents or limit.
     let mut ctx = GpuContext::new().unwrap();
     ctx.options.pool_bytes = 3 << 20;
-    ctx.storage_pool = Arc::new(StoragePool::new(ctx.options.pool_bytes, None, 0));
+    ctx.storage_pool = Arc::new(StoragePool::new(ctx.options.pool_bytes, u64::MAX));
     let before = ctx.storage_pool.bytes();
     let a = ctx.storage("pool test", 1 << 20);
     let raw: wgpu::Buffer = (*a).clone();
@@ -826,45 +826,29 @@ fn storage_pool_reuses_buffers() {
     drop(ctx.storage("eviction", 3 << 20));
     assert_eq!(ctx.storage_pool.bytes(), 3 << 20);
     ctx.options.pool_bytes = 0;
-    ctx.storage_pool = Arc::new(StoragePool::new(0, None, 0));
+    ctx.storage_pool = Arc::new(StoragePool::new(0, u64::MAX));
     drop(ctx.storage("disabled", 1 << 20));
     assert_eq!(ctx.storage_pool.bytes(), 0);
 }
 
 #[test]
-fn storage_pool_releases_idle_buffers_and_skips_small_circuits() {
+fn storage_pool_releases_idle_buffers() {
     let Some(_) = ctx() else { return };
     let mut ctx = GpuContext::new().unwrap();
     ctx.options.pool_bytes = 8 << 20;
-    ctx.storage_pool = Arc::new(StoragePool::new(8 << 20, Some(1), 0));
+    ctx.storage_pool = Arc::new(StoragePool::new(8 << 20, 1));
     let pool = ctx.storage_pool.clone();
-    pool.begin_proof(12);
+    pool.begin_proof();
     drop(ctx.storage("idle", 1 << 20));
     drop(ctx.storage("reused", 2 << 20));
     assert_eq!(pool.bytes(), 3 << 20);
     // Both were returned during the previous proof, so both survive its start.
-    pool.begin_proof(12);
+    pool.begin_proof();
     assert_eq!(pool.bytes(), 3 << 20);
     drop(ctx.storage("reused", 2 << 20));
     // The 1 MiB buffer stayed unused through a whole proof; the 2 MiB one did not.
-    pool.begin_proof(12);
+    pool.begin_proof();
     assert_eq!(pool.bytes(), 2 << 20);
-
-    // A smaller circuit neither takes buffers from the pool nor returns them.
-    ctx.storage_pool = Arc::new(StoragePool::new(8 << 20, None, 12));
-    let pool = ctx.storage_pool.clone();
-    pool.begin_proof(12);
-    drop(ctx.storage("large circuit", 1 << 20));
-    assert_eq!(pool.bytes(), 1 << 20);
-    pool.begin_proof(11);
-    let small = ctx.storage("small circuit", 1 << 20);
-    assert_eq!(pool.bytes(), 1 << 20);
-    drop(small);
-    assert_eq!(pool.bytes(), 1 << 20);
-    pool.begin_proof(12);
-    let large = ctx.storage("large circuit", 1 << 20);
-    assert_eq!(pool.bytes(), 0);
-    drop(large);
 }
 
 #[test]
