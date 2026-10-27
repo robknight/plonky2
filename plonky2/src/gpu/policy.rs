@@ -68,12 +68,12 @@ pub(crate) enum ExecutionPath {
     CpuQuotient,
 }
 
-/// Hybrid CPU evaluation needs contiguous rows; fully resident proofs can
-/// reuse the column-major LDE as their leaf storage and gather queries later.
+/// Where a commitment's leaves live: copied to the host as rows, or left in
+/// the LDE's column-major device buffer, from which queried rows and a hybrid
+/// proof's CPU rows are gathered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LeafStorage {
     Host,
-    Rows,
     Columns,
 }
 
@@ -118,8 +118,8 @@ impl ExecutionPlan {
         }
     }
 
-    /// Whether this proof keeps leaves on the device: columns for resident
-    /// proofs, rows for hybrid proofs where the host maps buffers directly.
+    /// Whether this proof keeps leaves on the device: resident proofs, and
+    /// hybrid proofs where the host maps buffers directly.
     pub(crate) fn retain_leaves(&self) -> bool {
         match self.path {
             ExecutionPath::Resident => true,
@@ -128,13 +128,13 @@ impl ExecutionPlan {
         }
     }
 
+    /// Retained leaves stay in the LDE's own column-major buffer. A hybrid
+    /// proof's CPU quotient share gathers just the rows it reads.
     pub(crate) fn leaf_storage(&self) -> LeafStorage {
-        if !self.retain_leaves() {
-            LeafStorage::Host
-        } else if self.path == ExecutionPath::Resident {
+        if self.retain_leaves() {
             LeafStorage::Columns
         } else {
-            LeafStorage::Rows
+            LeafStorage::Host
         }
     }
 }

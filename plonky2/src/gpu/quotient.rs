@@ -2404,8 +2404,11 @@ pub(crate) fn try_compute_quotient<
             .merkle_tree
             .leaves
             .is_device_resident();
+    // Rounded to 1/256 of the points, so the buffers of gathered rows repeat
+    // in size from proof to proof and come from the storage pool.
     let cpu_rows = if cpu_share > 0.0 && (!resident || ctx.mappable) {
-        ((n as f64 * cpu_share) as usize).min(n / 2)
+        let granule = (n / 256).max(1);
+        ((n as f64 * cpu_share / granule as f64).round() as usize * granule).min(n / 2)
     } else {
         0
     };
@@ -2476,6 +2479,22 @@ pub(crate) fn try_compute_quotient<
     // The CPU evaluates the last points while the kernel runs, the share
     // following the rates measured on the previous proof.
     let start = std::time::Instant::now();
+    // The CPU share's rows are gathered by the device before the GPU share is
+    // queued, so the CPU waits only for the gathers. The Z polynomials also
+    // need the row `next_step` points ahead, which for the last points wraps
+    // into the first `next_step` rows.
+    let (wires_rows, zs_rows) = if gpu_rows < n {
+        (
+            wires_commitment
+                .batch()
+                .queue_lde_values(gpu_rows..n, step as usize),
+            zs_commitment
+                .batch()
+                .queue_lde_values((gpu_rows..n).chain(0..next_step as usize), step as usize),
+        )
+    } else {
+        (None, None)
+    };
     #[cfg(feature = "gpu-profiling")]
     let _capture = super::capture::Capture::quotient();
     let (gpu_time, cpu_time) = plonky2_maybe_rayon::join(
@@ -2519,15 +2538,9 @@ pub(crate) fn try_compute_quotient<
                 return None;
             }
             let start = std::time::Instant::now();
-            // The rows this share reads: each point's own row, and for the
-            // Z polynomials also the row `next_step` points ahead.
-            wires_commitment
-                .batch()
-                .prepare_lde_values(gpu_rows..n, step as usize);
-            zs_commitment.batch().prepare_lde_values(
-                (gpu_rows..n).flat_map(|i| [i, (i + next_step as usize) % n]),
-                step as usize,
-            );
+            for finish in [wires_rows, zs_rows].into_iter().flatten() {
+                finish();
+            }
             let values = crate::plonk::prover::quotient_values_cpu::<F, C, D>(
                 common_data,
                 prover_data,

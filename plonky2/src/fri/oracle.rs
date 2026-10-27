@@ -351,14 +351,27 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
 
     /// Prepares the rows that `get_lde_values(index, step)` will read for
     /// these indices, from the device buffer where the host maps it directly.
-    #[cfg(feature = "gpu")]
+    #[cfg(all(feature = "gpu", test))]
     pub(crate) fn prepare_lde_values(&self, indices: impl IntoIterator<Item = usize>, step: usize) {
+        if let Some(finish) = self.queue_lde_values(indices, step) {
+            finish();
+        }
+    }
+
+    /// Submits the device work of `prepare_lde_values`; the returned step
+    /// waits for it and stores the rows (see `MerkleLeaves::queue_rows`).
+    #[cfg(feature = "gpu")]
+    pub(crate) fn queue_lde_values(
+        &self,
+        indices: impl IntoIterator<Item = usize>,
+        step: usize,
+    ) -> Option<Box<dyn FnOnce() + Send + '_>> {
         let bits = self.degree_log + self.rate_bits;
         let rows = indices
             .into_iter()
             .map(|index| reverse_bits(index * step, bits))
             .collect::<Vec<_>>();
-        self.merkle_tree.leaves.prepare_rows(&rows);
+        self.merkle_tree.leaves.queue_rows(&rows)
     }
 
     /// Like `get_lde_values`, but fetches LDE values from a batch of `P::WIDTH` points, and returns

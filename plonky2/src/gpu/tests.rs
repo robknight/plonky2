@@ -1965,6 +1965,10 @@ fn hybrid_proof_plan_keeps_leaves_and_prepares_quotient_rows() {
     let outside = commit(None);
     assert!(!outside.batch.merkle_tree.leaves.is_device_resident());
     assert_eq!(
+        in_proof.batch.merkle_tree.leaves.is_column_backed(),
+        ctx.mappable
+    );
+    assert_eq!(
         in_proof.batch.merkle_tree.cap,
         outside.batch.merkle_tree.cap
     );
@@ -1977,7 +1981,7 @@ fn hybrid_proof_plan_keeps_leaves_and_prepares_quotient_rows() {
             outside.batch.get_lde_values(i, step)
         );
     }
-    // The prepared rows came from the mapped buffer, not a full download.
+    // The prepared rows came from a gather of the columns, not a full download.
     assert_eq!(
         in_proof.batch.merkle_tree.leaves.is_device_resident(),
         ctx.mappable

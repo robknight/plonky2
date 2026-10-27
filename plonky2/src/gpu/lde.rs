@@ -955,13 +955,6 @@ fn commit<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usi
             0,
             tree.leaves_done.clone(),
         ),
-        LeafStorage::Rows => MerkleLeaves::from_device(
-            ctx.clone(),
-            rows.expect("row buffer"),
-            columns,
-            n,
-            tree.leaves_done.clone(),
-        ),
         LeafStorage::Host => timed!(
             timing,
             "gpu: hash leaves and read rows",

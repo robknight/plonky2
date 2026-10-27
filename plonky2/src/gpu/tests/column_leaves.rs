@@ -111,7 +111,7 @@ fn column_leaves_match_rows_through_queries_and_materialization() {
 }
 
 #[test]
-fn resident_commitments_reuse_columns_while_hybrid_keeps_rows() {
+fn retained_commitments_reuse_columns() {
     use crate::plonk::config::PoseidonGoldilocksConfig as C;
     let _guard = ENABLE_LOCK.lock().unwrap();
     let Some(ctx) = ctx() else { return };
@@ -136,9 +136,9 @@ fn resident_commitments_reuse_columns_while_hybrid_keeps_rows() {
             false,
         )
     };
-    let rows = commit(policy::LeafStorage::Rows);
+    let rows = commit(policy::LeafStorage::Host);
     let columns = commit(policy::LeafStorage::Columns);
-    assert!(!rows.batch.merkle_tree.leaves.is_column_backed());
+    assert!(!rows.batch.merkle_tree.leaves.is_device_resident());
     assert!(columns.batch.merkle_tree.leaves.is_column_backed());
     assert_eq!(columns.batch.merkle_tree.cap, rows.batch.merkle_tree.cap);
     // Consuming the quotient's LDE cache leaves its query storage intact.

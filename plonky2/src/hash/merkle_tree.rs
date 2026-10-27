@@ -373,46 +373,64 @@ impl<F: Copy> MerkleLeaves<F> {
     /// leaves value: a later call is ignored. Runs on the calling thread and,
     /// for decoding, on scoped threads, never on the Rayon pool, because a
     /// stolen row-access task could wait on the lock held here.
+    #[cfg(test)]
     pub(crate) fn prepare_rows(&self, indices: &[usize])
     where
-        F: Send,
+        F: Send + Sync,
     {
-        let Some(d) = &self.values.device else { return };
+        if let Some(finish) = self.queue_rows(indices) {
+            finish();
+        }
+    }
+
+    /// The device work of `prepare_rows`, submitted now; the returned step
+    /// waits for it and stores the rows. Column leaves are gathered by a
+    /// device dispatch, so a caller about to queue other device work queues
+    /// this first and finishes it while that work runs. Row leaves are read
+    /// from the mapped buffer here, under the lock a full download also takes.
+    pub(crate) fn queue_rows(&self, indices: &[usize]) -> Option<Box<dyn FnOnce() + Send + '_>>
+    where
+        F: Send + Sync,
+    {
+        let d = self.values.device.as_ref()?;
         if d.full.get().is_some() || d.rows.get().is_some() || indices.is_empty() {
-            return;
+            return None;
         }
         let resident = d.resident.lock().unwrap();
         // Another caller may have prepared rows while this one waited.
         if d.rows.get().is_some() {
-            return;
+            return None;
         }
-        let Some(buffer) = resident.as_ref() else {
-            return;
-        };
+        let buffer = resident.as_ref()?;
         if !buffer.context.mappable {
-            return;
+            return None;
         }
         let started = std::time::Instant::now();
         let mut indices = indices.to_vec();
-        indices.sort_unstable();
+        // Gathered rows are stored in the order they are read: by row of the
+        // column buffer, where consecutive leaves are far apart, so that the
+        // gather reads each cache line once; otherwise by leaf.
+        match d.source {
+            crate::gpu::merkle::LeafSource::Columns {
+                log_n, arity_bits, ..
+            } => indices.sort_unstable_by_key(|&i| {
+                crate::util::reverse_bits(i, (log_n - arity_bits) as usize)
+            }),
+            crate::gpu::merkle::LeafSource::Rows { .. } => indices.sort_unstable(),
+        }
         indices.dedup();
         assert!(indices.iter().all(|&i| i < self.num_leaves));
         let row_bytes = self.leaf_len * 8;
-        let data = if matches!(d.source, crate::gpu::merkle::LeafSource::Columns { .. }) {
-            let (compact, done) = crate::gpu::merkle::gather_leaves(
-                &buffer.context,
+        let ctx = buffer.context.clone();
+        let gathered = if matches!(d.source, crate::gpu::merkle::LeafSource::Columns { .. }) {
+            Ok(crate::gpu::merkle::gather_leaves(
+                &ctx,
                 &buffer.buffer,
                 d.source,
                 &indices,
-            );
-            buffer.context.read_after(
-                &compact,
-                (indices.len() * row_bytes) as u64,
-                Some(&done),
-                d.decode,
-            )
+            ))
         } else {
-            buffer.context.read_after(
+            Err(ctx.read_after(
                 &buffer.buffer,
                 (d.count * 8) as u64,
                 Some(&buffer.done),
@@ -456,21 +474,32 @@ impl<F: Copy> MerkleLeaves<F> {
                     }
                     data
                 },
-            )
+            ))
         };
         drop(resident);
-        let mut index = vec![u32::MAX; self.num_leaves];
-        for (k, &i) in indices.iter().enumerate() {
-            index[i] = u32::try_from(k).expect("fewer than 2^32 prepared rows");
-        }
-        log::debug!(
-            "gpu: prepared {} of {} leaf rows of {} values in {:?}",
-            indices.len(),
-            self.num_leaves,
-            self.leaf_len,
-            started.elapsed()
-        );
-        let _ = d.rows.set(PreparedRows { index, data });
+        Some(Box::new(move || {
+            let data = match gathered {
+                Ok((compact, done)) => ctx.read_after(
+                    &compact,
+                    (indices.len() * row_bytes) as u64,
+                    Some(&done),
+                    d.decode,
+                ),
+                Err(data) => data,
+            };
+            let mut index = vec![u32::MAX; self.num_leaves];
+            for (k, &i) in indices.iter().enumerate() {
+                index[i] = u32::try_from(k).expect("fewer than 2^32 prepared rows");
+            }
+            log::debug!(
+                "gpu: prepared {} of {} leaf rows of {} values in {:?}",
+                indices.len(),
+                self.num_leaves,
+                self.leaf_len,
+                started.elapsed()
+            );
+            let _ = d.rows.set(PreparedRows { index, data });
+        }))
     }
 
     /// True while a device copy is retained. Does not download any data.
