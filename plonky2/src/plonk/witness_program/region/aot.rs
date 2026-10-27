@@ -584,16 +584,25 @@ pub(super) fn run_pattern_group(
         "native pattern lane count mismatch"
     );
     let chunk = super::cpu::lane_chunk(Kind::ArithmeticChain) as usize;
-    ids.par_chunks(chunk).enumerate().try_for_each(|(c, ids)| {
-        let _profile = e.profile.kind(26, ids.len() as u32);
-        for (i, &id) in ids.iter().enumerate() {
-            let kernel = kernels
-                .get(id as usize)
-                .ok_or_else(|| anyhow::anyhow!("unknown native pattern"))?;
-            kernel(e, g, (c * chunk + i) as u32)?;
-        }
-        Ok(())
-    })
+    let run = |k: u32| -> Result<()> {
+        let kernel = kernels
+            .get(ids[k as usize] as usize)
+            .ok_or_else(|| anyhow::anyhow!("unknown native pattern"))?;
+        kernel(e, g, k)
+    };
+    ids.par_chunks(chunk)
+        .enumerate()
+        .try_for_each(|(c, lanes)| {
+            let _profile = e.profile.kind(26, lanes.len() as u32);
+            let start = (c * chunk) as u32;
+            let end = start + lanes.len() as u32;
+            // Lanes deferred to the device are not run here.
+            #[cfg(feature = "gpu")]
+            if let Some(tail) = e.gpu_tail {
+                return tail.cpu_ranges(g, start, end, |a, b| (a..b).try_for_each(run));
+            }
+            (start..end).try_for_each(run)
+        })
 }
 
 /// Classifies each arithmetic chain once against a small bank of native kernels.

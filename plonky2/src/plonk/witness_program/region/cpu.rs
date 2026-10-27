@@ -266,7 +266,15 @@ impl RegionProgram {
             let chunk = lane_chunk(group.kind);
             let chunks = group.count.div_ceil(chunk);
             (0..chunks).into_par_iter().try_for_each(|c| {
-                for k in c * chunk..chunk_end(c * chunk, chunk, group.count) {
+                let (start, end) = (c * chunk, chunk_end(c * chunk, chunk, group.count));
+                // Lanes deferred to the device are not run here.
+                #[cfg(feature = "gpu")]
+                if let Some(tail) = executor.gpu_tail {
+                    return tail.cpu_ranges(group, start, end, |a, b| {
+                        (a..b).try_for_each(|k| executor.step(group, k))
+                    });
+                }
+                for k in start..end {
                     executor.step(group, k)?;
                 }
                 Ok::<(), anyhow::Error>(())
@@ -2566,12 +2574,12 @@ pub fn check_against_worklist<
     let actual = match wires {
         Wires::Host(witness) => witness.wire_values,
         #[cfg(feature = "gpu")]
-        Wires::Resident(resident) => crate::gpu::lde::read_columns::<F>(
-            &resident.ctx,
-            &resident.wire_values,
-            num_wires,
-            degree,
-        ),
+        Wires::Resident(resident) => {
+            // Device checks are part of the witness; compact state is read
+            // through its cell-to-slot table.
+            resident.validate()?;
+            resident.read_columns::<F>(num_wires, degree)
+        }
     };
     ensure!(actual.len() == num_wires, "wire matrix has the wrong width");
     let mut wire_mismatches = 0usize;
@@ -2945,13 +2953,15 @@ pub(crate) mod tests {
                 .flatten()
                 .map(|v| v.to_canonical_u64())
                 .collect::<Vec<_>>();
-            // (device witness, checked execution, CPU gather tile)
-            for (device, checked, columns, rows) in [
-                (false, false, 2, 1024),
-                (false, false, 16, 256),
-                (false, false, 7, 123),
-                (true, false, 16, 256),
-                (true, true, 16, 256),
+            // (device witness, checked execution, one-thread pool, CPU gather tile).
+            // One thread runs layer by layer rather than by dependencies.
+            for (device, checked, single, columns, rows) in [
+                (false, false, false, 2, 1024),
+                (false, false, false, 16, 256),
+                (false, false, false, 7, 123),
+                (true, false, false, 16, 256),
+                (true, false, true, 16, 256),
+                (true, true, false, 16, 256),
             ] {
                 let mut config = program.config().clone();
                 config.policy.device_witness = Some(device);
@@ -2961,6 +2971,9 @@ pub(crate) mod tests {
                 config.policy.gather_tiles = (columns, rows);
                 if columns == 7 && cfg!(feature = "parallel") {
                     config.threads = 2;
+                }
+                if single {
+                    config.threads = 1;
                 }
                 let tail = device && !checked && cfg!(feature = "parallel");
                 data.install_witness_program(program.with_execution_config(config).unwrap())
@@ -3235,6 +3248,90 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    /// A one-thread pool runs layer by layer. Arithmetic chains deferred to
+    /// the device must not also run on the CPU there: their inputs are device
+    /// Poseidon outputs and their results are seeded roots.
+    #[test]
+    #[cfg(all(feature = "gpu", feature = "parallel"))]
+    #[ignore = "requires native GPU; run alone"]
+    fn gpu_tail_layer_schedule_skips_deferred_chains() {
+        use crate::hash::poseidon::PoseidonHash;
+        use crate::plonk::witness_program::{WitnessConfig, WitnessFallback};
+        let mut builder =
+            CircuitBuilder::<G, 2>::new(CircuitConfig::standard_recursion_zk_config());
+        let a = builder.add_virtual_target();
+        let mut claims = Vec::new();
+        for i in 0..64 {
+            let c = builder.constant(G::from_canonical_u64(i));
+            let v = builder.add(a, c);
+            let h = builder
+                .hash_n_to_hash_no_pad::<PoseidonHash>(vec![v; 4])
+                .elements;
+            let x = builder.mul_add(h[0], h[1], h[2]);
+            let y = builder.mul_add(x, h[3], h[0]);
+            let claim = builder.add_virtual_target();
+            builder.connect(y, claim);
+            claims.push(claim);
+        }
+        builder.register_public_input(a);
+        let data = builder.build::<C>();
+        let mut pw = PartialWitness::new();
+        pw.set_target(a, G::from_canonical_u64(13)).unwrap();
+        let values = crate::iop::generator::generate_partial_witness(
+            pw.clone(),
+            &data.prover_only,
+            &data.common,
+        )
+        .unwrap();
+        for &claim in &claims {
+            pw.set_target(claim, values.get_target(claim)).unwrap();
+        }
+        let worklist = crate::iop::generator::generate_partial_witness(
+            pw.clone(),
+            &data.prover_only,
+            &data.common,
+        )
+        .unwrap();
+        let mut config = WitnessConfig::default();
+        config.policy.device_witness = Some(true);
+        config.fallback = WitnessFallback::Error;
+        config.threads = 1;
+        let mut targets = vec![a];
+        targets.extend(&claims);
+        let program = data
+            .compile_witness_program_with_config(&targets, config)
+            .unwrap();
+        let random = program
+            .program
+            .random_representatives()
+            .iter()
+            .map(|r| worklist.values[r.unwrap()].unwrap().to_canonical_u64())
+            .collect::<Vec<_>>();
+        data.install_witness_program(program).unwrap();
+        let (public, wires, report) =
+            generate_wires_with(&pw, &data.prover_only, &data.common, true, Some(random))
+                .unwrap()
+                .unwrap();
+        assert_eq!(report.gather_mode, "tail");
+        let Wires::Resident(resident) = &wires else {
+            panic!("resident tail")
+        };
+        resident.validate().unwrap();
+        assert_eq!(
+            resident.read_columns::<G>(data.common.config.num_wires, data.common.degree()),
+            worklist.full_witness().wire_values
+        );
+        let proof = crate::plonk::prover::prove_from_wires(
+            &data.prover_only,
+            &data.common,
+            public,
+            wires,
+            &mut TimingTree::default(),
+        )
+        .unwrap();
+        data.verify(proof).unwrap();
     }
 
     #[test]
