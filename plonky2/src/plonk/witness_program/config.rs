@@ -387,7 +387,6 @@ mod tests {
         let values = [
             ("PLONKY2_WITNESS_BENCH_MODE", "checked"),
             ("PLONKY2_WITNESS_BENCH_SCHEDULE", "layers"),
-            ("PLONKY2_WITNESS_BENCH_GATHER", "gpu"),
         ];
         let c = read(WitnessConfig::default(), &values).unwrap();
         #[cfg(feature = "witness-benchmarks")]
@@ -400,7 +399,6 @@ mod tests {
                 c.policy.schedule,
                 super::super::policy::WitnessSchedule::Layers
             );
-            assert_eq!(c.policy.gather, super::super::policy::WitnessGather::Gpu);
             assert!(read(
                 WitnessConfig::default(),
                 &[("PLONKY2_WITNESS_BENCH_MODE", "bad")]

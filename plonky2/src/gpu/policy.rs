@@ -36,6 +36,29 @@ impl ExecutionMode {
     }
 }
 
+/// Where an installed witness program's output goes to the device. Applies
+/// only to proofs that use a prepared witness program and resident wires.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WitnessPlacement {
+    /// The host path on every adapter.
+    #[default]
+    Auto,
+    /// The CPU executes the whole witness program and gathers the wire
+    /// matrix into an upload buffer; the CPU samples commitment salts.
+    Host,
+    /// The CPU executes only operations the device cannot finish and uploads
+    /// its compact state. The device runs the remaining operations with their
+    /// fresh randomness, checks roots and copy constraints, places the wires
+    /// and samples commitment salts.
+    Device,
+}
+
+impl WitnessPlacement {
+    pub(crate) fn on_device(self, _mappable: bool) -> bool {
+        self == Self::Device
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExecutionPath {
     Resident,

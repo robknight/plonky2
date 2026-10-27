@@ -1,22 +1,19 @@
-//! Experimental CPU/GPU cut: only certified exclusive outputs whose consumers
-//! all stay on the device may be deferred. Roots, aliases and public inputs
-//! are seeded on the CPU; the optional checked cut validates them on the GPU.
-//! This is selected only by the benchmark experiment hook.
+//! The CPU/GPU cut of a witness program for the device witness path. Only
+//! certified exclusive outputs whose consumers all stay on the device are
+//! deferred. Roots and public inputs are seeded on the CPU as expected
+//! values; deferred producers and a final alias pass check them on the
+//! device and raise an error flag that rejects the proof.
 use std::collections::HashMap;
-use std::fmt::Write;
 
 use anyhow::Result;
 
 use super::cpu::Executor;
 use super::{Group, Kind, RegionProgram};
-use crate::field::goldilocks_field::GoldilocksField as G;
 use crate::gpu::{DeviceBuffer, DeviceCache, GpuContext};
-use crate::hash::poseidon::{Poseidon, ALL_ROUND_CONSTANTS};
 
 #[derive(Debug)]
 pub(crate) struct Tail {
     masks: HashMap<u32, Vec<bool>>,
-    pub(super) checks: bool,
     public_slots: Vec<u32>,
     cpu_slots: Vec<u32>,
     cpu_slots_device: DeviceCache,
@@ -31,40 +28,13 @@ pub(crate) struct Tail {
     shared_random: bool,
 }
 impl Tail {
-    #[cfg(test)]
     pub(super) fn compile(p: &RegionProgram, public_slots: &[u32]) -> Self {
-        Self::compile_with_checks(p, public_slots, false)
-    }
-    #[cfg(test)]
-    pub(super) fn compile_with_checks(
-        p: &RegionProgram,
-        public_slots: &[u32],
-        checks: bool,
-    ) -> Self {
-        Self::compile_config(p, public_slots, checks, false)
-    }
-    pub(super) fn compile_config(
-        p: &RegionProgram,
-        public_slots: &[u32],
-        checks: bool,
-        compress: bool,
-    ) -> Self {
-        #[cfg(feature = "witness-benchmarks")]
-        if std::env::var_os("PLONKY2_GPU_WITNESS_CUT_ANALYSIS").is_some() {
-            analyze(p, public_slots);
-        }
         let fast = p.fast.get().expect("certified tail");
         let mut cpu = vec![false; p.state_slots as usize];
         cpu[..p.roots.len()].fill(true);
         for &s in public_slots {
             if s != u32::MAX {
                 cpu[s as usize] = true;
-            }
-        }
-        if !checks {
-            for i in 0..p.alias_count as usize {
-                cpu[p.targets[p.alias_pair_offset as usize + 2 * i] as usize] = true;
-                cpu[p.targets[p.alias_pair_offset as usize + 2 * i + 1] as usize] = true;
             }
         }
         let mut masks = HashMap::new();
@@ -95,8 +65,7 @@ impl Tail {
                     let offload = supported
                         && (g.inputs..g.inputs + g.outputs).all(|pos| {
                             let s = target(g, pos, k) as usize;
-                            (checks && s < p.roots.len())
-                                || (!cpu[s] && s >= p.roots.len() && fast.single[s] != 0)
+                            s < p.roots.len() || (!cpu[s] && fast.single[s] != 0)
                         });
                     mask[k as usize] = offload;
                     if offload {
@@ -132,9 +101,8 @@ impl Tail {
         }
         let mut shared_random = false;
         let mut levels = vec![0u32; p.state_slots as usize];
-        let split_eq = crate::gpu::resident_witness::experiment().contains("split-eq");
         let mut buckets = std::collections::BTreeMap::<(u32, u8), Vec<[u32; 8]>>::new();
-        for (layer, groups) in p.groups.iter().enumerate() {
+        for groups in &p.groups {
             for g in groups {
                 for k in 0..g.count {
                     if !masks[&g.targets_offset][k as usize] {
@@ -144,21 +112,15 @@ impl Tail {
                     // Seeded roots are expected values, not dependencies on their
                     // deferred checking operations. Only device-produced values
                     // introduce edges in this graph.
-                    let rank = if compress {
-                        (0..g.inputs)
-                            .map(|pos| levels[target(g, pos, k) as usize])
-                            .max()
-                            .unwrap_or(0)
-                            + 1
-                    } else {
-                        layer as u32
-                    };
-                    if compress {
-                        for pos in g.inputs..g.inputs + g.outputs {
-                            let slot = target(g, pos, k) as usize;
-                            if slot >= p.roots.len() {
-                                levels[slot] = rank;
-                            }
+                    let rank = (0..g.inputs)
+                        .map(|pos| levels[target(g, pos, k) as usize])
+                        .max()
+                        .unwrap_or(0)
+                        + 1;
+                    for pos in g.inputs..g.inputs + g.outputs {
+                        let slot = target(g, pos, k) as usize;
+                        if slot >= p.roots.len() {
+                            levels[slot] = rank;
                         }
                     }
                     let device_random = if g.kind == Kind::RandomValue {
@@ -171,16 +133,7 @@ impl Tail {
                         0
                     };
                     buckets
-                        .entry((
-                            rank,
-                            if g.kind == Kind::Poseidon {
-                                0
-                            } else if split_eq && g.kind == Kind::Equality {
-                                2
-                            } else {
-                                1
-                            },
-                        ))
+                        .entry((rank, u8::from(g.kind != Kind::Poseidon)))
                         .or_default()
                         .push([
                             g.kind.code() as u32,
@@ -207,10 +160,6 @@ impl Tail {
             runs.push((base, count, kind == 0));
             run_kinds.push(kind);
         }
-        eprintln!(
-            "GPU_TAIL_SCHEDULE compressed={compress} dispatches={}",
-            runs.len()
-        );
         let mut device_outputs = vec![false; p.state_slots as usize];
         for g in p.groups.iter().flatten() {
             for k in 0..g.count {
@@ -229,21 +178,18 @@ impl Tail {
             .enumerate()
             .filter_map(|(i, &gpu)| (!gpu).then_some(i as u32))
             .collect::<Vec<_>>();
-        eprintln!(
-            "GPU_TAIL_STATE cpu_bytes={} total_bytes={}",
-            cpu_slots.len() * 8,
-            p.state_slots as usize * 8
-        );
-        eprintln!(
-            "GPU_TAIL_PLAN counts={counts:?} operations={} dispatches={} gpu_random={}/{}",
+        log::debug!(
+            "gpu witness cut: operations per kind {counts:?}, {} deferred in {} dispatches, \
+             {} of {} random values on the device, {} of {} state bytes uploaded",
             metadata.len() / 8,
             runs.len(),
             gpu_random.iter().filter(|&&x| x).count(),
-            p.random_count
+            p.random_count,
+            cpu_slots.len() * 8,
+            p.state_slots as usize * 8
         );
         Self {
             masks,
-            checks,
             public_slots: public_slots.to_vec(),
             cpu_slots,
             cpu_slots_device: Default::default(),
@@ -377,7 +323,6 @@ impl Tail {
         let error = ctx.storage("tail errors", 16);
         let mut encoder = ctx.encoder("terminal witness regions");
         encoder.clear_buffer(&error, 0, None);
-        let cache_params = crate::gpu::resident_witness::experiment().contains("params");
         let binds = self
             .runs
             .iter()
@@ -390,24 +335,17 @@ impl Tail {
                             base,
                             count,
                             u32::from(seed.is_some()),
-                            if self.checks {
-                                e.program.roots.len() as u32
-                            } else {
-                                0
-                            },
+                            e.program.roots.len() as u32,
                         ],
                     ))
                 };
-                let params = if cache_params {
-                    let cache = &self.params_cache[index][usize::from(seed.is_some())];
-                    cache.get().unwrap_or_else(|| {
-                        let p = create();
-                        cache.set_if_within_limit(ctx, p.clone());
-                        p
-                    })
-                } else {
-                    create()
-                };
+                // Fixed per run and seed mode; fresh keys are bound separately.
+                let cache = &self.params_cache[index][usize::from(seed.is_some())];
+                let params = cache.get().unwrap_or_else(|| {
+                    let p = create();
+                    cache.set_if_within_limit(ctx, p.clone());
+                    p
+                });
                 (
                     ctx.bind(
                         &kernels.layout,
@@ -435,15 +373,12 @@ impl Tail {
         let detailed = false;
         if detailed {
             for (bind, count, poseidon, kind) in &binds {
-                let label = format!(
-                    "witness {}",
-                    match kind {
-                        0 => "Poseidon",
-                        2 => "Equality",
-                        _ => "Other",
-                    }
-                );
-                let mut pass = ctx.begin_pass(&mut encoder, &label, None);
+                let label = if *kind == 0 {
+                    "witness Poseidon"
+                } else {
+                    "witness other"
+                };
+                let mut pass = ctx.begin_pass(&mut encoder, label, None);
                 pass.set_pipeline(if *poseidon {
                     &kernels.poseidon
                 } else {
@@ -468,7 +403,7 @@ impl Tail {
                 pass.dispatch_workgroups(width, groups.div_ceil(width), 1);
             }
         }
-        if self.checks && e.program.alias_count > 0 {
+        if e.program.alias_count > 0 {
             let params = ctx.uniform(
                 "alias range",
                 &[e.program.alias_pair_offset, e.program.alias_count, 0, 0],
@@ -514,11 +449,7 @@ impl Kernels {
         let mut source = crate::gpu::shader::prelude_with_mds(ctx.flavor);
         source.push_str(crate::gpu::random::CHACHA);
         source.push_str(KERNEL);
-        if crate::gpu::resident_witness::experiment().contains("dense") {
-            source.push_str(&crate::gpu::shader::witness_dense_trace());
-        } else {
-            source.push_str(&trace());
-        }
+        source.push_str(&crate::gpu::shader::witness_dense_trace());
         let module = crate::gpu::module(&ctx.device, "witness tail", &source);
         let scatter_layout = crate::gpu::storage_layout(
             &ctx.device,
@@ -599,109 +530,6 @@ fn poseidon(@builtin(global_invocation_id) id:vec3<u32>,@builtin(num_workgroups)
 }
 "#;
 
-fn trace() -> String {
-    let mut s=String::from("fn trace_poseidon(g:Op) { var a:array<Field,12>; for(var i=0u;i<12u;i++){a[i]=inp(g,i);} let swap=canonical(inp(g,12u)); if(swap.y!=0u || swap.x>1u){fail();return;}\n");
-    for i in 0..4 {
-        writeln!(
-            s,
-            "emit(g,{i}u,mul_field(swap,sub_field(a[{}],a[{i}])));",
-            i + 4
-        )
-        .unwrap();
-    }
-    s.push_str("if(swap.x==1u){for(var i=0u;i<4u;i++){let t=a[i];a[i]=a[i+4u];a[i+4u]=t;}}\n");
-    let mut out = 4;
-    let literal = crate::gpu::shader::literal;
-    for r in 0..4 {
-        for i in 0..12 {
-            writeln!(
-                s,
-                "a[{i}]=add_field(a[{i}],{});",
-                literal(ALL_ROUND_CONSTANTS[r * 12 + i])
-            )
-            .unwrap();
-        }
-        if r != 0 {
-            for i in 0..12 {
-                writeln!(s, "emit(g,{out}u,a[{i}]);").unwrap();
-                out += 1;
-            }
-        }
-        s.push_str("for(var i=0u;i<12u;i++){a[i]=sbox(a[i]);} a=mds12(a);\n");
-    }
-    for i in 0..12 {
-        writeln!(
-            s,
-            "a[{i}]=add_field(a[{i}],{});",
-            literal(G::FAST_PARTIAL_FIRST_ROUND_CONSTANT[i])
-        )
-        .unwrap();
-    }
-    s.push_str("var b:array<Field,12>;b[0]=a[0];\n");
-    for c in 1..12 {
-        let mut expr = "Field(0u,0u)".to_owned();
-        for r in 1..12 {
-            expr = format!(
-                "add_field({expr},mul_field(a[{r}],{}))",
-                literal(G::FAST_PARTIAL_ROUND_INITIAL_MATRIX[r - 1][c - 1])
-            );
-        }
-        writeln!(s, "b[{c}]={expr};").unwrap();
-    }
-    s.push_str("a=b;\n");
-    for r in 0..22 {
-        writeln!(s, "emit(g,{out}u,a[0]);a[0]=sbox(a[0]);").unwrap();
-        out += 1;
-        if r != 21 {
-            writeln!(
-                s,
-                "a[0]=add_field(a[0],{});",
-                literal(G::FAST_PARTIAL_ROUND_CONSTANTS[r])
-            )
-            .unwrap();
-        }
-        let mut expr = format!(
-            "mul_field(a[0],{})",
-            literal(G::MDS_MATRIX_CIRC[0] + G::MDS_MATRIX_DIAG[0])
-        );
-        for i in 1..12 {
-            expr = format!(
-                "add_field({expr},mul_field(a[{i}],{}))",
-                literal(G::FAST_PARTIAL_ROUND_W_HATS[r][i - 1])
-            );
-        }
-        writeln!(s, "b[0]={expr};").unwrap();
-        for i in 1..12 {
-            writeln!(
-                s,
-                "b[{i}]=add_field(a[{i}],mul_field(a[0],{}));",
-                literal(G::FAST_PARTIAL_ROUND_VS[r][i - 1])
-            )
-            .unwrap();
-        }
-        s.push_str("a=b;\n");
-    }
-    for r in 26..30 {
-        for i in 0..12 {
-            writeln!(
-                s,
-                "a[{i}]=add_field(a[{i}],{});emit(g,{out}u,a[{i}]);",
-                literal(ALL_ROUND_CONSTANTS[r * 12 + i])
-            )
-            .unwrap();
-            out += 1;
-        }
-        s.push_str("for(var i=0u;i<12u;i++){a[i]=sbox(a[i]);} a=mds12(a);\n");
-    }
-    for i in 0..12 {
-        writeln!(s, "emit(g,{out}u,a[{i}]);").unwrap();
-        out += 1;
-    }
-    assert_eq!(out, 122);
-    s.push_str("}\n");
-    s
-}
-
 const SCATTER: &str = r#"
 @group(0) @binding(0) var<uniform> count:vec4<u32>;
 @group(0) @binding(1) var<storage,read> packed:array<vec2<u32>>;
@@ -712,95 +540,6 @@ fn scatter(@builtin(global_invocation_id) id:vec3<u32>,@builtin(num_workgroups) 
  let i=id.x+id.y*groups.x*256u;if(i<count.x){state[slots[i]]=packed[i];}
 }
 "#;
-
-#[cfg(feature = "witness-benchmarks")]
-fn analyze(p: &RegionProgram, public: &[u32]) {
-    let supported = |k: Kind| {
-        matches!(
-            k,
-            Kind::Poseidon
-                | Kind::Arithmetic
-                | Kind::Copy
-                | Kind::Constant
-                | Kind::Equality
-                | Kind::ExtensionArithmetic
-                | Kind::ExtensionMultiply
-                | Kind::ArithmeticChain
-                | Kind::RandomValue
-                | Kind::ConditionalZero
-                | Kind::BitSum
-        )
-    };
-    let current = (0..Kind::COUNT)
-        .filter(|&k| supported(Kind::from_code(k).unwrap()))
-        .fold(0u128, |mask, k| mask | (1u128 << k));
-    let fast = p.fast.get().unwrap();
-    let estimate = |support: u128, checks: bool| {
-        let mut cpu = vec![false; p.state_slots as usize];
-        cpu[..p.roots.len()].fill(true);
-        for &s in public {
-            if s != u32::MAX {
-                cpu[s as usize] = true;
-            }
-        }
-        if !checks {
-            for i in 0..p.alias_count as usize {
-                cpu[p.targets[p.alias_pair_offset as usize + 2 * i] as usize] = true;
-                cpu[p.targets[p.alias_pair_offset as usize + 2 * i + 1] as usize] = true;
-            }
-        }
-        let mut counts = [0u64; Kind::COUNT];
-        for groups in p.groups.iter().rev() {
-            for g in groups {
-                for k in 0..g.count {
-                    let target = |pos: u32| {
-                        p.targets[(g.targets_offset + pos * g.count + k) as usize] as usize
-                    };
-                    let offload = support & (1u128 << g.kind.code()) != 0
-                        && (g.inputs..g.inputs + g.outputs).all(|pos| {
-                            let s = target(pos);
-                            if checks && s < p.roots.len() {
-                                true
-                            } else {
-                                !cpu[s] && s >= p.roots.len() && fast.single[s] != 0
-                            }
-                        });
-                    if offload {
-                        counts[g.kind.code()] += 1;
-                    } else {
-                        for pos in 0..g.inputs {
-                            cpu[target(pos)] = true;
-                        }
-                    }
-                }
-            }
-        }
-        counts
-    };
-    let mut totals = [0u64; Kind::COUNT];
-    for g in p.groups.iter().flatten() {
-        totals[g.kind.code()] += g.count as u64;
-    }
-    eprintln!("GPU_CUT_TOTALS {totals:?}");
-    for (label, mask, checks) in [
-        ("current", current, false),
-        ("all-ops", u128::MAX, false),
-        ("current-device-checks", current, true),
-        ("all-device-checks", u128::MAX, true),
-    ] {
-        let counts = estimate(mask, checks);
-        eprintln!("GPU_CUT_ESTIMATE label={label} counts={counts:?}");
-    }
-    for k in 0..Kind::COUNT {
-        if current & (1u128 << k) == 0 {
-            let counts = estimate(current | (1u128 << k), true);
-            eprintln!(
-                "GPU_CUT_EXTRA kind={:?} counts={counts:?}",
-                Kind::from_code(k).unwrap()
-            );
-        }
-    }
-}
 
 const ALIASES: &str = r#"
 @group(0) @binding(0) var<uniform> range:vec4<u32>;
@@ -817,8 +556,9 @@ fn validate(@builtin(global_invocation_id) id:vec3<u32>,@builtin(num_workgroups)
 
 #[cfg(test)]
 mod trace_tests {
-    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField as G;
     use crate::field::types::{Field, Field64};
+    use crate::hash::poseidon::Poseidon;
     #[test]
     fn dense_rounds_match_all_122_trace_values() {
         for case in 0..256u64 {

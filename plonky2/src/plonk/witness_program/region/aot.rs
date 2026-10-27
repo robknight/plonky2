@@ -22,14 +22,11 @@ pub(super) struct FastLayout {
     pub poseidon: OnceLock<HashMap<u32, Vec<u32>>>,
     pub adaptive: OnceLock<HashMap<u32, Vec<u8>>>,
     pub random_spans: OnceLock<HashMap<u32, (u32, u32)>>,
+    /// Column-major cell to state slot table on the device.
     #[cfg(feature = "gpu")]
-    pub gpu_gather: OnceLock<Arc<GpuGather>>,
+    pub wire_slots: crate::gpu::DeviceCache,
     #[cfg(feature = "gpu")]
     pub gpu_tail: OnceLock<Arc<super::gpu_tail::Tail>>,
-    #[cfg(feature = "gpu")]
-    pub gpu_tail_checks: OnceLock<Arc<super::gpu_tail::Tail>>,
-    #[cfg(feature = "gpu")]
-    pub gpu_tail_ranks: OnceLock<Arc<super::gpu_tail::Tail>>,
 }
 
 #[cfg(feature = "witness-benchmarks")]
@@ -489,13 +486,9 @@ pub(super) fn certify(p: &RegionProgram) -> Result<FastLayout> {
         adaptive: Default::default(),
         random_spans: Default::default(),
         #[cfg(feature = "gpu")]
-        gpu_gather: Default::default(),
+        wire_slots: Default::default(),
         #[cfg(feature = "gpu")]
         gpu_tail: Default::default(),
-        #[cfg(feature = "gpu")]
-        gpu_tail_checks: Default::default(),
-        #[cfg(feature = "gpu")]
-        gpu_tail_ranks: Default::default(),
     })
 }
 
@@ -688,48 +681,28 @@ pub(super) fn run_adaptive(
     Ok(())
 }
 
-#[cfg(feature = "gpu")]
-#[derive(Debug)]
-pub(super) struct GpuGather {
-    layout: wgpu::BindGroupLayout,
-    pipeline: wgpu::ComputePipeline,
-    slots: crate::gpu::DeviceCache,
-}
-
-/// Upload compact contiguous state; resolve the fixed wire permutation on GPU.
-/// Synchronous submission makes this experiment's gather timer include GPU work.
+/// Uploads the executor's compact state for kernels that read wires through
+/// the cell-to-slot table, which is uploaded once per program. With a device
+/// tail only the CPU-produced slots are uploaded and scattered on the device.
 #[cfg(feature = "gpu")]
 pub(super) fn compact_on_gpu(
     e: &Executor<'_>,
     ctx: &crate::gpu::GpuContext,
     slots: &[u32],
 ) -> Result<(crate::gpu::DeviceBuffer, crate::gpu::DeviceBuffer)> {
-    let cache = e.program.fast.get().expect("validated GPU gather plan").gpu_gather.get_or_init(|| {
-        let layout = crate::gpu::storage_layout(&ctx.device, "witness gather", &[(false,true),(false,true),(false,false)]);
-        let module = crate::gpu::module(&ctx.device, "witness gather", r#"
-@group(0) @binding(0) var<storage, read> state: array<vec2<u32>>;
-@group(0) @binding(1) var<storage, read> slots: array<u32>;
-@group(0) @binding(2) var<storage, read_write> wires: array<vec2<u32>>;
-@compute @workgroup_size(256)
-fn gather(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
-    let i = id.x + id.y * groups.x * 256u;
-    if (i >= arrayLength(&slots) || i >= arrayLength(&wires)) { return; }
-    let slot = slots[i];
-    var value = vec2<u32>(0u);
-    if (slot != 0xffffffffu && slot < arrayLength(&state)) { value = state[slot]; }
-    wires[i] = value;
-}
-"#);
-        let pipeline = crate::gpu::pipeline(&ctx.device, &layout, &module, "gather");
-        Arc::new(GpuGather { layout, pipeline, slots: Default::default() })
-    });
-    let indices = cache.slots.get().unwrap_or_else(|| {
+    let cache = &e
+        .program
+        .fast
+        .get()
+        .expect("validated device witness plan")
+        .wire_slots;
+    let indices = cache.get().unwrap_or_else(|| {
         let words = slots
             .chunks(2)
             .map(|x| x[0] as u64 | ((x.get(1).copied().unwrap_or(u32::MAX) as u64) << 32))
             .collect::<Vec<_>>();
         let indices = ctx.upload("witness wire slots", &words);
-        cache.slots.set_if_within_limit(ctx, indices.clone());
+        cache.set_if_within_limit(ctx, indices.clone());
         indices
     });
     if let Some(tail) = e.gpu_tail {
@@ -763,36 +736,6 @@ fn gather(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups)
     let state = ctx.storage("compact witness state", state_bytes as u64);
     ctx.finish_upload(staging, &state, state_bytes as u64);
     Ok((state, indices))
-}
-
-#[cfg(feature = "gpu")]
-pub(super) fn gather_on_gpu(
-    e: &Executor<'_>,
-    ctx: &crate::gpu::GpuContext,
-    slots: &[u32],
-) -> Result<crate::gpu::DeviceBuffer> {
-    let (state, indices) = compact_on_gpu(e, ctx, slots)?;
-    let cache = e
-        .program
-        .fast
-        .get()
-        .expect("validated GPU gather plan")
-        .gpu_gather
-        .get()
-        .expect("prepared gather");
-    let out = ctx.storage("GPU gathered proving wires", (slots.len() * 8) as u64);
-    let bind = ctx.bind(&cache.layout, &[&state, &indices, &out]);
-    let mut encoder = ctx.encoder("witness wire gather");
-    {
-        let mut pass = ctx.begin_pass(&mut encoder, "witness wire gather", None);
-        pass.set_pipeline(&cache.pipeline);
-        pass.set_bind_group(0, &bind, &[]);
-        let groups = (slots.len() as u32).div_ceil(256);
-        let width = groups.min(65535);
-        pass.dispatch_workgroups(width, groups.div_ceil(width), 1);
-    }
-    ctx.submit(encoder);
-    Ok(out)
 }
 
 fn poseidon_mode() -> u8 {

@@ -1,7 +1,7 @@
 //! Typed GPU runtime settings, read from the environment on first use unless
 //! the application supplies explicit settings through [`configure`](super::configure).
 
-use super::policy::ExecutionMode;
+use super::policy::{ExecutionMode, WitnessPlacement};
 use crate::util::environment::{Environment, EnvironmentError};
 
 /// A graphics API the context may use.
@@ -72,6 +72,8 @@ pub struct GpuConfig {
     /// workgroup per tile without prefetching. `None` is 8 on unified-memory
     /// adapters, where it was measured, and 0 on discrete ones.
     pub fft_tiles_per_workgroup: Option<u32>,
+    /// Whether witness work after the CPU executor runs on the device.
+    pub witness: WitnessPlacement,
 }
 
 impl Default for GpuConfig {
@@ -88,6 +90,7 @@ impl Default for GpuConfig {
             quotient_cpu_share: 0.10,
             shutdown_at_exit: true,
             fft_tiles_per_workgroup: None,
+            witness: WitnessPlacement::Auto,
         }
     }
 }
@@ -188,6 +191,17 @@ impl GpuConfig {
         )? {
             c.fft_tiles_per_workgroup = value;
         }
+        if let Some(v) = env.choice(
+            "PLONKY2_GPU_WITNESS",
+            "PLONKY2_GPU_WITNESS",
+            &[
+                ("auto", WitnessPlacement::Auto),
+                ("host", WitnessPlacement::Host),
+                ("device", WitnessPlacement::Device),
+            ],
+        )? {
+            c.witness = v;
+        }
         c.validate()?;
         Ok(c)
     }
@@ -286,6 +300,7 @@ mod tests {
             quotient_cpu_share: 0.3,
             shutdown_at_exit: false,
             fft_tiles_per_workgroup: Some(5),
+            witness: WitnessPlacement::Host,
         };
         assert_eq!(read_defaults(defaults.clone(), &[]).unwrap(), defaults);
         let c = read_defaults(
@@ -312,6 +327,7 @@ mod tests {
         assert_eq!(c.allow_software, defaults.allow_software);
         assert_eq!(c.shutdown_at_exit, defaults.shutdown_at_exit);
         assert_eq!(c.fft_tiles_per_workgroup, Some(5));
+        assert_eq!(c.witness, WitnessPlacement::Host);
         assert_eq!(
             read_defaults(
                 defaults.clone(),
@@ -344,6 +360,7 @@ mod tests {
             ("PLONKY2_GPU_QUOTIENT_CPU_SHARE", "0.25"),
             ("PLONKY2_GPU_SHUTDOWN_AT_EXIT", "0"),
             ("PLONKY2_GPU_FFT_TILES_PER_WORKGROUP", "0"),
+            ("PLONKY2_GPU_WITNESS", "device"),
         ])
         .unwrap();
         assert!(!c.enabled && c.allow_software && !c.shutdown_at_exit);
@@ -355,7 +372,9 @@ mod tests {
         assert_eq!(c.pool_bytes, Some(4096));
         assert_eq!(c.quotient_cpu_share, 0.25);
         assert_eq!(c.fft_tiles_per_workgroup, Some(0));
+        assert_eq!(c.witness, WitnessPlacement::Device);
         assert!(read(&[("PLONKY2_GPU_FFT_TILES_PER_WORKGROUP", "-1")]).is_err());
+        assert!(read(&[("PLONKY2_GPU_WITNESS", "gpu")]).is_err());
         let c = read(&[("PLONKY2_GPU_PROVING_WORKERS", "3")]).unwrap();
         assert_eq!(c.retained_bytes_limit(), 6 << 30);
     }

@@ -889,8 +889,9 @@ fn commit<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usi
     // The FFT is submitted without waiting for it: the salt is sampled and
     // written while the device runs it (into columns it does not touch), and
     // the leaf hashing below queues behind it, so the device goes from one to
-    // the other without waiting for the host.
-    let device_random = crate::gpu::resident_witness::experiment().contains("salts");
+    // the other without waiting for the host. With the device witness path the
+    // device samples the salt from a fresh OS seed instead.
+    let device_random = ctx.options.witness_on_device;
     let salts = timed!(timing, "gpu: FFT and salt", {
         timed!(
             timing,

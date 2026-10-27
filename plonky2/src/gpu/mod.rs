@@ -100,7 +100,7 @@ pub(crate) mod policy;
 #[doc(hidden)]
 pub mod poseidon_bn128;
 pub use config::{Backend, ConfigureError, GpuConfig};
-pub use policy::ExecutionMode;
+pub use policy::{ExecutionMode, WitnessPlacement};
 pub(crate) mod pow;
 #[doc(hidden)]
 pub mod quotient;
@@ -367,12 +367,9 @@ pub fn field_supported<F: PrimeField64>() -> bool {
     F::ORDER == GOLDILOCKS_ORDER
 }
 
-type FixedUniformCache = Mutex<std::collections::HashMap<(String, Vec<u32>), DeviceCache>>;
-
 /// A device, its queue, the compiled pipelines and cached constant tables.
 #[doc(hidden)]
 pub struct GpuContext {
-    fixed_uniforms: FixedUniformCache,
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
     pub info: wgpu::AdapterInfo,
@@ -567,6 +564,8 @@ pub(crate) struct GpuOptions {
     pub proving_workers: usize,
     pub retained_bytes: u64,
     pub fft_tiles_per_workgroup: u32,
+    /// Finish witness programs on the device (`GpuConfig::witness`).
+    pub witness_on_device: bool,
 }
 
 impl GpuOptions {
@@ -583,6 +582,7 @@ impl GpuOptions {
             } else {
                 0
             }),
+            witness_on_device: config.witness.on_device(mappable),
         }
     }
 
@@ -942,7 +942,6 @@ impl GpuContext {
             permute,
             random: OnceLock::new(),
             witness_tail: OnceLock::new(),
-            fixed_uniforms: Mutex::new(Default::default()),
             compact_fft: OnceLock::new(),
             fft_layout,
             fft,
@@ -1043,41 +1042,6 @@ impl GpuContext {
 
     /// A uniform buffer holding `words`.
     pub(crate) fn uniform(&self, label: &str, words: &[u32]) -> wgpu::Buffer {
-        // Only shape/control metadata is eligible. Fresh RNG keys and proof
-        // challenges are deliberately outside this allowlist.
-        if cfg!(feature = "witness-benchmarks")
-            && resident_witness::experiment().contains("uniforms")
-            && matches!(
-                label,
-                "fft params"
-                    | "hash params"
-                    | "permutation params"
-                    | "fold params"
-                    | "leaf gather params"
-                    | "scatter range"
-                    | "alias range"
-            )
-        {
-            let cache = {
-                let mut fixed = self.fixed_uniforms.lock().unwrap();
-                let key = (label.to_owned(), words.to_vec());
-                if !fixed.contains_key(&key) && fixed.len() >= 1024 {
-                    if let Some(old) = fixed.keys().next().cloned() {
-                        fixed.remove(&old);
-                    }
-                }
-                fixed.entry(key).or_default().clone()
-            };
-            if let Some(buffer) = cache.get() {
-                return std::ops::Deref::deref(&buffer).clone();
-            }
-            let buffer = self.uniform_uncached(label, words);
-            cache.set_if_within_limit(self, DeviceBuffer::unpooled(buffer.clone()));
-            return buffer;
-        }
-        self.uniform_uncached(label, words)
-    }
-    fn uniform_uncached(&self, label: &str, words: &[u32]) -> wgpu::Buffer {
         let mut bytes = words
             .iter()
             .flat_map(|w| w.to_le_bytes())

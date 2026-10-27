@@ -32,32 +32,14 @@ pub(crate) enum WitnessSchedule {
     Dependencies,
 }
 
-/// Destination for the final witness gather.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum WitnessGather {
-    /// Use the recommended CPU gather, including mapped GPU staging when applicable.
-    #[default]
-    Auto,
-    /// Request GPU gathering when GPU proving and a validated plan are available.
-    #[cfg(any(feature = "gpu", test, feature = "witness-benchmarks"))]
-    Gpu,
-    #[cfg(any(feature = "gpu", test))]
-    Compact,
-    #[cfg(any(feature = "gpu", test))]
-    Tail,
-    #[cfg(any(feature = "gpu", test))]
-    TailRandom,
-    #[cfg(any(feature = "gpu", test))]
-    TailChecks,
-    #[cfg(any(feature = "gpu", test))]
-    TailChecksRandom,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Policy {
     pub execution: WitnessExecution,
     pub schedule: WitnessSchedule,
-    pub gather: WitnessGather,
+    /// Forces the host (false) or device (true) witness path regardless of
+    /// the GPU context's `witness` setting.
+    #[cfg(test)]
+    pub device_witness: Option<bool>,
     #[cfg(test)]
     pub gather_tiles: (usize, usize),
 }
@@ -66,7 +48,8 @@ impl Default for Policy {
         Self {
             execution: WitnessExecution::Auto,
             schedule: WitnessSchedule::Auto,
-            gather: WitnessGather::Auto,
+            #[cfg(test)]
+            device_witness: None,
             #[cfg(test)]
             gather_tiles: (16, 256),
         }
@@ -118,17 +101,6 @@ impl Policy {
         )? {
             self.schedule = v;
         }
-        if let Some(v) = env.choice(
-            "PLONKY2_WITNESS_BENCH_GATHER",
-            "PLONKY2_WITNESS_BENCH_GATHER",
-            &[
-                ("auto", WitnessGather::Auto),
-                ("cpu", WitnessGather::Auto),
-                ("gpu", WitnessGather::Gpu),
-            ],
-        )? {
-            self.gather = v;
-        }
         self.validate()
     }
 }
@@ -141,7 +113,6 @@ mod tests {
         let env = crate::util::environment::Environment::with_lookup(|key: &str| match key {
             "PLONKY2_WITNESS_BENCH_MODE" => Some("checked".into()),
             "PLONKY2_WITNESS_BENCH_SCHEDULE" => Some("layers".into()),
-            "PLONKY2_WITNESS_BENCH_GATHER" => Some("gpu".into()),
             _ => None,
         });
         let mut p = Policy::default();
@@ -149,7 +120,6 @@ mod tests {
         assert_eq!(p.compilation_key(), Policy::default().compilation_key());
         assert_eq!(p.execution, WitnessExecution::Checked);
         assert_eq!(p.schedule, WitnessSchedule::Layers);
-        assert_eq!(p.gather, WitnessGather::Gpu);
         let env = crate::util::environment::Environment::with_lookup(|key: &str| {
             (key == "PLONKY2_WITNESS_BENCH_MODE").then(|| "bad".into())
         });

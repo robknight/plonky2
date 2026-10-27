@@ -15,18 +15,6 @@ pub(crate) struct ResidentWitness {
     pub error: Option<DeviceBuffer>,
 }
 
-/// Benchmark-only pipeline experiments, selected before a process starts proving.
-pub(crate) fn experiment() -> String {
-    #[cfg(feature = "witness-benchmarks")]
-    {
-        std::env::var("PLONKY2_GPU_WITNESS_EXPERIMENT").unwrap_or_default()
-    }
-    #[cfg(not(feature = "witness-benchmarks"))]
-    {
-        String::new()
-    }
-}
-
 pub(crate) struct CompactFft {
     pub layout: wgpu::BindGroupLayout,
     pub ordinary: wgpu::ComputePipeline,

@@ -315,7 +315,7 @@ impl RegionProgram {
         drop(layers);
         let aliases = executor.profile.stage(Stage::Aliases);
         #[cfg(feature = "gpu")]
-        let device_checks = executor.gpu_tail.is_some_and(|t| t.checks);
+        let device_checks = executor.gpu_tail.is_some();
         #[cfg(not(feature = "gpu"))]
         let device_checks = false;
         if !device_checks {
@@ -2171,35 +2171,35 @@ pub(crate) fn generate_wires_with<
         values
     };
     drop(root_binding);
+    // A resident destination, held through execution and upload: routing may
+    // change concurrently, and deferred values must be produced on this device.
     #[cfg(feature = "gpu")]
-    let tail_requested = allow_device
-        && cfg!(feature = "parallel")
-        && (crate::gpu::resident_witness::experiment().starts_with("tail")
-            || program.runtime.config.policy.gather == super::super::policy::WitnessGather::Tail
-            || program.runtime.config.policy.gather
-                == super::super::policy::WitnessGather::TailRandom
-            || program.runtime.config.policy.gather
-                == super::super::policy::WitnessGather::TailChecks
-            || program.runtime.config.policy.gather
-                == super::super::policy::WitnessGather::TailChecksRandom)
-        && crate::gpu::permutation::supported_circuit(prover, common)
-        && program.runtime.config.policy.execution
-            != super::super::policy::WitnessExecution::Checked;
-    // Keep the selected context alive through execution and upload. Routing may
-    // change concurrently; deferred values must still be produced on this device.
-    #[cfg(feature = "gpu")]
-    let tail_ctx = if tail_requested {
+    let ctx = if allow_device && crate::gpu::permutation::supported_circuit(prover, common) {
         crate::gpu::lde::applicable::<F, C, D>(
             num_wires,
             degree,
             config.fri_config.rate_bits,
-            config.zero_knowledge,
+            config.zero_knowledge && crate::plonk::plonk_common::PlonkOracle::WIRES.blinding,
         )
     } else {
         None
     };
     #[cfg(feature = "gpu")]
-    let tail = if tail_ctx.is_some() {
+    let on_device = ctx.as_ref().is_some_and(|ctx| {
+        #[cfg(test)]
+        if let Some(forced) = program.runtime.config.policy.device_witness {
+            return forced;
+        }
+        ctx.options.witness_on_device
+    });
+    // Deferring operations needs the parallel executor's certified plan; the
+    // serial and checked executors upload their complete compact state.
+    #[cfg(feature = "gpu")]
+    let tail = if on_device
+        && cfg!(feature = "parallel")
+        && program.runtime.config.policy.execution
+            != super::super::policy::WitnessExecution::Checked
+    {
         let public_slots = prover
             .public_inputs
             .iter()
@@ -2210,27 +2210,10 @@ pub(crate) fn generate_wires_with<
             "missing public input in GPU witness plan"
         );
         let fast = program.fast.get().expect("prepared tail certificate");
-        let checks = crate::gpu::resident_witness::experiment().contains("checks")
-            || program.runtime.config.policy.gather
-                == super::super::policy::WitnessGather::TailChecks
-            || program.runtime.config.policy.gather
-                == super::super::policy::WitnessGather::TailChecksRandom;
-        let compress = checks && crate::gpu::resident_witness::experiment().contains("ranks");
-        let cache = if compress {
-            &fast.gpu_tail_ranks
-        } else if checks {
-            &fast.gpu_tail_checks
-        } else {
-            &fast.gpu_tail
-        };
-        let tail = cache
+        let tail = fast
+            .gpu_tail
             .get_or_init(|| {
-                std::sync::Arc::new(super::gpu_tail::Tail::compile_config(
-                    &program,
-                    &public_slots,
-                    checks,
-                    compress,
-                ))
+                std::sync::Arc::new(super::gpu_tail::Tail::compile(&program, &public_slots))
             })
             .as_ref();
         ensure!(
@@ -2241,15 +2224,10 @@ pub(crate) fn generate_wires_with<
     } else {
         None
     };
+    // Deferred random values come from a fresh device seed unless the caller
+    // supplied the values.
     #[cfg(feature = "gpu")]
-    let device_seed = if tail.is_some()
-        && random_values.is_none()
-        && (crate::gpu::resident_witness::experiment().contains("random")
-            || program.runtime.config.policy.gather
-                == super::super::policy::WitnessGather::TailRandom
-            || program.runtime.config.policy.gather
-                == super::super::policy::WitnessGather::TailChecksRandom)
-    {
+    let device_seed = if tail.is_some() && random_values.is_none() {
         Some(crate::gpu::random::fresh_seed())
     } else {
         None
@@ -2350,19 +2328,6 @@ pub(crate) fn generate_wires_with<
         })
         .collect::<Result<Vec<_>>>()?;
     // A device destination exists only with the `gpu` feature.
-    #[cfg(feature = "gpu")]
-    let ctx = if tail.is_some() {
-        tail_ctx
-    } else if allow_device && crate::gpu::permutation::supported_circuit(prover, common) {
-        crate::gpu::lde::applicable::<F, C, D>(
-            num_wires,
-            degree,
-            config.fri_config.rate_bits,
-            config.zero_knowledge && crate::plonk::plonk_common::PlonkOracle::WIRES.blinding,
-        )
-    } else {
-        None
-    };
     #[cfg(not(feature = "gpu"))]
     let ctx: Option<()> = {
         let _ = (allow_device, config);
@@ -2372,16 +2337,9 @@ pub(crate) fn generate_wires_with<
         #[cfg(feature = "gpu")]
         Some(ctx) => {
             let cell_slots = program.cell_slots(map, num_wires, degree);
-            let gpu_gather = program.runtime.config.policy.gather
-                == super::super::policy::WitnessGather::Gpu
-                && executor.fast.is_some();
-            let compact = tail.is_some()
-                || crate::gpu::resident_witness::experiment().starts_with("compact")
-                || program.runtime.config.policy.gather
-                    == super::super::policy::WitnessGather::Compact;
             let mut wire_slots = None;
             let mut error = None;
-            let wire_values = if compact {
+            let wire_values = if on_device {
                 report.gather_mode = "compact";
                 let (state, slots) = super::aot::compact_on_gpu(&executor, &ctx, cell_slots)?;
                 wire_slots = Some(slots);
@@ -2390,9 +2348,6 @@ pub(crate) fn generate_wires_with<
                     report.gather_mode = "tail";
                 }
                 state
-            } else if gpu_gather {
-                report.gather_mode = "gpu";
-                super::aot::gather_on_gpu(&executor, &ctx, cell_slots)?
             } else {
                 let bytes = num_wires * degree * 8;
                 // A reused mapped upload buffer, one mapped range per column
@@ -2945,7 +2900,7 @@ pub(crate) mod tests {
     #[ignore = "requires a native GPU; run alone with --ignored"]
     fn gpu_cpu_gather_tiles_match_every_worklist_wire() {
         use crate::hash::poseidon::PoseidonHash;
-        use crate::plonk::witness_program::policy::WitnessGather;
+        use crate::plonk::witness_program::policy::WitnessExecution;
         use crate::plonk::witness_program::WitnessConfig;
         for hashes in [512, 1024] {
             let mut builder =
@@ -2995,26 +2950,24 @@ pub(crate) mod tests {
                 .flatten()
                 .map(|v| v.to_canonical_u64())
                 .collect::<Vec<_>>();
-            for (gather, columns, rows) in [
-                (WitnessGather::Auto, 2, 1024),
-                (WitnessGather::Auto, 16, 256),
-                (WitnessGather::Auto, 7, 123),
-                (WitnessGather::Gpu, 16, 256),
-                (WitnessGather::Compact, 16, 256),
-                (WitnessGather::Tail, 16, 256),
-                (WitnessGather::TailChecks, 16, 256),
+            // (device witness, checked execution, CPU gather tile)
+            for (device, checked, columns, rows) in [
+                (false, false, 2, 1024),
+                (false, false, 16, 256),
+                (false, false, 7, 123),
+                (true, false, 16, 256),
+                (true, true, 16, 256),
             ] {
-                if !cfg!(feature = "parallel")
-                    && matches!(gather, WitnessGather::Tail | WitnessGather::TailChecks)
-                {
-                    continue;
-                }
                 let mut config = program.config().clone();
-                config.policy.gather = gather;
+                config.policy.device_witness = Some(device);
+                if checked {
+                    config.policy.execution = WitnessExecution::Checked;
+                }
                 config.policy.gather_tiles = (columns, rows);
-                if (columns == 7 || gather == WitnessGather::Gpu) && cfg!(feature = "parallel") {
+                if columns == 7 && cfg!(feature = "parallel") {
                     config.threads = 2;
                 }
+                let tail = device && !checked && cfg!(feature = "parallel");
                 data.install_witness_program(program.with_execution_config(config).unwrap())
                     .unwrap();
                 let (public_inputs, wires, report) = generate_wires_with(
@@ -3028,12 +2981,10 @@ pub(crate) mod tests {
                 .unwrap();
                 assert_eq!(
                     report.gather_mode,
-                    if gather == WitnessGather::Tail || gather == WitnessGather::TailChecks {
+                    if tail {
                         "tail"
-                    } else if gather == WitnessGather::Compact {
+                    } else if device {
                         "compact"
-                    } else if gather == WitnessGather::Gpu {
-                        "gpu"
                     } else {
                         "reused"
                     }
@@ -3061,7 +3012,7 @@ pub(crate) mod tests {
                 )
                 .unwrap();
                 data.verify(proof).unwrap();
-                if gather == WitnessGather::Tail || gather == WitnessGather::TailChecks {
+                if tail {
                     let mut invalid = random.clone();
                     invalid[0] = G::ORDER;
                     match generate_wires_with(
@@ -3098,7 +3049,6 @@ pub(crate) mod tests {
     #[ignore = "requires a native GPU; run alone"]
     fn gpu_tail_random_proves_fresh_inputs() {
         use crate::hash::poseidon::PoseidonHash;
-        use crate::plonk::witness_program::policy::WitnessGather;
         use crate::plonk::witness_program::{WitnessConfig, WitnessFallback};
         let mut builder =
             CircuitBuilder::<G, 2>::new(CircuitConfig::standard_recursion_zk_config());
@@ -3117,7 +3067,7 @@ pub(crate) mod tests {
         builder.register_public_input(input);
         let data = builder.build::<C>();
         let mut config = WitnessConfig::default();
-        config.policy.gather = WitnessGather::TailRandom;
+        config.policy.device_witness = Some(true);
         config.fallback = WitnessFallback::Error;
         data.prepare_witness_program_with_config(&[input], config)
             .unwrap();
@@ -3208,7 +3158,6 @@ pub(crate) mod tests {
     fn gpu_tail_checks_seeded_roots_and_aliases() {
         use crate::hash::poseidon::PoseidonHash;
         use crate::plonk::config::Hasher;
-        use crate::plonk::witness_program::policy::WitnessGather;
         use crate::plonk::witness_program::{WitnessConfig, WitnessFallback};
         let mut builder =
             CircuitBuilder::<G, 2>::new(CircuitConfig::standard_recursion_zk_config());
@@ -3234,7 +3183,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let mut config = WitnessConfig::default();
-        config.policy.gather = WitnessGather::TailChecks;
+        config.policy.device_witness = Some(true);
         config.fallback = WitnessFallback::Error;
         let program = data
             .compile_witness_program_with_config(&[a, b, claim], config)
