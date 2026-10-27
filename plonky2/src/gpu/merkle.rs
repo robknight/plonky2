@@ -312,10 +312,9 @@ pub(crate) fn read_query_paths<T: Copy>(
     if depth == 0 || indices.is_empty() {
         return vec![Vec::new(); indices.len()];
     }
-    let compact = ctx.storage("merkle query siblings", (indices.len() * depth * 32) as u64);
-    let mut encoder = ctx.encoder("gather merkle query siblings");
     let tree_len = num_digests >> cap_height;
-    for (query, &index) in indices.iter().enumerate() {
+    let mut siblings = Vec::with_capacity(indices.len() * depth);
+    for &index in indices {
         // The same sibling positions as the CPU's merkle_tree_prove.
         let tree_start = (index >> depth) * tree_len;
         let mut pair = index & ((1 << depth) - 1);
@@ -323,14 +322,36 @@ pub(crate) fn read_query_paths<T: Copy>(
             let parity = pair & 1;
             pair >>= 1;
             let sibling = tree_start + 2 * ((pair << (level + 1)) + (1 << level) - 1) + 1 - parity;
-            encoder.copy_buffer_to_buffer(
-                digests,
-                sibling as u64 * 32,
-                &compact,
-                ((query * depth + level) * 32) as u64,
-                32,
-            );
+            siblings.push(sibling as u64);
         }
+    }
+    let kernel = ctx.sibling_gather.get_or_init(|| {
+        let layout = super::storage_layout(
+            &ctx.device,
+            "sibling gather",
+            &[(true, true), (false, true), (false, true), (false, false)],
+        );
+        let module = super::module(
+            &ctx.device,
+            "sibling gather",
+            super::shader::sibling_gather_module(),
+        );
+        let pipeline = super::pipeline(&ctx.device, &layout, &module, "gather_siblings");
+        LeafGatherKernel { layout, pipeline }
+    });
+    let compact = ctx.storage("merkle query siblings", (siblings.len() * 32) as u64);
+    let count = u32::try_from(siblings.len() * 8).expect("sibling gather size");
+    let groups = count.div_ceil(HASH_WORKGROUP);
+    let x = groups.min(ctx.max_workgroups).max(1);
+    let params = ctx.uniform("sibling gather params", &[count, x * HASH_WORKGROUP, 0, 0]);
+    let siblings = ctx.upload("merkle query sibling positions", &siblings);
+    let bindings = ctx.bind(&kernel.layout, &[&params, digests, &siblings, &compact]);
+    let mut encoder = ctx.encoder("gather merkle query siblings");
+    {
+        let mut pass = ctx.begin_pass(&mut encoder, "gather merkle query siblings", None);
+        pass.set_pipeline(&kernel.pipeline);
+        pass.set_bind_group(0, &bindings, &[]);
+        pass.dispatch_workgroups(x, groups.div_ceil(x).max(1), 1);
     }
     let done = ctx.submit_async(encoder);
     let hashes = ctx.read_after(

@@ -198,6 +198,7 @@ fn shaders_validate() {
             ("fft", shader::fft_module(flavor)),
             ("large fft", shader::fft_module_with_tile(flavor, 11)),
             ("leaf gather", shader::leaf_gather_module().to_owned()),
+            ("sibling gather", shader::sibling_gather_module().to_owned()),
             ("fold", shader::fold_module(flavor)),
             ("open", shader::open_module(flavor)),
             ("combine", shader::combine_module(flavor)),
