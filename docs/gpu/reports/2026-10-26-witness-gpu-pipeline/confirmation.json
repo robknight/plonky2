@@ -1,0 +1,44 @@
+[
+  {
+    "label": "confirm-0-baseline",
+    "mode": "baseline",
+    "pool_gib": 4,
+    "fft_tiles": 0,
+    "repeats": 27
+  },
+  {
+    "label": "confirm-1-tail-random-salts",
+    "mode": "tail-random-salts",
+    "pool_gib": 4,
+    "fft_tiles": 0,
+    "repeats": 27
+  },
+  {
+    "label": "confirm-2-tail-checks-ranks-random-salts",
+    "mode": "tail-checks-ranks-random-salts",
+    "pool_gib": 4,
+    "fft_tiles": 0,
+    "repeats": 27
+  },
+  {
+    "label": "confirm-3-tail-checks-ranks-random-salts",
+    "mode": "tail-checks-ranks-random-salts",
+    "pool_gib": 4,
+    "fft_tiles": 0,
+    "repeats": 27
+  },
+  {
+    "label": "confirm-4-tail-random-salts",
+    "mode": "tail-random-salts",
+    "pool_gib": 4,
+    "fft_tiles": 0,
+    "repeats": 27
+  },
+  {
+    "label": "confirm-5-baseline",
+    "mode": "baseline",
+    "pool_gib": 4,
+    "fft_tiles": 0,
+    "repeats": 27
+  }
+]

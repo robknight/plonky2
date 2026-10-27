@@ -1,0 +1,161 @@
+MainPod GPU witness pipeline on the local M4 — 2026-10-26
+
+Result
+======
+The RTX 4090 winner did not produce a useful speedup on this M4. In the longer
+same-binary whole-proof comparison, the existing executor's warm median was
+607.092 ms versus 615.843 ms for the checked GPU cut with cached dispatch
+parameters and dense Poseidon traces: 1.44% higher latency. These small changes
+are comparable to run-to-run drift; this is not a precise regression estimate.
+The large 15.1% reduction seen on the 4090 did not reproduce locally.
+
+Final confirmation, forward/reverse order, 27 proofs per process, first three
+discarded, two processes and 48 warm proofs per mode:
+  Mode                         Combined median   Process medians (ms)
+  Existing executor                 607.092       597.289 / 614.931
+  New checked cut + params + dense  615.843       605.782 / 620.338
+
+Combined medians pool the warm proofs; they are not averages of process medians.
+Proofs within a process correlate. There is no confidence interval or claim of
+independent samples. All confirmation runs use the identical native release
+binary and settings. Timestamp-enabled profiles are separate from these times.
+
+Earlier screen, two processes per mode, 15 proofs each, first three discarded:
+  Existing executor                    601.766 ms (592.844 / 614.935)
+  Compact state                        597.519 ms (597.155 / 599.951)
+  Conservative GPU tail + RNG/salts     596.534 ms (594.115 / 596.834)
+  Checked GPU cut + device ranks        609.411 ms (609.411 / 609.346)
+  Above + cached params + dense trace   603.801 ms (604.721 / 603.354)
+The small apparent improvements in the compact and conservative variants were
+below the baseline block variation and were not advanced as demonstrated wins.
+The dense layout improved the larger GPU cut, but did not beat the executor.
+
+Execution-policy control
+========================
+The M4 defaults to hybrid quotient evaluation, using CPU and GPU together and
+adapting the CPU share after each proof. The 4090 defaults to fully resident
+GPU evaluation. The primary M4 comparison preserves the local hybrid default;
+its adaptive shares are captured in every run record.
+
+A separate same-binary GPU-only resident control, forward/reverse order,
+15 proofs per process with three discarded, two processes per mode, measured:
+  Existing executor   607.797 ms (609.235 / 606.838)
+  New candidate       611.964 ms (611.902 / 612.038)
+The candidate was 0.69% slower here too. Changing the execution policy did not
+reveal the substantial win observed on the 4090. These are separate windows;
+do not combine their samples or percentages with the primary confirmation.
+
+What the profiles show
+======================
+Separate captures contain six warm proofs per mode (nine total, three discarded).
+CPU executor diagnostic scopes, median milliseconds:
+  Scope                    Existing executor   New candidate
+  Sample / input binding        1.666                0.874
+  Execute                       5.265                1.882
+  Gather / enqueue              2.871                0.674
+Sampling includes root binding; it is not a pure RNG timer. Enqueued GPU witness
+work is asynchronous and appears later in commitment waits. These scopes must
+not be interpreted as independent partitions of whole-proof time.
+
+The candidate adds 12.403 ms of GPU witness-region work. Its compact indirection
+also changes the first inverse FFT from 6.827 to 8.635 ms in these captures.
+The CPU savings and reduced upload preparation therefore do not imply a net win.
+On unified memory, the original executor already writes a mapped GPU buffer;
+there is no discrete-device PCIe upload to remove.
+
+Dominant mean GPU pass times, baseline / candidate:
+  Quotient evaluation                 218.431 / 215.157 ms
+  Wire leaf hashing, 524288 x 139      182.881 / 181.355 ms
+  Large forward FFT                    47.208 /  47.774 ms
+  All Merkle levels                    35.947 /  35.747 ms
+  Leaves, 524288 x 20                   31.401 /  30.769 ms
+  Leaves, 524288 x 24                   30.852 /  30.654 ms
+
+Baseline GPU span median was 594.368 ms and recorded compute-pass union
+580.894 ms. Candidate span was 606.125 ms and union 589.060 ms. Recorded gap
+medians were 12.657 and 10.478 ms. Independent medians need not add exactly.
+These are compute-pass intervals, not SM occupancy, arithmetic utilization, or
+an exact CPU/GPU/idle partition. Host and device clocks were not calibrated.
+
+The most substantial remaining local targets are quotient evaluation and
+commitment hashing. The existing CPU executor is already inexpensive here;
+moving its few remaining milliseconds onto this GPU is an unfavorable trade.
+Keep this GPU witness cut opt-in and hardware-specific pending further work.
+
+Machine and method
+==================
+Apple M4 MacBook Air, Mac16,13, 32 GiB unified memory, 10 CPU cores (four
+performance, six efficiency), Metal, macOS 15.8.1 / Darwin 24.6.0. pmset reported
+AC power during the campaign. The OS scheduler controls core placement.
+
+Source is the exact v9 snapshot used for the final 4090 tests: all 447 source
+and lock files matched before building. Base branch fft-pipelined, commit
+0bb3c575, with the same v9 witness-pipeline patch (committed subsequently as
+6644d126 and merged into gpu). During the local test, no algorithm source,
+production defaults, active checkout, or application input fixture changed.
+
+Native CPU optimization (-C target-cpu=native), nightly-2026-10-08, release,
+locked dependencies. Cargo features gpu,time,plonky2/gpu-profiling,
+plonky2/witness-benchmarks. One proof worker, RAYON_NUM_THREADS=10, 4 GiB GPU
+storage pool, default retained budget, 64 MiB wiped CPU execution-buffer reuse,
+and eight FFT tiles per workgroup (the branch's unified-memory default).
+The baseline already enables the compiled executor and mapped upload. Strict
+prepared execution rejects fallback to the worklist. Each proof uses fresh RNG.
+
+The fixture is the same real, default-parameter, ZK, degree-16 padded MainPod
+with an empty frontend builder. Timer starts before MainPodBuilder::prove and
+ends on return, including binding, witness work, GPU work, openings, assembly,
+and ordinary cleanup. Builder creation is outside. CPU verification follows the
+timer. Cold circuit/executor/shader preparation is excluded by discarded warmups.
+Nonempty application inputs, cold start, and concurrent proof throughput were
+not measured.
+
+This was a normal live local machine. CPU/GPU balance and block timings drifted;
+OS memory compression and paging counters increased during the campaign, with
+swap-out activity early in the screen. They are system-wide counters, so no
+particular proof or application is blamed. pmset reported no recorded thermal
+or performance warning, which does not establish constant clocks. No apps were
+closed and no system power policy was changed. The runs can rule out the large
+4090 gain, but are insufficient to establish sub-percent improvements.
+
+Correctness and artifacts
+=========================
+336 measured MainPods verified across 20 processes, including all warmups,
+screens, controls, confirmations, and profiles. Every process passed explicit
+GPU shutdown. Every proof used Metal and the prepared executor; no CPU-only
+quotient fallback occurred. The main application source remains unchanged.
+
+All raw logs and settings are under:
+  .benchmark-artifacts/witness-gpu-pipeline-m4-2026-10-26/
+
+summary.json contains the measurement windows, phases.json contains CPU/GPU
+profiles, and gpu-trace.json contains per-proof relative GPU intervals. Exact
+cases are screen.json, resident.json, confirmation.json, and profiles.json.
+The executable, source snapshot, source manifest, runtime library hashes,
+build receipts, power/VM receipts, scripts, and raw logs are retained locally.
+
+Binary SHA256:
+cbb25b9ae90e59324870b8dadf4f69defa939c6ae6a5b552cfd05d22c0869d82
+
+The initial loader attempt failed before any proof because the test binary's
+SCIP dependency was not on the runtime search path. Corrected time_child.py sets
+DYLD_LIBRARY_PATH immediately before launching the benchmark. This also avoids
+macOS stripping that variable through protected /usr/bin/time. Its resource
+receipt reports process RSS including mapped unified GPU allocations; do not
+compare that directly with host-only RSS on the 4090. Failed-start logs remain
+in results/initial-loader-* and are excluded from all proof counts and timings.
+
+The final archive is results-final.tar.gz; archive-receipt.json holds its SHA256
+and size. verification.json checks every raw timed/verified proof against the
+run records, the measured binary, archived runtime libraries, and all 447 final
+source files. No cloud resources were created for this local test.
+
+Reproduction
+============
+Use the captured v9 source layout, the pinned native release build, and the JSON
+case files with scripts/measure.py. Scripts resolve their artifact root from
+scripts/.. and use the previous campaign's work/pod2 as the fixture cwd. The
+native Cargo JSON build receipt supplies the SCIP library path. Bundled copies
+are also retained in binaries/lib. Build/prepare before measuring; do not run
+compilers concurrently with benchmark processes. scripts/analyze.py regenerates
+the summaries; scripts/verify_and_archive.py checks and packages the campaign.

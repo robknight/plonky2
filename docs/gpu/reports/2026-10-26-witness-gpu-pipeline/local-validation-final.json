@@ -1,0 +1,17 @@
+{
+  "release_witness_tests": {
+    "passed": 42,
+    "ignored_native": 4
+  },
+  "clippy": {
+    "exit": 0,
+    "baseline_warnings": true
+  },
+  "format_check": {
+    "changed_source_passed": true,
+    "existing_unmodified_baseline_diff": "plonky2/src/gpu/tests/benchmarks.rs"
+  },
+  "patch_apply_check": true,
+  "source_manifest": "v9",
+  "source_files": 447
+}

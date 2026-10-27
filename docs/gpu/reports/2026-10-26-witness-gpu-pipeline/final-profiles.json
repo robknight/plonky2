@@ -1,0 +1,26 @@
+[
+  {
+    "label": "profile-v7-baseline",
+    "mode": "baseline",
+    "pool_gib": 4,
+    "fft_tiles": 0,
+    "repeats": 15,
+    "timeline": true
+  },
+  {
+    "label": "profile-v7-tail-random-salts",
+    "mode": "tail-random-salts",
+    "pool_gib": 4,
+    "fft_tiles": 0,
+    "repeats": 15,
+    "timeline": true
+  },
+  {
+    "label": "profile-v7-tail-checks-ranks-random-salts",
+    "mode": "tail-checks-ranks-random-salts",
+    "pool_gib": 4,
+    "fft_tiles": 0,
+    "repeats": 15,
+    "timeline": true
+  }
+]

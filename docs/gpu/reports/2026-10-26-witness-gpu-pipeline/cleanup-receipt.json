@@ -1,0 +1,43 @@
+{
+  "id": "iqqgjxfo4oivtn",
+  "name": "mainpod-witness-gpu-pipeline-20261026",
+  "status": "RUNNING",
+  "cost": 0.89,
+  "createdAt": "2026-10-26T16:53:43.312Z",
+  "deletion": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\n  \"status\": 204\n}"
+      }
+    ],
+    "isError": false
+  },
+  "readback": [
+    {
+      "status": "fulfilled",
+      "value": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"detail\": \"pod not found\",\n  \"status\": 404,\n  \"title\": \"Not Found\",\n  \"hint\": \"No such resource on this account: verify the id with the matching list- tool before retrying.\"\n}"
+          }
+        ],
+        "isError": true
+      }
+    },
+    {
+      "status": "fulfilled",
+      "value": {
+        "content": [
+          {
+            "type": "text",
+            "text": "{\n  \"pagination\": {\n    \"hasNextPage\": false,\n    \"nextCursor\": null\n  },\n  \"pods\": []\n}"
+          }
+        ],
+        "isError": false
+      }
+    }
+  ],
+  "verifiedAt": "2026-10-26T19:21:55Z"
+}

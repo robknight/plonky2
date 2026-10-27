@@ -1,0 +1,13 @@
+{
+  "archive": {
+    "sha256": "bdb454d707d14155fda6820e2d514159fb22fc75df7c639ddf6976b8792e7d5c",
+    "bytes": 138817782,
+    "verified_mainpods": 1820,
+    "processes": 81
+  },
+  "source_version": "v9",
+  "source_files": 447,
+  "all_source_files_match": true,
+  "all_raw_proof_logs_match": true,
+  "all_measured_binaries_match": true
+}

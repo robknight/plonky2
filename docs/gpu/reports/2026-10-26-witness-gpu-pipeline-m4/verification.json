@@ -1,0 +1,10 @@
+{
+  "all_raw_logs_match": true,
+  "all_proofs_verified": true,
+  "shutdown_passed": true,
+  "processes": 20,
+  "measured_mainpods": 336,
+  "source_version": "v9",
+  "source_files": 447,
+  "binary_sha256": "cbb25b9ae90e59324870b8dadf4f69defa939c6ae6a5b552cfd05d22c0869d82"
+}

@@ -1,0 +1,2429 @@
+diff --git a/plonky2/src/fri/oracle.rs b/plonky2/src/fri/oracle.rs
+index 88d7ac27..0a769e55 100644
+--- a/plonky2/src/fri/oracle.rs
++++ b/plonky2/src/fri/oracle.rs
+@@ -72,6 +72,10 @@ pub struct PolynomialBatch<F: RichField + Extendable<D>, C: GenericConfig<D, F =
+     #[cfg(feature = "gpu")]
+     #[serde(skip)]
+     pub(crate) device_values: crate::gpu::DeviceCache,
++    /// Optional compact witness slot map for the subgroup values.
++    #[cfg(feature = "gpu")]
++    #[serde(skip)]
++    pub(crate) device_value_slots: crate::gpu::DeviceCache,
+ }
+ 
+ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> Default
+@@ -90,6 +94,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> D
+             device_coeffs: Default::default(),
+             #[cfg(feature = "gpu")]
+             device_values: Default::default(),
++            #[cfg(feature = "gpu")]
++            device_value_slots: Default::default(),
+         }
+     }
+ }
+@@ -303,6 +309,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
+             device_coeffs: Default::default(),
+             #[cfg(feature = "gpu")]
+             device_values: Default::default(),
++            #[cfg(feature = "gpu")]
++            device_value_slots: Default::default(),
+         }
+     }
+ 
+diff --git a/plonky2/src/gpu/lde.rs b/plonky2/src/gpu/lde.rs
+index 8a4f095d..41b28ea8 100644
+--- a/plonky2/src/gpu/lde.rs
++++ b/plonky2/src/gpu/lde.rs
+@@ -222,6 +222,51 @@ fn record_fft(
+     kernel: &wgpu::ComputePipeline,
+     tiles_per_workgroup: u32,
+     #[cfg(test)] only: Option<usize>,
++) {
++    record_fft_input(
++        ctx,
++        encoder,
++        job,
++        plan,
++        kernel,
++        tiles_per_workgroup,
++        #[cfg(test)]
++        only,
++        None,
++    );
++}
++
++pub(crate) fn fft_compact(
++    ctx: &GpuContext,
++    encoder: &mut wgpu::CommandEncoder,
++    job: FftJob<'_>,
++    slots: &wgpu::Buffer,
++) {
++    let tiles = ctx.options.fft_tiles_per_workgroup;
++    let plan = fft_plan(job.log_n);
++    record_fft_input(
++        ctx,
++        encoder,
++        job,
++        plan,
++        ctx.fft_kernel_for(tiles),
++        tiles,
++        #[cfg(test)]
++        None,
++        Some(slots),
++    );
++}
++
++#[allow(clippy::too_many_arguments)]
++fn record_fft_input(
++    ctx: &GpuContext,
++    encoder: &mut wgpu::CommandEncoder,
++    job: FftJob<'_>,
++    plan: Vec<(u32, u32, u32)>,
++    kernel: &wgpu::ComputePipeline,
++    tiles_per_workgroup: u32,
++    #[cfg(test)] only: Option<usize>,
++    slots: Option<&wgpu::Buffer>,
+ ) {
+     assert!(
+         job.shift_in.is_none() || job.shift_out.is_none(),
+@@ -290,7 +335,22 @@ fn record_fft(
+                 .checked_div(tiles_per_workgroup)
+                 .map_or(tiles, |w| w.max(1));
+             (
+-                ctx.bind_fft(&params, job.input, job.data, output, &twiddles, &shift_pows),
++                if let Some(slots) = slots {
++                    ctx.bind(
++                        &ctx.compact_fft().layout,
++                        &[
++                            &params,
++                            job.input,
++                            job.data,
++                            output,
++                            &twiddles,
++                            &shift_pows,
++                            slots,
++                        ],
++                    )
++                } else {
++                    ctx.bind_fft(&params, job.input, job.data, output, &twiddles, &shift_pows)
++                },
+                 workgroups,
+             )
+         })
+@@ -303,6 +363,16 @@ fn record_fft(
+         if job.inverse { " inverse" } else { "" }
+     );
+     let mut pass = ctx.begin_pass(encoder, &label, None);
++    let kernel = if slots.is_some() {
++        let compact = ctx.compact_fft();
++        if tiles_per_workgroup == 0 {
++            &compact.ordinary
++        } else {
++            &compact.pipelined
++        }
++    } else {
++        kernel
++    };
+     pass.set_pipeline(kernel);
+     for (bindings, workgroups) in &bindings {
+         pass.set_bind_group(0, bindings, &[]);
+@@ -569,6 +639,39 @@ pub(crate) fn from_device_values<
+     timing: &mut TimingTree,
+     leaf_storage: LeafStorage,
+     retain_values: bool,
++) -> ProverPolynomialBatch<F, C, D> {
++    from_device_values_with_slots::<F, C, D>(
++        ctx,
++        vals,
++        num_polys,
++        degree,
++        rate_bits,
++        blinding,
++        cap_height,
++        timing,
++        leaf_storage,
++        retain_values,
++        None,
++    )
++}
++
++#[allow(clippy::too_many_arguments)]
++pub(crate) fn from_device_values_with_slots<
++    F: RichField + Extendable<D>,
++    C: GenericConfig<D, F = F>,
++    const D: usize,
++>(
++    ctx: &std::sync::Arc<GpuContext>,
++    vals: DeviceBuffer,
++    num_polys: usize,
++    degree: usize,
++    rate_bits: usize,
++    blinding: bool,
++    cap_height: usize,
++    timing: &mut TimingTree,
++    leaf_storage: LeafStorage,
++    retain_values: bool,
++    slots: Option<&DeviceBuffer>,
+ ) -> ProverPolynomialBatch<F, C, D> {
+     let log_d = log2_strict(degree) as u32;
+     let (coeffs, work) = timed!(timing, "gpu: allocate IFFT buffers", {
+@@ -582,22 +685,23 @@ pub(crate) fn from_device_values<
+     });
+     let encoder = timed!(timing, "gpu: encode IFFT", {
+         let mut encoder = ctx.encoder("ifft");
+-        fft(
+-            ctx,
+-            &mut encoder,
+-            FftJob {
+-                log_n: log_d,
+-                columns: num_polys as u32,
+-                input: &vals,
+-                in_len: degree as u32,
+-                in_stride: degree as u32,
+-                data: &work,
+-                output: Some(&coeffs),
+-                shift_in: None,
+-                inverse: true,
+-                shift_out: None,
+-            },
+-        );
++        let job = FftJob {
++            log_n: log_d,
++            columns: num_polys as u32,
++            input: &vals,
++            in_len: degree as u32,
++            in_stride: degree as u32,
++            data: &work,
++            output: Some(&coeffs),
++            shift_in: None,
++            inverse: true,
++            shift_out: None,
++        };
++        if let Some(slots) = slots {
++            fft_compact(ctx, &mut encoder, job, slots);
++        } else {
++            fft(ctx, &mut encoder, job);
++        }
+         encoder
+     });
+     let device_values = crate::gpu::DeviceCache::default();
+@@ -610,7 +714,7 @@ pub(crate) fn from_device_values<
+     } else {
+         drop(vals);
+     }
+-    commit(
++    let batch = commit(
+         ctx,
+         HostCoefficients::Device {
+             columns: num_polys,
+@@ -623,7 +727,13 @@ pub(crate) fn from_device_values<
+         cap_height,
+         timing,
+         leaf_storage,
+-    )
++    );
++    if retain_values {
++        if let Some(slots) = slots {
++            batch.batch.device_value_slots.set(slots.clone());
++        }
++    }
++    batch
+ }
+ 
+ /// Commits column-major device coefficients without a host copy. CPU opening
+@@ -780,6 +890,7 @@ fn commit<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usi
+     // written while the device runs it (into columns it does not touch), and
+     // the leaf hashing below queues behind it, so the device goes from one to
+     // the other without waiting for the host.
++    let device_random = crate::gpu::resident_witness::experiment().contains("salts");
+     let salts = timed!(timing, "gpu: FFT and salt", {
+         timed!(
+             timing,
+@@ -790,14 +901,23 @@ fn commit<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usi
+                 ctx.submit_async(encoder)
+             )
+         );
+-        salt_words::<F>(salt_size, n)
++        if device_random {
++            Vec::new()
++        } else {
++            salt_words::<F>(salt_size, n)
++        }
+     });
+     // The opening phase evaluates the polynomials from these coefficients.
+     let device_coeffs = crate::gpu::DeviceCache::default();
+     device_coeffs.set(coeffs.clone());
+     timed!(timing, "gpu: pack and enqueue salt writes", {
+         // The salt columns follow the polynomials' columns in the LDE buffer.
+-        ctx.write(&lde, (num_polys * n) as u64, &salts);
++        if device_random && salt_size > 0 {
++            let seed = crate::gpu::random::fresh_seed();
++            ctx.fill_random(&lde, num_polys * n, salt_size * n, &seed, 0x53414c54);
++        } else {
++            ctx.write(&lde, (num_polys * n) as u64, &salts);
++        }
+     });
+     let rows = (leaf_storage != LeafStorage::Columns).then(|| {
+         timed!(
+@@ -896,6 +1016,7 @@ fn commit<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usi
+         device,
+         device_coeffs,
+         device_values,
++        device_value_slots: Default::default(),
+     };
+     match host_coeffs {
+         HostCoefficients::Ready(polynomials) => ProverPolynomialBatch::from(PolynomialBatch {
+diff --git a/plonky2/src/gpu/mod.rs b/plonky2/src/gpu/mod.rs
+index 6c71029d..5c2739d3 100644
+--- a/plonky2/src/gpu/mod.rs
++++ b/plonky2/src/gpu/mod.rs
+@@ -104,6 +104,7 @@ pub use policy::ExecutionMode;
+ pub(crate) mod pow;
+ #[doc(hidden)]
+ pub mod quotient;
++pub(crate) mod random;
+ pub(crate) mod resident_witness;
+ mod retained;
+ #[doc(hidden)]
+@@ -366,9 +367,12 @@ pub fn field_supported<F: PrimeField64>() -> bool {
+     F::ORDER == GOLDILOCKS_ORDER
+ }
+ 
++type FixedUniformCache = Mutex<std::collections::HashMap<(String, Vec<u32>), DeviceCache>>;
++
+ /// A device, its queue, the compiled pipelines and cached constant tables.
+ #[doc(hidden)]
+ pub struct GpuContext {
++    fixed_uniforms: FixedUniformCache,
+     pub(crate) device: wgpu::Device,
+     pub(crate) queue: wgpu::Queue,
+     pub info: wgpu::AdapterInfo,
+@@ -389,6 +393,9 @@ pub struct GpuContext {
+     pub(crate) hash_nodes: wgpu::ComputePipeline,
+     #[cfg(test)]
+     pub(crate) permute: wgpu::ComputePipeline,
++    pub(crate) random: OnceLock<random::Kernels>,
++    pub(crate) witness_tail: OnceLock<crate::plonk::witness_program::region::gpu_tail::Kernels>,
++    pub(crate) compact_fft: OnceLock<resident_witness::CompactFft>,
+     fft_layout: wgpu::BindGroupLayout,
+     pub(crate) fft: wgpu::ComputePipeline,
+     #[cfg(test)]
+@@ -412,6 +419,7 @@ pub struct GpuContext {
+     /// `batch_powers`, `reduce_batch`, `divide_blocks`, `scan_blocks` and
+     /// `combine_quotients`, dispatched in this order.
+     pub(crate) combine: [wgpu::ComputePipeline; 5],
++    pub(crate) compact_permutation: OnceLock<resident_witness::CompactPermutation>,
+     permutation_layout: wgpu::BindGroupLayout,
+     /// `block_products`, `block_prefix` and `fill_columns`, following row products.
+     pub(crate) permutation: [wgpu::ComputePipeline; 3],
+@@ -570,9 +578,11 @@ impl GpuOptions {
+             mode: config.mode,
+             proving_workers: config.proving_workers,
+             retained_bytes: config.retained_bytes_limit(),
+-            fft_tiles_per_workgroup: config
+-                .fft_tiles_per_workgroup
+-                .unwrap_or(if mappable { 8 } else { 0 }),
++            fft_tiles_per_workgroup: config.fft_tiles_per_workgroup.unwrap_or(if mappable {
++                8
++            } else {
++                0
++            }),
+         }
+     }
+ 
+@@ -930,6 +940,10 @@ impl GpuContext {
+             hash_nodes,
+             #[cfg(test)]
+             permute,
++            random: OnceLock::new(),
++            witness_tail: OnceLock::new(),
++            fixed_uniforms: Mutex::new(Default::default()),
++            compact_fft: OnceLock::new(),
+             fft_layout,
+             fft,
+             #[cfg(test)]
+@@ -947,6 +961,7 @@ impl GpuContext {
+             eval_openings,
+             combine_layout,
+             combine,
++            compact_permutation: OnceLock::new(),
+             permutation_layout,
+             permutation,
+             permutation_rows: cache::GpuCache::new(retained.clone()),
+@@ -1028,6 +1043,41 @@ impl GpuContext {
+ 
+     /// A uniform buffer holding `words`.
+     pub(crate) fn uniform(&self, label: &str, words: &[u32]) -> wgpu::Buffer {
++        // Only shape/control metadata is eligible. Fresh RNG keys and proof
++        // challenges are deliberately outside this allowlist.
++        if cfg!(feature = "witness-benchmarks")
++            && resident_witness::experiment().contains("uniforms")
++            && matches!(
++                label,
++                "fft params"
++                    | "hash params"
++                    | "permutation params"
++                    | "fold params"
++                    | "leaf gather params"
++                    | "scatter range"
++                    | "alias range"
++            )
++        {
++            let cache = {
++                let mut fixed = self.fixed_uniforms.lock().unwrap();
++                let key = (label.to_owned(), words.to_vec());
++                if !fixed.contains_key(&key) && fixed.len() >= 1024 {
++                    if let Some(old) = fixed.keys().next().cloned() {
++                        fixed.remove(&old);
++                    }
++                }
++                fixed.entry(key).or_default().clone()
++            };
++            if let Some(buffer) = cache.get() {
++                return std::ops::Deref::deref(&buffer).clone();
++            }
++            let buffer = self.uniform_uncached(label, words);
++            cache.set_if_within_limit(self, DeviceBuffer::unpooled(buffer.clone()));
++            return buffer;
++        }
++        self.uniform_uncached(label, words)
++    }
++    fn uniform_uncached(&self, label: &str, words: &[u32]) -> wgpu::Buffer {
+         let mut bytes = words
+             .iter()
+             .flat_map(|w| w.to_le_bytes())
+diff --git a/plonky2/src/gpu/permutation.rs b/plonky2/src/gpu/permutation.rs
+index 472e7c11..14fb8474 100644
+--- a/plonky2/src/gpu/permutation.rs
++++ b/plonky2/src/gpu/permutation.rs
+@@ -128,10 +128,15 @@ pub(crate) fn try_partial_products_commitment<
+     let wires = wires_commitment.batch().device_values.get()?;
+     let ctx = context()?;
+     wires_commitment.batch().device_values.take();
++    let slots = wires_commitment.batch().device_value_slots.take();
+     let num_blocks = degree / PERMUTATION_BLOCK as usize;
+     let num_columns = num_challenges * (1 + num_prods);
+     let out = timed!(timing, "gpu: partial products and Z's", {
+-        let rows = ctx.permutation_rows(num_chunks as u32, max_degree);
++        let rows = if slots.is_some() {
++            ctx.compact_permutation_rows(num_chunks as u32, max_degree)
++        } else {
++            ctx.permutation_rows(num_chunks as u32, max_degree)
++        };
+         let sigmas = device_sigmas(&ctx, prover_data, config.num_routed_wires);
+         let mut consts = Vec::new();
+         for (&beta, &gamma) in betas.iter().zip(gammas) {
+@@ -167,13 +172,25 @@ pub(crate) fn try_partial_products_commitment<
+             (num_challenges * (degree * num_chunks + 2 * num_blocks) * 8) as u64,
+         );
+         let out = ctx.storage("partial products", (num_columns * degree * 8) as u64);
+-        let bindings =
+-            ctx.bind_permutation(&[&params, &wires, &sigmas, &consts, &twiddles, &scratch, &out]);
++        let bindings = if let Some(slots) = &slots {
++            ctx.bind(
++                &ctx.compact_permutation().layout,
++                &[
++                    &params, &wires, &sigmas, &consts, &twiddles, &scratch, &out, slots,
++                ],
++            )
++        } else {
++            ctx.bind_permutation(&[&params, &wires, &sigmas, &consts, &twiddles, &scratch, &out])
++        };
+         let mut encoder = ctx.encoder("partial products");
+         {
+             let mut pass = ctx.begin_pass(&mut encoder, "partial products", None);
+             pass.set_bind_group(0, &bindings, &[]);
+-            let [blocks, prefix, fill] = &ctx.permutation;
++            let [blocks, prefix, fill] = if slots.is_some() {
++                &ctx.compact_permutation().rest
++            } else {
++                &ctx.permutation
++            };
+             pass.set_pipeline(&rows);
+             pass.dispatch_workgroups(
+                 (degree as u32).div_ceil(HASH_WORKGROUP),
+diff --git a/plonky2/src/gpu/resident_witness.rs b/plonky2/src/gpu/resident_witness.rs
+index 05de1b54..7cfde8bd 100644
+--- a/plonky2/src/gpu/resident_witness.rs
++++ b/plonky2/src/gpu/resident_witness.rs
+@@ -10,4 +10,140 @@ use crate::gpu::{DeviceBuffer, GpuContext};
+ pub(crate) struct ResidentWitness {
+     pub ctx: Arc<GpuContext>,
+     pub wire_values: DeviceBuffer,
++    /// Fixed column-major cell -> compact state slot, or dense values when absent.
++    pub wire_slots: Option<DeviceBuffer>,
++    pub error: Option<DeviceBuffer>,
++}
++
++/// Benchmark-only pipeline experiments, selected before a process starts proving.
++pub(crate) fn experiment() -> String {
++    #[cfg(feature = "witness-benchmarks")]
++    {
++        std::env::var("PLONKY2_GPU_WITNESS_EXPERIMENT").unwrap_or_default()
++    }
++    #[cfg(not(feature = "witness-benchmarks"))]
++    {
++        String::new()
++    }
++}
++
++pub(crate) struct CompactFft {
++    pub layout: wgpu::BindGroupLayout,
++    pub ordinary: wgpu::ComputePipeline,
++    pub pipelined: wgpu::ComputePipeline,
++}
++impl GpuContext {
++    pub(crate) fn compact_fft(&self) -> &CompactFft {
++        self.compact_fft.get_or_init(|| {
++            let layout = super::storage_layout(&self.device, "compact fft", &[
++                (true,true),(false,true),(false,false),(false,false),
++                (false,true),(false,true),(false,true),
++            ]);
++            let source = super::shader::fft_module(self.flavor)
++                .replace("v = input[col * fp.in_stride + x];", "let slot = wire_slots[col * fp.in_stride + x]; if (slot != 0xffffffffu) { v = input[slot]; }");
++            let source = format!("{source}\n@group(0) @binding(6) var<storage, read> wire_slots: array<u32>;\n");
++            let module = super::module(&self.device, "compact fft", &source);
++            CompactFft {
++                ordinary: super::pipeline(&self.device, &layout, &module, "fft_group"),
++                pipelined: super::pipeline(&self.device, &layout, &module, "fft_group_pipelined"),
++                layout,
++            }
++        })
++    }
++}
++
++impl ResidentWitness {
++    pub(crate) fn read_columns<F: crate::field::types::PrimeField64>(
++        &self,
++        columns: usize,
++        degree: usize,
++    ) -> Vec<Vec<F>> {
++        if let Some(slots) = &self.wire_slots {
++            let state = self
++                .ctx
++                .read_u64(&self.wire_values, self.wire_values.size() as usize / 8);
++            let slots = self.ctx.read_u64(slots, (columns * degree).div_ceil(2));
++            (0..columns)
++                .map(|column| {
++                    (0..degree)
++                        .map(|row| {
++                            let i = column * degree + row;
++                            let slot = (slots[i / 2] >> (32 * (i % 2))) as u32;
++                            F::from_canonical_u64(if slot == u32::MAX {
++                                0
++                            } else {
++                                state[slot as usize]
++                            })
++                        })
++                        .collect()
++                })
++                .collect()
++        } else {
++            super::lde::read_columns::<F>(&self.ctx, &self.wire_values, columns, degree)
++        }
++    }
++}
++
++pub(crate) struct CompactPermutation {
++    pub layout: wgpu::BindGroupLayout,
++    pub rows: std::sync::Mutex<std::collections::HashMap<u32, Arc<wgpu::ComputePipeline>>>,
++    pub rest: [wgpu::ComputePipeline; 3],
++}
++impl GpuContext {
++    pub(crate) fn compact_permutation(&self) -> &CompactPermutation {
++        self.compact_permutation.get_or_init(|| {
++            let layout = super::storage_layout(
++                &self.device,
++                "compact permutation",
++                &[
++                    (true, true),
++                    (false, true),
++                    (false, true),
++                    (false, true),
++                    (false, true),
++                    (false, false),
++                    (false, false),
++                    (false, true),
++                ],
++            );
++            let source = super::shader::permutation_module(self.flavor);
++            let module = super::module(&self.device, "compact permutation rest", &source);
++            let rest = ["block_products", "block_prefix", "fill_columns"]
++                .map(|entry| super::pipeline(&self.device, &layout, &module, entry));
++            CompactPermutation {
++                layout,
++                rows: Default::default(),
++                rest,
++            }
++        })
++    }
++    pub(crate) fn compact_permutation_rows(
++        &self,
++        chunks: u32,
++        max_degree: usize,
++    ) -> Arc<wgpu::ComputePipeline> {
++        let c = self.compact_permutation();
++        let key = if max_degree <= 2 { 0 } else { chunks };
++        let mut cache = c.rows.lock().unwrap();
++        cache.entry(key).or_insert_with(||{
++            let source=if key==0 {super::shader::permutation_module_individual(self.flavor)} else {super::shader::permutation_module_with_chunks(self.flavor,chunks)};
++            let source=source.replace("wires[j * pp.degree + i]","compact_wire(j * pp.degree + i)")
++                .replace("wires[k * pp.degree + i]","compact_wire(k * pp.degree + i)");
++            let source=format!("{source}\n@group(0) @binding(7) var<storage,read> wire_slots: array<u32>;\nfn compact_wire(i:u32)->Field {{ let slot=wire_slots[i]; if(slot==0xffffffffu){{return Field(0u,0u);}} return wires[slot]; }}\n");
++            let module=super::module(&self.device,"compact row products",&source);
++            Arc::new(super::pipeline(&self.device,&c.layout,&module,"row_products"))
++        }).clone()
++    }
++}
++
++impl ResidentWitness {
++    pub(crate) fn validate(&self) -> anyhow::Result<()> {
++        if let Some(error) = &self.error {
++            anyhow::ensure!(
++                self.ctx.read_u64(error, 2).iter().all(|x| *x == 0),
++                "GPU witness rejected invalid operation inputs"
++            );
++        }
++        Ok(())
++    }
+ }
+diff --git a/plonky2/src/gpu/shader.rs b/plonky2/src/gpu/shader.rs
+index 15fbc878..0cbe30ab 100644
+--- a/plonky2/src/gpu/shader.rs
++++ b/plonky2/src/gpu/shader.rs
+@@ -1708,3 +1708,64 @@ fn permutation_module_source(flavor: Flavor, chunks: u32, rows: &str) -> String
+     );
+     out
+ }
++
++/// The same 122 witness values as the sparse CPU trace. The dense partial
++/// rounds preserve the S-box input in word zero; the other words are needed
++/// only after the partial-round basis transformation has been undone.
++/// Reuse the tree kernel's small-coefficient MDS and folded round constants.
++pub(crate) fn witness_dense_trace() -> String {
++    let mut out = String::from("\nfn trace_poseidon(g:Op) {\n");
++    for i in 0..12 {
++        writeln!(out, "var s{i}=inp(g,{i}u);").unwrap();
++    }
++    out.push_str("let swap=canonical(inp(g,12u));if(swap.y!=0u || swap.x>1u){fail();return;}\n");
++    for i in 0..4 {
++        writeln!(
++            out,
++            "emit(g,{i}u,mul_field(swap,sub_field(s{},s{i})));",
++            i + 4
++        )
++        .unwrap();
++    }
++    out.push_str("if(swap.x==1u){\n");
++    for i in 0..4 {
++        writeln!(out, "let t{i}=s{i};s{i}=s{};s{}=t{i};", i + 4, i + 4).unwrap();
++    }
++    out.push_str("}\n");
++    for i in 1..12 {
++        writeln!(out, "var t0_{i}:u32;var t1_{i}:u32;var t2_{i}:u32;").unwrap();
++    }
++    for (i, c) in round_constants(0).iter().enumerate() {
++        writeln!(out, "s{i}=add_const(s{i},{});", literal(*c)).unwrap();
++    }
++    let mut output = 4;
++    let partial = 4..26;
++    for round in 0..30 {
++        let full = !partial.contains(&round);
++        writeln!(out, "{{ // witness round {round}").unwrap();
++        if full {
++            if round != 0 {
++                for i in 0..12 {
++                    writeln!(out, "emit(g,{output}u,s{i});").unwrap();
++                    output += 1;
++                }
++            }
++        } else {
++            writeln!(out, "emit(g,{output}u,s0);").unwrap();
++            output += 1;
++        }
++        for i in 0..if full { 12 } else { 1 } {
++            writeln!(out, "s{i}=sbox(s{i});").unwrap();
++        }
++        let next = (round + 1 < 30).then(|| round_constants(round + 1));
++        mds_layer(&mut out, next, !full, partial.contains(&(round + 1)));
++        out.push_str("}\n");
++    }
++    for i in 0..12 {
++        writeln!(out, "emit(g,{output}u,s{i});").unwrap();
++        output += 1;
++    }
++    assert_eq!(output, 122);
++    out.push_str("}\n");
++    out
++}
+diff --git a/plonky2/src/plonk/prover.rs b/plonky2/src/plonk/prover.rs
+index bee4220c..fbf4cc4d 100644
+--- a/plonky2/src/plonk/prover.rs
++++ b/plonky2/src/plonk/prover.rs
+@@ -291,7 +291,7 @@ where
+             ProverWires::Resident(resident) => timed!(
+                 timing,
+                 "compute resident wires commitment",
+-                crate::gpu::lde::from_device_values::<F, C, D>(
++                crate::gpu::lde::from_device_values_with_slots::<F, C, D>(
+                     &resident.ctx,
+                     resident.wire_values.clone(),
+                     config.num_wires,
+@@ -302,11 +302,16 @@ where
+                     timing,
+                     gpu_plan.leaf_storage(),
+                     retain_values,
++                    resident.wire_slots.as_ref(),
+                 )
+             ),
+         }
+     };
+ 
++    #[cfg(feature = "gpu")]
++    if let ProverWires::Resident(resident) = &wires {
++        resident.validate()?;
++    }
+     // CPU quotient evaluation reads Merkle rows, not the column-major LDE.
+     // Release that duplicate before constructing the permutation commitment.
+     #[cfg(feature = "gpu")]
+@@ -379,14 +384,10 @@ where
+                     // Read through the original context even if GPU routing
+                     // was disabled after the witness was uploaded.
+                     let witness = MatrixWitness {
+-                        wire_values: crate::gpu::lde::read_columns::<F>(
+-                            &resident.ctx,
+-                            &resident.wire_values,
+-                            config.num_wires,
+-                            degree,
+-                        ),
++                        wire_values: resident.read_columns::<F>(config.num_wires, degree),
+                     };
+                     drop(wires_commitment.batch.device_values.take());
++                    drop(wires_commitment.batch.device_value_slots.take());
+                     log::debug!("gpu: materialized wire values for CPU permutation fallback");
+                     witness
+                 }
+diff --git a/plonky2/src/plonk/witness_program/policy.rs b/plonky2/src/plonk/witness_program/policy.rs
+index 5a937035..e32770df 100644
+--- a/plonky2/src/plonk/witness_program/policy.rs
++++ b/plonky2/src/plonk/witness_program/policy.rs
+@@ -82,6 +82,16 @@ pub(crate) enum WitnessGather {
+     /// Request GPU gathering when GPU proving and a validated plan are available.
+     #[cfg(any(feature = "gpu", test, feature = "witness-benchmarks"))]
+     Gpu,
++    #[cfg(any(feature = "gpu", test))]
++    Compact,
++    #[cfg(any(feature = "gpu", test))]
++    Tail,
++    #[cfg(any(feature = "gpu", test))]
++    TailRandom,
++    #[cfg(any(feature = "gpu", test))]
++    TailChecks,
++    #[cfg(any(feature = "gpu", test))]
++    TailChecksRandom,
+ }
+ 
+ #[derive(Clone, Debug, PartialEq, Eq)]
+diff --git a/plonky2/src/plonk/witness_program/region.rs b/plonky2/src/plonk/witness_program/region.rs
+index d6ba3259..ca68d083 100644
+--- a/plonky2/src/plonk/witness_program/region.rs
++++ b/plonky2/src/plonk/witness_program/region.rs
+@@ -23,6 +23,8 @@ use crate::iop::witness::{PartialWitness, PartitionWitness};
+ pub(crate) mod aot;
+ pub(super) mod buffers;
+ pub mod cpu;
++#[cfg(feature = "gpu")]
++pub(crate) mod gpu_tail;
+ pub(crate) mod plan_bytes;
+ mod profile;
+ #[cfg(feature = "parallel")]
+diff --git a/plonky2/src/plonk/witness_program/region/aot.rs b/plonky2/src/plonk/witness_program/region/aot.rs
+index edd9cea3..7d96d6a2 100644
+--- a/plonky2/src/plonk/witness_program/region/aot.rs
++++ b/plonky2/src/plonk/witness_program/region/aot.rs
+@@ -24,6 +24,12 @@ pub(super) struct FastLayout {
+     pub random_spans: OnceLock<HashMap<u32, (u32, u32)>>,
+     #[cfg(feature = "gpu")]
+     pub gpu_gather: OnceLock<Arc<GpuGather>>,
++    #[cfg(feature = "gpu")]
++    pub gpu_tail: OnceLock<Arc<super::gpu_tail::Tail>>,
++    #[cfg(feature = "gpu")]
++    pub gpu_tail_checks: OnceLock<Arc<super::gpu_tail::Tail>>,
++    #[cfg(feature = "gpu")]
++    pub gpu_tail_ranks: OnceLock<Arc<super::gpu_tail::Tail>>,
+ }
+ 
+ #[cfg(feature = "witness-benchmarks")]
+@@ -55,6 +61,13 @@ pub(super) fn execute(executor: &Executor<'_>) -> Result<bool> {
+ }
+ 
+ pub(super) fn run_fixed<const K: u8>(executor: &Executor<'_>, group: &Group) -> Result<()> {
++    #[cfg(all(feature = "gpu", feature = "parallel"))]
++    if let Some(tail) = executor.gpu_tail {
++        return tail.cpu_ranges(group, 0, group.count, |a, b| {
++            run_range_inner(executor, group, a, b)
++        });
++    }
++
+     let kind = Kind::from_code(K as usize)?;
+     let use_simd = K == 0 && poseidon_mode(executor) != 0 && group.count >= poseidon_min_group();
+     let chunk = if use_simd {
+@@ -491,6 +504,12 @@ pub(super) fn certify(p: &RegionProgram) -> Result<FastLayout> {
+         random_spans: Default::default(),
+         #[cfg(feature = "gpu")]
+         gpu_gather: Default::default(),
++        #[cfg(feature = "gpu")]
++        gpu_tail: Default::default(),
++        #[cfg(feature = "gpu")]
++        gpu_tail_checks: Default::default(),
++        #[cfg(feature = "gpu")]
++        gpu_tail_ranks: Default::default(),
+     })
+ }
+ 
+@@ -709,11 +728,11 @@ pub(super) struct GpuGather {
+ /// Upload compact contiguous state; resolve the fixed wire permutation on GPU.
+ /// Synchronous submission makes this experiment's gather timer include GPU work.
+ #[cfg(feature = "gpu")]
+-pub(super) fn gather_on_gpu(
++pub(super) fn compact_on_gpu(
+     e: &Executor<'_>,
+     ctx: &crate::gpu::GpuContext,
+     slots: &[u32],
+-) -> Result<crate::gpu::DeviceBuffer> {
++) -> Result<(crate::gpu::DeviceBuffer, crate::gpu::DeviceBuffer)> {
+     let cache = e.program.fast.get().expect("validated GPU gather plan").gpu_gather.get_or_init(|| {
+         let layout = crate::gpu::storage_layout(&ctx.device, "witness gather", &[(false,true),(false,true),(false,false)]);
+         let module = crate::gpu::module(&ctx.device, "witness gather", r#"
+@@ -742,6 +761,9 @@ fn gather(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups)
+         cache.slots.set_if_within_limit(ctx, indices.clone());
+         indices
+     });
++    if let Some(tail) = e.gpu_tail {
++        return Ok((tail.upload_state(e, ctx), indices));
++    }
+     let state_bytes = e.state.len() * 8;
+     let staging = ctx.upload_staging(state_bytes as u64);
+     e.program.runtime.run(|| {
+@@ -769,6 +791,24 @@ fn gather(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups)
+     });
+     let state = ctx.storage("compact witness state", state_bytes as u64);
+     ctx.finish_upload(staging, &state, state_bytes as u64);
++    Ok((state, indices))
++}
++
++#[cfg(feature = "gpu")]
++pub(super) fn gather_on_gpu(
++    e: &Executor<'_>,
++    ctx: &crate::gpu::GpuContext,
++    slots: &[u32],
++) -> Result<crate::gpu::DeviceBuffer> {
++    let (state, indices) = compact_on_gpu(e, ctx, slots)?;
++    let cache = e
++        .program
++        .fast
++        .get()
++        .expect("validated GPU gather plan")
++        .gpu_gather
++        .get()
++        .expect("prepared gather");
+     let out = ctx.storage("GPU gathered proving wires", (slots.len() * 8) as u64);
+     let bind = ctx.bind(&cache.layout, &[&state, &indices, &out]);
+     let mut encoder = ctx.encoder("witness wire gather");
+@@ -810,6 +850,14 @@ fn poseidon_chunk() -> u32 {
+ 
+ #[cfg(feature = "parallel")]
+ pub(super) fn run_range(e: &Executor<'_>, g: &Group, start: u32, end: u32) -> Result<()> {
++    #[cfg(feature = "gpu")]
++    if let Some(tail) = e.gpu_tail {
++        return tail.cpu_ranges(g, start, end, |a, b| run_range_inner(e, g, a, b));
++    }
++    run_range_inner(e, g, start, end)
++}
++#[cfg(feature = "parallel")]
++fn run_range_inner(e: &Executor<'_>, g: &Group, start: u32, end: u32) -> Result<()> {
+     match g.kind {
+         Kind::Arithmetic => return arithmetic_simplified(e, g, start, end),
+         Kind::Equality => return equality_batch(e, g, start, end),
+diff --git a/plonky2/src/plonk/witness_program/region/cpu.rs b/plonky2/src/plonk/witness_program/region/cpu.rs
+index 020c7163..71f649aa 100644
+--- a/plonky2/src/plonk/witness_program/region/cpu.rs
++++ b/plonky2/src/plonk/witness_program/region/cpu.rs
+@@ -232,6 +232,21 @@ impl RegionProgram {
+         root_values: &[u64],
+         random_values: &'a [u64],
+         reference: bool,
++    ) -> Result<Executor<'a>> {
++        self.execute_state_inner_with_tail(
++            root_values,
++            random_values,
++            reference,
++            #[cfg(feature = "gpu")]
++            None,
++        )
++    }
++    fn execute_state_inner_with_tail<'a>(
++        &'a self,
++        root_values: &[u64],
++        random_values: &'a [u64],
++        reference: bool,
++        #[cfg(feature = "gpu")] gpu_tail: Option<&'a super::gpu_tail::Tail>,
+     ) -> Result<Executor<'a>> {
+         ensure!(
+             random_values.len() == self.random_count as usize,
+@@ -271,6 +286,8 @@ impl RegionProgram {
+             profile,
+             program: self,
+             random: random_values,
++            #[cfg(feature = "gpu")]
++            gpu_tail,
+             compact_readiness,
+             fast,
+             state,
+@@ -344,13 +361,19 @@ impl RegionProgram {
+         }
+         drop(layers);
+         let aliases = executor.profile.stage(Stage::Aliases);
+-        for i in 0..self.alias_count {
+-            let canonical = self.targets[(self.alias_pair_offset + 2 * i) as usize];
+-            let duplicate = self.targets[(self.alias_pair_offset + 2 * i + 1) as usize];
+-            ensure!(
+-                executor.load(canonical)? == executor.load(duplicate)?,
+-                "alias slot {duplicate} disagrees with its canonical slot {canonical}"
+-            );
++        #[cfg(feature = "gpu")]
++        let device_checks = executor.gpu_tail.is_some_and(|t| t.checks);
++        #[cfg(not(feature = "gpu"))]
++        let device_checks = false;
++        if !device_checks {
++            for i in 0..self.alias_count {
++                let canonical = self.targets[(self.alias_pair_offset + 2 * i) as usize];
++                let duplicate = self.targets[(self.alias_pair_offset + 2 * i + 1) as usize];
++                ensure!(
++                    executor.load(canonical)? == executor.load(duplicate)?,
++                    "alias slot {duplicate} disagrees with its canonical slot {canonical}"
++                );
++            }
+         }
+         drop(aliases);
+         let readiness = executor.profile.stage(Stage::Ready);
+@@ -373,7 +396,9 @@ impl RegionProgram {
+ pub(super) struct Executor<'a> {
+     pub(super) profile: profile::Execution,
+     pub(super) program: &'a RegionProgram,
+-    random: &'a [u64],
++    pub(super) random: &'a [u64],
++    #[cfg(feature = "gpu")]
++    pub(super) gpu_tail: Option<&'a super::gpu_tail::Tail>,
+     pub(super) state: Vec<AtomicU64>,
+     ready: Vec<AtomicBool>,
+     compact_readiness: bool,
+@@ -2193,12 +2218,110 @@ pub(crate) fn generate_wires_with<
+         values
+     };
+     drop(root_binding);
++    #[cfg(feature = "gpu")]
++    let tail_requested = allow_device
++        && cfg!(feature = "parallel")
++        && (crate::gpu::resident_witness::experiment().starts_with("tail")
++            || program.runtime.config.policy.gather == super::super::policy::WitnessGather::Tail
++            || program.runtime.config.policy.gather
++                == super::super::policy::WitnessGather::TailRandom
++            || program.runtime.config.policy.gather
++                == super::super::policy::WitnessGather::TailChecks
++            || program.runtime.config.policy.gather
++                == super::super::policy::WitnessGather::TailChecksRandom)
++        && crate::gpu::permutation::supported_circuit(prover, common)
++        && program.runtime.config.policy.execution
++            != super::super::policy::WitnessExecution::Checked;
++    // Keep the selected context alive through execution and upload. Routing may
++    // change concurrently; deferred values must still be produced on this device.
++    #[cfg(feature = "gpu")]
++    let tail_ctx = if tail_requested {
++        crate::gpu::lde::applicable::<F, C, D>(
++            num_wires,
++            degree,
++            config.fri_config.rate_bits,
++            config.zero_knowledge,
++        )
++    } else {
++        None
++    };
++    #[cfg(feature = "gpu")]
++    let tail = if tail_ctx.is_some() {
++        let public_slots = prover
++            .public_inputs
++            .iter()
++            .map(|&t| rep(t).map(|r| program.rep_slots(map.len())[r]))
++            .collect::<Result<Vec<_>>>()?;
++        ensure!(
++            public_slots.iter().all(|&s| s != u32::MAX),
++            "missing public input in GPU witness plan"
++        );
++        let fast = program.fast.get().expect("prepared tail certificate");
++        let checks = crate::gpu::resident_witness::experiment().contains("checks")
++            || program.runtime.config.policy.gather
++                == super::super::policy::WitnessGather::TailChecks
++            || program.runtime.config.policy.gather
++                == super::super::policy::WitnessGather::TailChecksRandom;
++        let compress = checks && crate::gpu::resident_witness::experiment().contains("ranks");
++        let cache = if compress {
++            &fast.gpu_tail_ranks
++        } else if checks {
++            &fast.gpu_tail_checks
++        } else {
++            &fast.gpu_tail
++        };
++        let tail = cache
++            .get_or_init(|| {
++                std::sync::Arc::new(super::gpu_tail::Tail::compile_config(
++                    &program,
++                    &public_slots,
++                    checks,
++                    compress,
++                ))
++            })
++            .as_ref();
++        ensure!(
++            tail.matches_public_inputs(&public_slots),
++            "GPU witness plan public inputs changed"
++        );
++        Some(tail)
++    } else {
++        None
++    };
++    #[cfg(feature = "gpu")]
++    let device_seed = if tail.is_some()
++        && random_values.is_none()
++        && (crate::gpu::resident_witness::experiment().contains("random")
++            || program.runtime.config.policy.gather
++                == super::super::policy::WitnessGather::TailRandom
++            || program.runtime.config.policy.gather
++                == super::super::policy::WitnessGather::TailChecksRandom)
++    {
++        Some(crate::gpu::random::fresh_seed())
++    } else {
++        None
++    };
+     let random_sampling = profile::Pipeline::new("random-sampling", prover.generators.len());
+     let random = match random_values {
+         Some(values) => zeroize::Zeroizing::new(values),
+         None => program.runtime.run(|| {
+             #[cfg(test)]
+             program.runtime.assert_active_pool();
++            #[cfg(feature = "gpu")]
++            if device_seed.is_some() {
++                let mask = &tail.expect("device random tail").gpu_random;
++                let mut words = zeroize::Zeroizing::new(vec![0u64; program.random_count as usize]);
++                words
++                    .par_chunks_mut(SAMPLE_CHUNK)
++                    .enumerate()
++                    .for_each(|(block, chunk)| {
++                        let begin = block * SAMPLE_CHUNK;
++                        if !mask[begin..begin + chunk.len()].iter().all(|&x| x) {
++                            crate::util::blinding_rng::fill_field_words::<F>(chunk);
++                        }
++                    });
++                return words;
++            }
+             sample_random_values::<F>(program.random_count as usize)
+         }),
+     };
+@@ -2244,6 +2367,11 @@ pub(crate) fn generate_wires_with<
+         }
+     }
+     let started = Instant::now();
++    #[cfg(feature = "gpu")]
++    let executor = program
++        .runtime
++        .run(|| program.execute_state_inner_with_tail(&root_values, &random, false, tail))?;
++    #[cfg(not(feature = "gpu"))]
+     let executor = program.execute_state(&root_values, &random)?;
+     report.execute = started.elapsed();
+ 
+@@ -2270,7 +2398,9 @@ pub(crate) fn generate_wires_with<
+         .collect::<Result<Vec<_>>>()?;
+     // A device destination exists only with the `gpu` feature.
+     #[cfg(feature = "gpu")]
+-    let ctx = if allow_device && crate::gpu::permutation::supported_circuit(prover, common) {
++    let ctx = if tail.is_some() {
++        tail_ctx
++    } else if allow_device && crate::gpu::permutation::supported_circuit(prover, common) {
+         crate::gpu::lde::applicable::<F, C, D>(
+             num_wires,
+             degree,
+@@ -2292,7 +2422,22 @@ pub(crate) fn generate_wires_with<
+             let gpu_gather = program.runtime.config.policy.gather
+                 == super::super::policy::WitnessGather::Gpu
+                 && executor.fast.is_some();
+-            let wire_values = if gpu_gather {
++            let compact = tail.is_some()
++                || crate::gpu::resident_witness::experiment().starts_with("compact")
++                || program.runtime.config.policy.gather
++                    == super::super::policy::WitnessGather::Compact;
++            let mut wire_slots = None;
++            let mut error = None;
++            let wire_values = if compact {
++                report.gather_mode = "compact";
++                let (state, slots) = super::aot::compact_on_gpu(&executor, &ctx, cell_slots)?;
++                wire_slots = Some(slots);
++                if let Some(tail) = tail {
++                    error = Some(tail.submit(&executor, &ctx, &state, device_seed.as_deref())?);
++                    report.gather_mode = "tail";
++                }
++                state
++            } else if gpu_gather {
+                 report.gather_mode = "gpu";
+                 super::aot::gather_on_gpu(&executor, &ctx, cell_slots)?
+             } else {
+@@ -2338,7 +2483,12 @@ pub(crate) fn generate_wires_with<
+                 wire_values
+             };
+             report.mode = "resident";
+-            Wires::Resident(crate::gpu::resident_witness::ResidentWitness { ctx, wire_values })
++            Wires::Resident(crate::gpu::resident_witness::ResidentWitness {
++                ctx,
++                wire_values,
++                wire_slots,
++                error,
++            })
+         }
+         _ => {
+             let cell_slots = program.cell_slots(map, num_wires, degree);
+@@ -2848,6 +2998,13 @@ pub(crate) mod tests {
+             let mut builder =
+                 CircuitBuilder::<G, 2>::new(CircuitConfig::standard_recursion_zk_config());
+             let input = builder.add_virtual_target();
++            // Private independent hash regions exercise device deferral while
++            // the public chain preserves a CPU boundary through the graph.
++            for i in 0..128 {
++                let c = builder.constant(G::from_canonical_u64(i));
++                let v = builder.add(input, c);
++                let _ = builder.hash_n_to_hash_no_pad::<PoseidonHash>(vec![v; 4]);
++            }
+             let mut state = vec![input; 4];
+             for _ in 0..hashes {
+                 state = builder
+@@ -2890,7 +3047,15 @@ pub(crate) mod tests {
+                 (WitnessGather::Auto, 16, 256),
+                 (WitnessGather::Auto, 7, 123),
+                 (WitnessGather::Gpu, 16, 256),
++                (WitnessGather::Compact, 16, 256),
++                (WitnessGather::Tail, 16, 256),
++                (WitnessGather::TailChecks, 16, 256),
+             ] {
++                if !cfg!(feature = "parallel")
++                    && matches!(gather, WitnessGather::Tail | WitnessGather::TailChecks)
++                {
++                    continue;
++                }
+                 let mut config = program.config().clone();
+                 config.policy.gather = gather;
+                 config.policy.gather_tiles = (columns, rows);
+@@ -2910,7 +3075,11 @@ pub(crate) mod tests {
+                 .unwrap();
+                 assert_eq!(
+                     report.gather_mode,
+-                    if gather == WitnessGather::Gpu {
++                    if gather == WitnessGather::Tail || gather == WitnessGather::TailChecks {
++                        "tail"
++                    } else if gather == WitnessGather::Compact {
++                        "compact"
++                    } else if gather == WitnessGather::Gpu {
+                         "gpu"
+                     } else {
+                         "reused"
+@@ -2919,7 +3088,13 @@ pub(crate) mod tests {
+                 let Wires::Resident(resident) = &wires else {
+                     panic!("native resident wires required")
+                 };
+-                let actual = resident.ctx.read_u64(&resident.wire_values, expected.len());
++                resident.validate().unwrap();
++                let actual = resident
++                    .read_columns::<G>(data.common.config.num_wires, data.common.degree())
++                    .into_iter()
++                    .flatten()
++                    .map(|x| x.to_canonical_u64())
++                    .collect::<Vec<_>>();
+                 assert_eq!(actual.len(), expected.len());
+                 for (i, (&a, &b)) in actual.iter().zip(&expected).enumerate() {
+                     assert_eq!(a, b, "hashes={hashes} tile={columns}x{rows} cell={i}");
+@@ -2933,6 +3108,234 @@ pub(crate) mod tests {
+                 )
+                 .unwrap();
+                 data.verify(proof).unwrap();
++                if gather == WitnessGather::Tail || gather == WitnessGather::TailChecks {
++                    let mut invalid = random.clone();
++                    invalid[0] = G::ORDER;
++                    match generate_wires_with(
++                        &pw,
++                        &data.prover_only,
++                        &data.common,
++                        true,
++                        Some(invalid),
++                    ) {
++                        Err(_) => {}
++                        Ok(Some((_, Wires::Resident(bad), _))) => assert!(bad.validate().is_err()),
++                        _ => panic!("invalid random values must be rejected"),
++                    }
++                    let (_, valid, _) = generate_wires_with(
++                        &pw,
++                        &data.prover_only,
++                        &data.common,
++                        true,
++                        Some(random.clone()),
++                    )
++                    .unwrap()
++                    .unwrap();
++                    let Wires::Resident(valid) = valid else {
++                        panic!("resident tail")
++                    };
++                    valid.validate().unwrap();
++                }
++            }
++        }
++    }
++
++    #[test]
++    #[cfg(all(feature = "gpu", feature = "parallel"))]
++    #[ignore = "requires a native GPU; run alone"]
++    fn gpu_tail_random_proves_fresh_inputs() {
++        use crate::hash::poseidon::PoseidonHash;
++        use crate::plonk::witness_program::policy::WitnessGather;
++        use crate::plonk::witness_program::{WitnessConfig, WitnessFallback};
++        let mut builder =
++            CircuitBuilder::<G, 2>::new(CircuitConfig::standard_recursion_zk_config());
++        let input = builder.add_virtual_target();
++        for i in 0..128 {
++            let c = builder.constant(G::from_canonical_u64(i));
++            let v = builder.add(input, c);
++            let mut state = vec![v; 4];
++            for _ in 0..4 {
++                state = builder
++                    .hash_n_to_hash_no_pad::<PoseidonHash>(state)
++                    .elements
++                    .to_vec();
++            }
++        }
++        builder.register_public_input(input);
++        let data = builder.build::<C>();
++        let mut config = WitnessConfig::default();
++        config.policy.gather = WitnessGather::TailRandom;
++        config.fallback = WitnessFallback::Error;
++        data.prepare_witness_program_with_config(&[input], config)
++            .unwrap();
++        let mut previous = None;
++        for value in [13, 13, G::ORDER - 1] {
++            let mut pw = PartialWitness::new();
++            pw.set_target(input, G::from_canonical_u64(value)).unwrap();
++            let (public, wires, report) =
++                generate_wires(&pw, &data.prover_only, &data.common, true)
++                    .unwrap()
++                    .unwrap();
++            assert_eq!(report.gather_mode, "tail");
++            assert_eq!(public, vec![G::from_canonical_u64(value)]);
++            let Wires::Resident(resident) = &wires else {
++                panic!("resident tail")
++            };
++            resident.validate().unwrap();
++            let actual =
++                resident.read_columns::<G>(data.common.config.num_wires, data.common.degree());
++            if let Some(prior) = previous {
++                assert_ne!(prior, actual, "fresh witness randomness");
++            }
++            previous = Some(actual);
++            let proof = crate::plonk::prover::prove_from_wires(
++                &data.prover_only,
++                &data.common,
++                public,
++                wires,
++                &mut TimingTree::default(),
++            )
++            .unwrap();
++            data.verify(proof).unwrap();
++        }
++    }
++
++    #[test]
++    #[cfg(all(feature = "gpu", feature = "parallel"))]
++    #[ignore = "requires a native GPU; run alone"]
++    fn gpu_tail_preserves_shared_random_sources() {
++        let mut builder =
++            CircuitBuilder::<G, 2>::new(CircuitConfig::standard_recursion_zk_config());
++        let input = builder.add_virtual_target();
++        builder.register_public_input(input);
++        let data = builder.build::<C>();
++        let installed = data.compile_witness_program(&[input]).unwrap();
++        let mut p = (*installed.program).clone();
++        let g = p
++            .groups
++            .iter()
++            .flatten()
++            .find(|g| g.kind == Kind::RandomValue && g.count > 1)
++            .unwrap()
++            .clone();
++        let co = g.coefficients_offset().unwrap() as usize;
++        let source = p.coefficients[co] as usize;
++        std::sync::Arc::make_mut(&mut p.coefficients)[co + 1] = source as u64;
++        p.fast = Default::default();
++        p.prepare(
++            &data.prover_only.representative_map,
++            data.common.config.num_wires,
++            data.common.degree(),
++        )
++        .unwrap();
++        let first = p.targets[g.targets_offset as usize];
++        let second = p.targets[g.targets_offset as usize + 1];
++        let tail = super::super::gpu_tail::Tail::compile(&p, &[first]);
++        assert!(!tail.gpu_random[source]);
++        let roots = vec![13; p.roots.len()];
++        let random = vec![17; p.random_count as usize];
++        let executor = p
++            .runtime
++            .run(|| p.execute_state_inner_with_tail(&roots, &random, false, Some(&tail)))
++            .unwrap();
++        let ctx = crate::gpu::context().expect("native GPU");
++        let state = tail.upload_state(&executor, &ctx);
++        let error = tail
++            .submit(&executor, &ctx, &state, Some(&[42; 32]))
++            .unwrap();
++        assert!(ctx.read_u64(&error, 2).iter().all(|&x| x == 0));
++        let actual = ctx.read_u64(&state, p.state_slots as usize);
++        assert_eq!(actual[first as usize], 17);
++        assert_eq!(actual[second as usize], 17);
++    }
++
++    #[test]
++    #[cfg(all(feature = "gpu", feature = "parallel"))]
++    #[ignore = "requires native GPU; run alone"]
++    fn gpu_tail_checks_seeded_roots_and_aliases() {
++        use crate::hash::poseidon::PoseidonHash;
++        use crate::plonk::config::Hasher;
++        use crate::plonk::witness_program::policy::WitnessGather;
++        use crate::plonk::witness_program::{WitnessConfig, WitnessFallback};
++        let mut builder =
++            CircuitBuilder::<G, 2>::new(CircuitConfig::standard_recursion_zk_config());
++        let a = builder.add_virtual_target();
++        let b = builder.add_virtual_target();
++        let claim = builder.add_virtual_target();
++        let ha = builder.hash_n_to_hash_no_pad::<PoseidonHash>(vec![a; 4]);
++        let hb = builder.hash_n_to_hash_no_pad::<PoseidonHash>(vec![b; 4]);
++        builder.connect(ha.elements[0], claim);
++        builder.connect(hb.elements[0], claim);
++        builder.register_public_input(claim);
++        let data = builder.build::<C>();
++        let input = G::from_canonical_u64(13);
++        let expected = PoseidonHash::hash_no_pad(&[input; 4]).elements[0];
++        let mut pw = PartialWitness::new();
++        pw.set_target(a, input).unwrap();
++        pw.set_target(b, input).unwrap();
++        pw.set_target(claim, expected).unwrap();
++        let worklist = crate::iop::generator::generate_partial_witness(
++            pw.clone(),
++            &data.prover_only,
++            &data.common,
++        )
++        .unwrap();
++        let mut config = WitnessConfig::default();
++        config.policy.gather = WitnessGather::TailChecks;
++        config.fallback = WitnessFallback::Error;
++        let program = data
++            .compile_witness_program_with_config(&[a, b, claim], config)
++            .unwrap();
++        let random = program
++            .program
++            .random_representatives()
++            .iter()
++            .map(|r| worklist.values[r.unwrap()].unwrap().to_canonical_u64())
++            .collect::<Vec<_>>();
++        let expected_wires = worklist.full_witness().wire_values;
++        data.install_witness_program(program).unwrap();
++        for (right, claimed, valid) in [
++            (13, expected, true),
++            (14, expected, false),
++            (13, G::ZERO, false),
++            (13, expected, true),
++        ] {
++            let mut pw = pw.clone();
++            pw.target_values.insert(b, G::from_canonical_u64(right));
++            pw.target_values.insert(claim, claimed);
++            let (public, wires, report) = generate_wires_with(
++                &pw,
++                &data.prover_only,
++                &data.common,
++                true,
++                Some(random.clone()),
++            )
++            .unwrap()
++            .unwrap();
++            assert_eq!(report.gather_mode, "tail");
++            let Wires::Resident(resident) = &wires else {
++                panic!("resident checked regions")
++            };
++            if valid {
++                resident.validate().unwrap();
++                assert_eq!(
++                    resident.read_columns::<G>(data.common.config.num_wires, data.common.degree()),
++                    expected_wires
++                );
++                let proof = crate::plonk::prover::prove_from_wires(
++                    &data.prover_only,
++                    &data.common,
++                    public,
++                    wires,
++                    &mut TimingTree::default(),
++                )
++                .unwrap();
++                data.verify(proof).unwrap();
++            } else {
++                assert!(
++                    resident.validate().is_err(),
++                    "conflicting root/alias must be rejected"
++                );
+             }
+         }
+     }
+diff --git a/plonky2/src/util/serialization/mod.rs b/plonky2/src/util/serialization/mod.rs
+index 76bc9eed..505fa5c5 100644
+--- a/plonky2/src/util/serialization/mod.rs
++++ b/plonky2/src/util/serialization/mod.rs
+@@ -757,6 +757,8 @@ pub trait Read {
+             device_coeffs: Default::default(),
+             #[cfg(feature = "gpu")]
+             device_values: Default::default(),
++            #[cfg(feature = "gpu")]
++            device_value_slots: Default::default(),
+         })
+     }
+ 
+diff --git a/plonky2/src/gpu/random.rs b/plonky2/src/gpu/random.rs
+new file mode 100644
+index 00000000..2e84c671
+--- /dev/null
++++ b/plonky2/src/gpu/random.rs
+@@ -0,0 +1,152 @@
++//! Experimental device-side ChaCha20 with rejection sampling into Goldilocks.
++//! Each call receives a fresh secret key; domains separate witness and salts.
++use rand::RngCore;
++
++use super::{DeviceBuffer, GpuContext};
++
++pub(crate) fn fresh_seed() -> zeroize::Zeroizing<[u8; 32]> {
++    let mut seed = zeroize::Zeroizing::new([0u8; 32]);
++    rand::rngs::OsRng.fill_bytes(seed.as_mut());
++    seed
++}
++pub(crate) fn seed_words(seed: &[u8; 32], domain: u32) -> zeroize::Zeroizing<Vec<u32>> {
++    let mut words = seed
++        .as_chunks::<4>()
++        .0
++        .iter()
++        .map(|x| u32::from_le_bytes(*x))
++        .collect::<Vec<_>>();
++    words.extend([domain, 0, 0, 0]);
++    zeroize::Zeroizing::new(words)
++}
++pub(crate) struct Kernels {
++    layout: wgpu::BindGroupLayout,
++    pipeline: wgpu::ComputePipeline,
++}
++impl GpuContext {
++    pub(crate) fn fill_random(
++        &self,
++        dst: &DeviceBuffer,
++        offset: usize,
++        count: usize,
++        seed: &[u8; 32],
++        domain: u32,
++    ) {
++        if count == 0 {
++            return;
++        }
++        let k = self.random.get_or_init(|| {
++            let layout = super::storage_layout(
++                &self.device,
++                "device randomness",
++                &[(true, true), (true, true), (false, false)],
++            );
++            let source = format!("{CHACHA}\n{FILL}");
++            let module = super::module(&self.device, "device ChaCha20", &source);
++            Kernels {
++                pipeline: super::pipeline(&self.device, &layout, &module, "fill"),
++                layout,
++            }
++        });
++        let key = self.uniform("fresh random key", &seed_words(seed, domain));
++        let params = self.uniform("random range", &[offset as u32, count as u32, 0, 0]);
++        let bind = self.bind(&k.layout, &[&params, &key, dst]);
++        let mut encoder = self.encoder("device randomness");
++        {
++            let mut pass = self.begin_pass(&mut encoder, "device randomness", None);
++            pass.set_pipeline(&k.pipeline);
++            pass.set_bind_group(0, &bind, &[]);
++            let groups = (count as u32).div_ceil(8).div_ceil(128);
++            let width = groups.min(65535);
++            pass.dispatch_workgroups(width, groups.div_ceil(width), 1);
++        }
++        self.submit_async(encoder);
++    }
++}
++#[cfg(test)]
++pub(crate) fn reference(seed: [u8; 32], domain: u32, index: usize) -> u64 {
++    use rand::SeedableRng;
++    let mut rng = rand_chacha::ChaCha20Rng::from_seed(seed);
++    let mut attempt = 0u64;
++    loop {
++        rng.set_stream((attempt << 32) | domain as u64);
++        rng.set_word_pos((index / 8 * 16 + index % 8 * 2) as u128);
++        let value = rng.next_u64();
++        if value < 0xffff_ffff_0000_0001 {
++            return value;
++        }
++        attempt += 1;
++    }
++}
++
++pub(crate) const CHACHA: &str = r#"
++struct RandomKey {a:vec4<u32>,b:vec4<u32>,domain:vec4<u32>}
++fn rol(x:u32,n:u32)->u32 {return (x<<n)|(x>>(32u-n));}
++fn qr(p:ptr<function,array<u32,16>>,a:u32,b:u32,c:u32,d:u32) {
++ (*p)[a]+=(*p)[b];(*p)[d]=rol((*p)[d]^(*p)[a],16u);
++ (*p)[c]+=(*p)[d];(*p)[b]=rol((*p)[b]^(*p)[c],12u);
++ (*p)[a]+=(*p)[b];(*p)[d]=rol((*p)[d]^(*p)[a],8u);
++ (*p)[c]+=(*p)[d];(*p)[b]=rol((*p)[b]^(*p)[c],7u);
++}
++fn chacha(key:RandomKey,block:u32,attempt:u32)->array<u32,16> {
++ let initial=array<u32,16>(0x61707865u,0x3320646eu,0x79622d32u,0x6b206574u,
++ key.a.x,key.a.y,key.a.z,key.a.w,key.b.x,key.b.y,key.b.z,key.b.w,
++ block,0u,key.domain.x,attempt);
++ var p=initial;
++ for(var r=0u;r<10u;r++) {
++  qr(&p,0u,4u,8u,12u);qr(&p,1u,5u,9u,13u);qr(&p,2u,6u,10u,14u);qr(&p,3u,7u,11u,15u);
++  qr(&p,0u,5u,10u,15u);qr(&p,1u,6u,11u,12u);qr(&p,2u,7u,8u,13u);qr(&p,3u,4u,9u,14u);
++ }
++ for(var i=0u;i<16u;i++){p[i]+=initial[i];}return p;
++}
++fn accepted(v:vec2<u32>)->bool {return v.y!=0xffffffffu || v.x==0u;}
++fn random_field(key:RandomKey,index:u32)->vec2<u32> {
++ var attempt=0u;
++ loop {
++  let words=chacha(key,index/8u,attempt);let pos=(index%8u)*2u;
++  let value=vec2<u32>(words[pos],words[pos+1u]);
++  if(accepted(value)){return value;}attempt++;
++ }
++ return vec2<u32>(0u);
++}
++"#;
++const FILL: &str = r#"
++struct Range {offset:u32,count:u32,pad0:u32,pad1:u32}
++@group(0) @binding(0) var<uniform> range:Range;
++@group(0) @binding(1) var<uniform> key:RandomKey;
++@group(0) @binding(2) var<storage,read_write> output:array<vec2<u32>>;
++@compute @workgroup_size(128)
++fn fill(@builtin(global_invocation_id) id:vec3<u32>,@builtin(num_workgroups) groups:vec3<u32>) {
++ let block=id.x+id.y*groups.x*128u;let begin=block*8u;if(begin>=range.count){return;}
++ let words=chacha(key,block,0u);
++ for(var i=0u;i<8u && begin+i<range.count;i++) {
++  var value=vec2<u32>(words[2u*i],words[2u*i+1u]);
++  if(!accepted(value)){value=random_field(key,begin+i);}
++  output[range.offset+begin+i]=value;
++ }
++}
++"#;
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    #[ignore = "requires native GPU; run alone"]
++    fn device_random_matches_chacha20_and_preserves_ranges() {
++        let ctx = super::super::context().expect("native GPU");
++        let seed = core::array::from_fn(|i| i as u8);
++        for domain in [0, 0x5749544e, 0x53414c54] {
++            let dst = ctx.upload("random test sentinels", &vec![77; 1040]);
++            ctx.fill_random(&dst, 3, 1027, &seed, domain);
++            let actual = ctx.read_u64(&dst, 1040);
++            assert_eq!(&actual[..3], &[77; 3]);
++            assert_eq!(&actual[1030..], &[77; 10]);
++            for (i, &value) in actual[3..1030].iter().enumerate() {
++                assert_eq!(value, reference(seed, domain, i), "domain={domain} i={i}");
++            }
++        }
++        let a = fresh_seed();
++        let b = fresh_seed();
++        assert_ne!(a.as_ref(), b.as_ref());
++    }
++}
+diff --git a/plonky2/src/plonk/witness_program/region/gpu_tail.rs b/plonky2/src/plonk/witness_program/region/gpu_tail.rs
+new file mode 100644
+index 00000000..d746e623
+--- /dev/null
++++ b/plonky2/src/plonk/witness_program/region/gpu_tail.rs
+@@ -0,0 +1,866 @@
++//! Experimental CPU/GPU cut: only certified exclusive outputs whose consumers
++//! all stay on the device may be deferred. Roots, aliases and public inputs
++//! are seeded on the CPU; the optional checked cut validates them on the GPU.
++//! This is selected only by the benchmark experiment hook.
++use std::collections::HashMap;
++use std::fmt::Write;
++
++use anyhow::Result;
++
++use super::cpu::Executor;
++use super::{Group, Kind, RegionProgram};
++use crate::field::goldilocks_field::GoldilocksField as G;
++use crate::gpu::{DeviceBuffer, DeviceCache, GpuContext};
++use crate::hash::poseidon::{Poseidon, ALL_ROUND_CONSTANTS};
++
++#[derive(Debug)]
++pub(crate) struct Tail {
++    masks: HashMap<u32, Vec<bool>>,
++    pub(super) checks: bool,
++    public_slots: Vec<u32>,
++    cpu_slots: Vec<u32>,
++    cpu_slots_device: DeviceCache,
++    metadata: Vec<u32>,
++    runs: Vec<(u32, u32, bool)>,
++    run_kinds: Vec<u8>,
++    params_cache: Vec<[DeviceCache; 2]>,
++    metadata_device: DeviceCache,
++    targets_device: DeviceCache,
++    coefficients_device: DeviceCache,
++    pub gpu_random: Vec<bool>,
++    shared_random: bool,
++}
++impl Tail {
++    #[cfg(test)]
++    pub(super) fn compile(p: &RegionProgram, public_slots: &[u32]) -> Self {
++        Self::compile_with_checks(p, public_slots, false)
++    }
++    #[cfg(test)]
++    pub(super) fn compile_with_checks(
++        p: &RegionProgram,
++        public_slots: &[u32],
++        checks: bool,
++    ) -> Self {
++        Self::compile_config(p, public_slots, checks, false)
++    }
++    pub(super) fn compile_config(
++        p: &RegionProgram,
++        public_slots: &[u32],
++        checks: bool,
++        compress: bool,
++    ) -> Self {
++        #[cfg(feature = "witness-benchmarks")]
++        if std::env::var_os("PLONKY2_GPU_WITNESS_CUT_ANALYSIS").is_some() {
++            analyze(p, public_slots);
++        }
++        let fast = p.fast.get().expect("certified tail");
++        let mut cpu = vec![false; p.state_slots as usize];
++        cpu[..p.roots.len()].fill(true);
++        for &s in public_slots {
++            if s != u32::MAX {
++                cpu[s as usize] = true;
++            }
++        }
++        if !checks {
++            for i in 0..p.alias_count as usize {
++                cpu[p.targets[p.alias_pair_offset as usize + 2 * i] as usize] = true;
++                cpu[p.targets[p.alias_pair_offset as usize + 2 * i + 1] as usize] = true;
++            }
++        }
++        let mut masks = HashMap::new();
++        let target = |g: &Group, pos: u32, k: u32| {
++            p.targets[(g.targets_offset + pos * g.count + k) as usize]
++        };
++        let mut counts = [0usize; Kind::COUNT];
++        let mut gpu_random = vec![false; p.random_count as usize];
++        for groups in p.groups.iter().rev() {
++            for g in groups {
++                let supported = matches!(
++                    g.kind,
++                    Kind::Poseidon
++                        | Kind::Arithmetic
++                        | Kind::Copy
++                        | Kind::Constant
++                        | Kind::Equality
++                        | Kind::ExtensionArithmetic
++                        | Kind::ExtensionMultiply
++                        | Kind::ArithmeticChain
++                        | Kind::RandomValue
++                        | Kind::ConditionalZero
++                        | Kind::BitSum
++                        | Kind::RandomAccess
++                );
++                let mut mask = vec![false; g.count as usize];
++                for k in 0..g.count {
++                    let offload = supported
++                        && (g.inputs..g.inputs + g.outputs).all(|pos| {
++                            let s = target(g, pos, k) as usize;
++                            (checks && s < p.roots.len())
++                                || (!cpu[s] && s >= p.roots.len() && fast.single[s] != 0)
++                        });
++                    mask[k as usize] = offload;
++                    if offload {
++                        counts[g.kind.code()] += 1;
++                        if g.kind == Kind::RandomValue {
++                            gpu_random[p.coefficients
++                                [(g.coefficients_offset().unwrap() + k) as usize]
++                                as usize] = true;
++                        }
++                    } else {
++                        for pos in 0..g.inputs {
++                            cpu[target(g, pos, k) as usize] = true;
++                        }
++                    }
++                }
++                masks.insert(g.targets_offset, mask);
++            }
++        }
++        // A random source may have several outputs. CPU consumers keep the
++        // source on the CPU, including its deferred copies on the device.
++        for g in p
++            .groups
++            .iter()
++            .flatten()
++            .filter(|g| g.kind == Kind::RandomValue)
++        {
++            for k in 0..g.count {
++                if !masks[&g.targets_offset][k as usize] {
++                    gpu_random[p.coefficients[(g.coefficients_offset().unwrap() + k) as usize]
++                        as usize] = false;
++                }
++            }
++        }
++        let mut shared_random = false;
++        let mut levels = vec![0u32; p.state_slots as usize];
++        let split_eq = crate::gpu::resident_witness::experiment().contains("split-eq");
++        let mut buckets = std::collections::BTreeMap::<(u32, u8), Vec<[u32; 8]>>::new();
++        for (layer, groups) in p.groups.iter().enumerate() {
++            for g in groups {
++                for k in 0..g.count {
++                    if !masks[&g.targets_offset][k as usize] {
++                        continue;
++                    }
++                    // Every CPU-produced value is ready before the device starts.
++                    // Seeded roots are expected values, not dependencies on their
++                    // deferred checking operations. Only device-produced values
++                    // introduce edges in this graph.
++                    let rank = if compress {
++                        (0..g.inputs)
++                            .map(|pos| levels[target(g, pos, k) as usize])
++                            .max()
++                            .unwrap_or(0)
++                            + 1
++                    } else {
++                        layer as u32
++                    };
++                    if compress {
++                        for pos in g.inputs..g.inputs + g.outputs {
++                            let slot = target(g, pos, k) as usize;
++                            if slot >= p.roots.len() {
++                                levels[slot] = rank;
++                            }
++                        }
++                    }
++                    let device_random = if g.kind == Kind::RandomValue {
++                        let device = gpu_random[p.coefficients
++                            [(g.coefficients_offset().unwrap() + k) as usize]
++                            as usize];
++                        shared_random |= !device;
++                        u32::from(device)
++                    } else {
++                        0
++                    };
++                    buckets
++                        .entry((
++                            rank,
++                            if g.kind == Kind::Poseidon {
++                                0
++                            } else if split_eq && g.kind == Kind::Equality {
++                                2
++                            } else {
++                                1
++                            },
++                        ))
++                        .or_default()
++                        .push([
++                            g.kind.code() as u32,
++                            g.targets_offset,
++                            g.count,
++                            k,
++                            g.argument.word(),
++                            g.inputs,
++                            g.outputs,
++                            device_random,
++                        ]);
++                }
++            }
++        }
++        let mut metadata = Vec::new();
++        let mut runs = Vec::new();
++        let mut run_kinds = Vec::new();
++        for ((_, kind), descriptors) in buckets {
++            let base = (metadata.len() / 8) as u32;
++            let count = descriptors.len() as u32;
++            for descriptor in descriptors {
++                metadata.extend(descriptor);
++            }
++            runs.push((base, count, kind == 0));
++            run_kinds.push(kind);
++        }
++        eprintln!(
++            "GPU_TAIL_SCHEDULE compressed={compress} dispatches={}",
++            runs.len()
++        );
++        let mut device_outputs = vec![false; p.state_slots as usize];
++        for g in p.groups.iter().flatten() {
++            for k in 0..g.count {
++                if masks[&g.targets_offset][k as usize] {
++                    for pos in g.inputs..g.inputs + g.outputs {
++                        let slot = target(g, pos, k) as usize;
++                        if slot >= p.roots.len() {
++                            device_outputs[slot] = true;
++                        }
++                    }
++                }
++            }
++        }
++        let cpu_slots = device_outputs
++            .iter()
++            .enumerate()
++            .filter_map(|(i, &gpu)| (!gpu).then_some(i as u32))
++            .collect::<Vec<_>>();
++        eprintln!(
++            "GPU_TAIL_STATE cpu_bytes={} total_bytes={}",
++            cpu_slots.len() * 8,
++            p.state_slots as usize * 8
++        );
++        eprintln!(
++            "GPU_TAIL_PLAN counts={counts:?} operations={} dispatches={} gpu_random={}/{}",
++            metadata.len() / 8,
++            runs.len(),
++            gpu_random.iter().filter(|&&x| x).count(),
++            p.random_count
++        );
++        Self {
++            masks,
++            checks,
++            public_slots: public_slots.to_vec(),
++            cpu_slots,
++            cpu_slots_device: Default::default(),
++            metadata,
++            params_cache: runs
++                .iter()
++                .map(|_| [Default::default(), Default::default()])
++                .collect(),
++            runs,
++            run_kinds,
++            metadata_device: Default::default(),
++            targets_device: Default::default(),
++            coefficients_device: Default::default(),
++            gpu_random,
++            shared_random,
++        }
++    }
++    pub(super) fn matches_public_inputs(&self, slots: &[u32]) -> bool {
++        self.public_slots == slots
++    }
++    pub(super) fn cpu_ranges(
++        &self,
++        g: &Group,
++        start: u32,
++        end: u32,
++        mut run: impl FnMut(u32, u32) -> Result<()>,
++    ) -> Result<()> {
++        let mask = &self.masks[&g.targets_offset];
++        let mut i = start;
++        while i < end {
++            while i < end && mask[i as usize] {
++                i += 1;
++            }
++            let begin = i;
++            while i < end && !mask[i as usize] {
++                i += 1;
++            }
++            if begin < i {
++                run(begin, i)?;
++            }
++        }
++        Ok(())
++    }
++    pub(super) fn upload_state(&self, e: &Executor<'_>, ctx: &GpuContext) -> DeviceBuffer {
++        use std::sync::atomic::Ordering;
++
++        use plonky2_maybe_rayon::*;
++        let bytes = self.cpu_slots.len() * 8;
++        if bytes == 0 {
++            return ctx.storage("hybrid witness state", (e.state.len() * 8) as u64);
++        }
++        let staging = ctx.upload_staging(bytes as u64);
++        e.program.runtime.run(|| {
++            self.cpu_slots
++                .par_chunks(16384)
++                .enumerate()
++                .for_each(|(block, slots)| {
++                    let begin = block * 16384 * 8;
++                    let mut view = staging
++                        .buffer
++                        .slice(begin as u64..(begin + slots.len() * 8) as u64)
++                        .get_mapped_range_mut()
++                        .expect("boundary mapping");
++                    let (words, _) = view.slice(..).into_chunks::<8>();
++                    for (word, &slot) in words.into_iter().zip(slots) {
++                        word.write(e.state[slot as usize].load(Ordering::Relaxed).to_le_bytes());
++                    }
++                })
++        });
++        let packed = ctx.storage("CPU boundary values", bytes as u64);
++        ctx.finish_upload(staging, &packed, bytes as u64);
++        let slots = self.cpu_slots_device.get().unwrap_or_else(|| {
++            let words = self
++                .cpu_slots
++                .chunks(2)
++                .map(|x| x[0] as u64 | ((x.get(1).copied().unwrap_or(0) as u64) << 32))
++                .collect::<Vec<_>>();
++            let b = ctx.upload("CPU boundary slots", &words);
++            self.cpu_slots_device.set_if_within_limit(ctx, b.clone());
++            b
++        });
++        let state = ctx.storage("hybrid witness state", (e.state.len() * 8) as u64);
++        let kernels = ctx.witness_tail.get_or_init(|| Kernels::new(ctx));
++        let params = ctx.uniform("scatter range", &[self.cpu_slots.len() as u32, 0, 0, 0]);
++        let bind = ctx.bind(&kernels.scatter_layout, &[&params, &packed, &slots, &state]);
++        let mut encoder = ctx.encoder("scatter CPU boundary");
++        {
++            let mut pass = ctx.begin_pass(&mut encoder, "scatter CPU boundary", None);
++            pass.set_pipeline(&kernels.scatter);
++            pass.set_bind_group(0, &bind, &[]);
++            let groups = (self.cpu_slots.len() as u32).div_ceil(256);
++            let width = groups.min(65535);
++            pass.dispatch_workgroups(width, groups.div_ceil(width), 1);
++        }
++        ctx.submit_async(encoder);
++        state
++    }
++    pub(super) fn submit(
++        &self,
++        e: &Executor<'_>,
++        ctx: &GpuContext,
++        state: &DeviceBuffer,
++        seed: Option<&[u8; 32]>,
++    ) -> Result<DeviceBuffer> {
++        let kernels = ctx.witness_tail.get_or_init(|| Kernels::new(ctx));
++        let upload_u32 = |label: &str, cache: &DeviceCache, words: &[u32]| {
++            cache.get().unwrap_or_else(|| {
++                let words = words
++                    .chunks(2)
++                    .map(|c| c[0] as u64 | ((c.get(1).copied().unwrap_or(0) as u64) << 32))
++                    .collect::<Vec<_>>();
++                let b = ctx.upload(label, &words);
++                cache.set_if_within_limit(ctx, b.clone());
++                b
++            })
++        };
++        let meta = upload_u32("tail descriptors", &self.metadata_device, &self.metadata);
++        let targets = upload_u32("tail targets", &self.targets_device, &e.program.targets);
++        let coefficients = self.coefficients_device.get().unwrap_or_else(|| {
++            let b = ctx.upload("tail coefficients", &e.program.coefficients);
++            self.coefficients_device.set_if_within_limit(ctx, b.clone());
++            b
++        });
++        let random = if seed.is_some() && !self.shared_random {
++            ctx.dummy.clone()
++        } else {
++            ctx.upload("tail random values", e.random)
++        };
++        let key_words = crate::gpu::random::seed_words(seed.unwrap_or(&[0u8; 32]), 0x5749544e);
++        let key = ctx.uniform("tail random key", &key_words);
++        let error = ctx.storage("tail errors", 16);
++        let mut encoder = ctx.encoder("terminal witness regions");
++        encoder.clear_buffer(&error, 0, None);
++        let cache_params = crate::gpu::resident_witness::experiment().contains("params");
++        let binds = self
++            .runs
++            .iter()
++            .enumerate()
++            .map(|(index, &(base, count, poseidon))| {
++                let create = || {
++                    DeviceBuffer::unpooled(ctx.uniform(
++                        "tail range",
++                        &[
++                            base,
++                            count,
++                            u32::from(seed.is_some()),
++                            if self.checks {
++                                e.program.roots.len() as u32
++                            } else {
++                                0
++                            },
++                        ],
++                    ))
++                };
++                let params = if cache_params {
++                    let cache = &self.params_cache[index][usize::from(seed.is_some())];
++                    cache.get().unwrap_or_else(|| {
++                        let p = create();
++                        cache.set_if_within_limit(ctx, p.clone());
++                        p
++                    })
++                } else {
++                    create()
++                };
++                (
++                    ctx.bind(
++                        &kernels.layout,
++                        &[
++                            &params,
++                            &meta,
++                            &targets,
++                            &coefficients,
++                            &random,
++                            state,
++                            &error,
++                            &key,
++                        ],
++                    ),
++                    count,
++                    poseidon,
++                    self.run_kinds[index],
++                )
++            })
++            .collect::<Vec<_>>();
++        #[cfg(feature = "gpu-profiling")]
++        let detailed = ctx.pass_timeline.is_some()
++            && crate::util::switches::flag("PLONKY2_GPU_WITNESS_KERNEL_TIMELINE");
++        #[cfg(not(feature = "gpu-profiling"))]
++        let detailed = false;
++        if detailed {
++            for (bind, count, poseidon, kind) in &binds {
++                let label = format!(
++                    "witness {}",
++                    match kind {
++                        0 => "Poseidon",
++                        2 => "Equality",
++                        _ => "Other",
++                    }
++                );
++                let mut pass = ctx.begin_pass(&mut encoder, &label, None);
++                pass.set_pipeline(if *poseidon {
++                    &kernels.poseidon
++                } else {
++                    &kernels.cheap
++                });
++                pass.set_bind_group(0, bind, &[]);
++                let groups = count.div_ceil(128);
++                let width = groups.min(65535);
++                pass.dispatch_workgroups(width, groups.div_ceil(width), 1);
++            }
++        } else {
++            let mut pass = ctx.begin_pass(&mut encoder, "terminal witness regions", None);
++            for (bind, count, poseidon, _) in &binds {
++                pass.set_pipeline(if *poseidon {
++                    &kernels.poseidon
++                } else {
++                    &kernels.cheap
++                });
++                pass.set_bind_group(0, bind, &[]);
++                let groups = count.div_ceil(128);
++                let width = groups.min(65535);
++                pass.dispatch_workgroups(width, groups.div_ceil(width), 1);
++            }
++        }
++        if self.checks && e.program.alias_count > 0 {
++            let params = ctx.uniform(
++                "alias range",
++                &[e.program.alias_pair_offset, e.program.alias_count, 0, 0],
++            );
++            let bind = ctx.bind(&kernels.alias_layout, &[&params, &targets, state, &error]);
++            let mut pass = ctx.begin_pass(&mut encoder, "validate witness aliases", None);
++            pass.set_pipeline(&kernels.alias);
++            pass.set_bind_group(0, &bind, &[]);
++            let groups = e.program.alias_count.div_ceil(256);
++            let width = groups.min(65535);
++            pass.dispatch_workgroups(width, groups.div_ceil(width), 1);
++        }
++        ctx.submit_async(encoder);
++        Ok(error)
++    }
++}
++
++pub(crate) struct Kernels {
++    layout: wgpu::BindGroupLayout,
++    cheap: wgpu::ComputePipeline,
++    poseidon: wgpu::ComputePipeline,
++    scatter_layout: wgpu::BindGroupLayout,
++    scatter: wgpu::ComputePipeline,
++    alias_layout: wgpu::BindGroupLayout,
++    alias: wgpu::ComputePipeline,
++}
++impl Kernels {
++    fn new(ctx: &GpuContext) -> Self {
++        let layout = crate::gpu::storage_layout(
++            &ctx.device,
++            "witness tail",
++            &[
++                (true, true),
++                (false, true),
++                (false, true),
++                (false, true),
++                (false, true),
++                (false, false),
++                (false, false),
++                (true, true),
++            ],
++        );
++        let mut source = crate::gpu::shader::prelude_with_mds(ctx.flavor);
++        source.push_str(crate::gpu::random::CHACHA);
++        source.push_str(KERNEL);
++        if crate::gpu::resident_witness::experiment().contains("dense") {
++            source.push_str(&crate::gpu::shader::witness_dense_trace());
++        } else {
++            source.push_str(&trace());
++        }
++        let module = crate::gpu::module(&ctx.device, "witness tail", &source);
++        let scatter_layout = crate::gpu::storage_layout(
++            &ctx.device,
++            "CPU boundary scatter",
++            &[(true, true), (false, true), (false, true), (false, false)],
++        );
++        let scatter_module = crate::gpu::module(&ctx.device, "CPU boundary scatter", SCATTER);
++        let scatter =
++            crate::gpu::pipeline(&ctx.device, &scatter_layout, &scatter_module, "scatter");
++        let alias_layout = crate::gpu::storage_layout(
++            &ctx.device,
++            "witness alias check",
++            &[(true, true), (false, true), (false, true), (false, false)],
++        );
++        let alias_module = crate::gpu::module(&ctx.device, "witness alias check", ALIASES);
++        let alias = crate::gpu::pipeline(&ctx.device, &alias_layout, &alias_module, "validate");
++        Self {
++            alias_layout,
++            alias,
++            scatter_layout,
++            scatter,
++            cheap: crate::gpu::pipeline(&ctx.device, &layout, &module, "cheap"),
++            poseidon: crate::gpu::pipeline(&ctx.device, &layout, &module, "poseidon"),
++            layout,
++        }
++    }
++}
++const KERNEL: &str = r#"
++struct Params {base:u32,count:u32,pad0:u32,pad1:u32}
++@group(0) @binding(0) var<uniform> params:Params;
++@group(0) @binding(1) var<storage,read> metadata:array<u32>;
++@group(0) @binding(2) var<storage,read> targets:array<u32>;
++@group(0) @binding(3) var<storage,read> coefficients:array<Field>;
++@group(0) @binding(4) var<storage,read> random:array<Field>;
++@group(0) @binding(5) var<storage,read_write> state:array<Field>;
++@group(0) @binding(6) var<storage,read_write> errors:array<atomic<u32>>;
++@group(0) @binding(7) var<uniform> random_key:RandomKey;
++struct Op {kind:u32,offset:u32,count:u32,lane:u32,co:u32,inputs:u32,outputs:u32,random_on_device:u32}
++fn operation(id:vec3<u32>,groups:vec3<u32>)->Op {
++ let index=id.x+id.y*groups.x*128u;
++ let i=(params.base+index)*8u;
++ return Op(metadata[i],metadata[i+1u],metadata[i+2u],metadata[i+3u],metadata[i+4u],metadata[i+5u],metadata[i+6u],metadata[i+7u]);
++}
++fn inp(g:Op,pos:u32)->Field {return state[targets[g.offset+pos*g.count+g.lane]];}
++fn coef(g:Op,pos:u32)->Field {return coefficients[g.co+pos*g.count+g.lane];}
++fn emit(g:Op,pos:u32,value:Field) {
++ let slot=targets[g.offset+(g.inputs+pos)*g.count+g.lane];let v=canonical(value);
++ if(slot<params.pad1){if(any(state[slot]!=v)){atomicOr(&errors[0],2u);}}else{state[slot]=v;}
++}
++fn fail() {atomicOr(&errors[0],1u);}
++fn chain_read(g:Op,v:Field,locals:array<Field,8>)->Field {
++ if ((v.y & 0x80000000u)!=0u) {return locals[v.x];}
++ return inp(g,v.x);
++}
++@compute @workgroup_size(128)
++fn cheap(@builtin(global_invocation_id) id:vec3<u32>,@builtin(num_workgroups) groups:vec3<u32>) {
++ let index=id.x+id.y*groups.x*128u;if(index>=params.count){return;}
++ let g=operation(id,groups);
++ switch g.kind {
++ case 1u: {emit(g,0u,add_field(mul_field(mul_field(inp(g,0u),inp(g,1u)),coef(g,0u)),mul_field(inp(g,2u),coef(g,1u))));}
++ case 2u: {emit(g,0u,inp(g,0u));}
++ case 3u: {emit(g,0u,coef(g,0u));}
++ case 4u: {let x=canonical(inp(g,0u));let y=canonical(inp(g,1u));if(all(x==y)){emit(g,0u,Field(1u,0u));emit(g,1u,Field(0u,0u));}else{emit(g,0u,Field(0u,0u));emit(g,1u,inv_field(sub_field(x,y)));}}
++ case 5u: {let p=ext_mul(inp(g,0u),inp(g,1u),inp(g,2u),inp(g,3u));emit(g,0u,add_field(mul_field(p[0],coef(g,0u)),mul_field(inp(g,4u),coef(g,1u))));emit(g,1u,add_field(mul_field(p[1],coef(g,0u)),mul_field(inp(g,5u),coef(g,1u))));}
++ case 6u: {let p=ext_mul(inp(g,0u),inp(g,1u),inp(g,2u),inp(g,3u));emit(g,0u,mul_field(p[0],coef(g,0u)));emit(g,1u,mul_field(p[1],coef(g,0u)));}
++ case 7u: {let index=canonical(inp(g,0u));if(index.y!=0u || index.x>=g.co){fail();return;}emit(g,0u,inp(g,1u+index.x));for(var i=1u;i<g.outputs;i++){emit(g,i,Field((index.x>>(i-1u))&1u,0u));}}
++ case 17u: {var value:Field;if(params.pad0!=0u && g.random_on_device!=0u){value=random_field(random_key,coef(g,0u).x);}else{value=random[coef(g,0u).x];}if(value.y==0xffffffffu && value.x>=1u){fail();return;}emit(g,0u,value);}
++ case 18u: {let d=canonical(inp(g,0u));var v=Field(0u,0u);if(any(d!=Field(0u,0u))){v=mul_field(inp(g,1u),inv_field(d));}emit(g,0u,v);}
++ case 26u: {var locals:array<Field,8>;for(var j=0u;j<g.outputs;j++){let a=chain_read(g,coef(g,5u*j),locals);let b=chain_read(g,coef(g,5u*j+1u),locals);let c=chain_read(g,coef(g,5u*j+2u),locals);locals[j]=add_field(mul_field(mul_field(a,b),coef(g,5u*j+3u)),mul_field(c,coef(g,5u*j+4u)));emit(g,j,locals[j]);}}
++ case 27u: {var v=Field(0u,0u);for(var j=g.inputs;j>0u;j--){let b=canonical(inp(g,j-1u));if(b.y!=0u || b.x>1u){fail();return;}v=add_field(add_field(v,v),b);}emit(g,0u,v);}
++ default: {fail();}
++ }
++}
++@compute @workgroup_size(128)
++fn poseidon(@builtin(global_invocation_id) id:vec3<u32>,@builtin(num_workgroups) groups:vec3<u32>) {
++ let index=id.x+id.y*groups.x*128u;if(index>=params.count){return;}
++ trace_poseidon(operation(id,groups));
++}
++"#;
++
++fn trace() -> String {
++    let mut s=String::from("fn trace_poseidon(g:Op) { var a:array<Field,12>; for(var i=0u;i<12u;i++){a[i]=inp(g,i);} let swap=canonical(inp(g,12u)); if(swap.y!=0u || swap.x>1u){fail();return;}\n");
++    for i in 0..4 {
++        writeln!(
++            s,
++            "emit(g,{i}u,mul_field(swap,sub_field(a[{}],a[{i}])));",
++            i + 4
++        )
++        .unwrap();
++    }
++    s.push_str("if(swap.x==1u){for(var i=0u;i<4u;i++){let t=a[i];a[i]=a[i+4u];a[i+4u]=t;}}\n");
++    let mut out = 4;
++    let literal = crate::gpu::shader::literal;
++    for r in 0..4 {
++        for i in 0..12 {
++            writeln!(
++                s,
++                "a[{i}]=add_field(a[{i}],{});",
++                literal(ALL_ROUND_CONSTANTS[r * 12 + i])
++            )
++            .unwrap();
++        }
++        if r != 0 {
++            for i in 0..12 {
++                writeln!(s, "emit(g,{out}u,a[{i}]);").unwrap();
++                out += 1;
++            }
++        }
++        s.push_str("for(var i=0u;i<12u;i++){a[i]=sbox(a[i]);} a=mds12(a);\n");
++    }
++    for i in 0..12 {
++        writeln!(
++            s,
++            "a[{i}]=add_field(a[{i}],{});",
++            literal(G::FAST_PARTIAL_FIRST_ROUND_CONSTANT[i])
++        )
++        .unwrap();
++    }
++    s.push_str("var b:array<Field,12>;b[0]=a[0];\n");
++    for c in 1..12 {
++        let mut expr = "Field(0u,0u)".to_owned();
++        for r in 1..12 {
++            expr = format!(
++                "add_field({expr},mul_field(a[{r}],{}))",
++                literal(G::FAST_PARTIAL_ROUND_INITIAL_MATRIX[r - 1][c - 1])
++            );
++        }
++        writeln!(s, "b[{c}]={expr};").unwrap();
++    }
++    s.push_str("a=b;\n");
++    for r in 0..22 {
++        writeln!(s, "emit(g,{out}u,a[0]);a[0]=sbox(a[0]);").unwrap();
++        out += 1;
++        if r != 21 {
++            writeln!(
++                s,
++                "a[0]=add_field(a[0],{});",
++                literal(G::FAST_PARTIAL_ROUND_CONSTANTS[r])
++            )
++            .unwrap();
++        }
++        let mut expr = format!(
++            "mul_field(a[0],{})",
++            literal(G::MDS_MATRIX_CIRC[0] + G::MDS_MATRIX_DIAG[0])
++        );
++        for i in 1..12 {
++            expr = format!(
++                "add_field({expr},mul_field(a[{i}],{}))",
++                literal(G::FAST_PARTIAL_ROUND_W_HATS[r][i - 1])
++            );
++        }
++        writeln!(s, "b[0]={expr};").unwrap();
++        for i in 1..12 {
++            writeln!(
++                s,
++                "b[{i}]=add_field(a[{i}],mul_field(a[0],{}));",
++                literal(G::FAST_PARTIAL_ROUND_VS[r][i - 1])
++            )
++            .unwrap();
++        }
++        s.push_str("a=b;\n");
++    }
++    for r in 26..30 {
++        for i in 0..12 {
++            writeln!(
++                s,
++                "a[{i}]=add_field(a[{i}],{});emit(g,{out}u,a[{i}]);",
++                literal(ALL_ROUND_CONSTANTS[r * 12 + i])
++            )
++            .unwrap();
++            out += 1;
++        }
++        s.push_str("for(var i=0u;i<12u;i++){a[i]=sbox(a[i]);} a=mds12(a);\n");
++    }
++    for i in 0..12 {
++        writeln!(s, "emit(g,{out}u,a[{i}]);").unwrap();
++        out += 1;
++    }
++    assert_eq!(out, 122);
++    s.push_str("}\n");
++    s
++}
++
++const SCATTER: &str = r#"
++@group(0) @binding(0) var<uniform> count:vec4<u32>;
++@group(0) @binding(1) var<storage,read> packed:array<vec2<u32>>;
++@group(0) @binding(2) var<storage,read> slots:array<u32>;
++@group(0) @binding(3) var<storage,read_write> state:array<vec2<u32>>;
++@compute @workgroup_size(256)
++fn scatter(@builtin(global_invocation_id) id:vec3<u32>,@builtin(num_workgroups) groups:vec3<u32>) {
++ let i=id.x+id.y*groups.x*256u;if(i<count.x){state[slots[i]]=packed[i];}
++}
++"#;
++
++#[cfg(feature = "witness-benchmarks")]
++fn analyze(p: &RegionProgram, public: &[u32]) {
++    let supported = |k: Kind| {
++        matches!(
++            k,
++            Kind::Poseidon
++                | Kind::Arithmetic
++                | Kind::Copy
++                | Kind::Constant
++                | Kind::Equality
++                | Kind::ExtensionArithmetic
++                | Kind::ExtensionMultiply
++                | Kind::ArithmeticChain
++                | Kind::RandomValue
++                | Kind::ConditionalZero
++                | Kind::BitSum
++        )
++    };
++    let current = (0..Kind::COUNT)
++        .filter(|&k| supported(Kind::from_code(k).unwrap()))
++        .fold(0u128, |mask, k| mask | (1u128 << k));
++    let fast = p.fast.get().unwrap();
++    let estimate = |support: u128, checks: bool| {
++        let mut cpu = vec![false; p.state_slots as usize];
++        cpu[..p.roots.len()].fill(true);
++        for &s in public {
++            if s != u32::MAX {
++                cpu[s as usize] = true;
++            }
++        }
++        if !checks {
++            for i in 0..p.alias_count as usize {
++                cpu[p.targets[p.alias_pair_offset as usize + 2 * i] as usize] = true;
++                cpu[p.targets[p.alias_pair_offset as usize + 2 * i + 1] as usize] = true;
++            }
++        }
++        let mut counts = [0u64; Kind::COUNT];
++        for groups in p.groups.iter().rev() {
++            for g in groups {
++                for k in 0..g.count {
++                    let target = |pos: u32| {
++                        p.targets[(g.targets_offset + pos * g.count + k) as usize] as usize
++                    };
++                    let offload = support & (1u128 << g.kind.code()) != 0
++                        && (g.inputs..g.inputs + g.outputs).all(|pos| {
++                            let s = target(pos);
++                            if checks && s < p.roots.len() {
++                                true
++                            } else {
++                                !cpu[s] && s >= p.roots.len() && fast.single[s] != 0
++                            }
++                        });
++                    if offload {
++                        counts[g.kind.code()] += 1;
++                    } else {
++                        for pos in 0..g.inputs {
++                            cpu[target(pos)] = true;
++                        }
++                    }
++                }
++            }
++        }
++        counts
++    };
++    let mut totals = [0u64; Kind::COUNT];
++    for g in p.groups.iter().flatten() {
++        totals[g.kind.code()] += g.count as u64;
++    }
++    eprintln!("GPU_CUT_TOTALS {totals:?}");
++    for (label, mask, checks) in [
++        ("current", current, false),
++        ("all-ops", u128::MAX, false),
++        ("current-device-checks", current, true),
++        ("all-device-checks", u128::MAX, true),
++    ] {
++        let counts = estimate(mask, checks);
++        eprintln!("GPU_CUT_ESTIMATE label={label} counts={counts:?}");
++    }
++    for k in 0..Kind::COUNT {
++        if current & (1u128 << k) == 0 {
++            let counts = estimate(current | (1u128 << k), true);
++            eprintln!(
++                "GPU_CUT_EXTRA kind={:?} counts={counts:?}",
++                Kind::from_code(k).unwrap()
++            );
++        }
++    }
++}
++
++const ALIASES: &str = r#"
++@group(0) @binding(0) var<uniform> range:vec4<u32>;
++@group(0) @binding(1) var<storage,read> targets:array<u32>;
++@group(0) @binding(2) var<storage,read> state:array<vec2<u32>>;
++@group(0) @binding(3) var<storage,read_write> errors:array<atomic<u32>>;
++@compute @workgroup_size(256)
++fn validate(@builtin(global_invocation_id) id:vec3<u32>,@builtin(num_workgroups) groups:vec3<u32>) {
++ let i=id.x+id.y*groups.x*256u;if(i>=range.y){return;}
++ let offset=range.x+2u*i;
++ if(any(state[targets[offset]]!=state[targets[offset+1u]])){atomicOr(&errors[0],4u);}
++}
++"#;
++
++#[cfg(test)]
++mod trace_tests {
++    use super::*;
++    use crate::field::types::{Field, Field64};
++    #[test]
++    fn dense_rounds_match_all_122_trace_values() {
++        for case in 0..256u64 {
++            let input = core::array::from_fn(|i| {
++                G::from_canonical_u64(match case % 4 {
++                    0 => 0,
++                    1 => G::ORDER - 1,
++                    2 => i as u64,
++                    _ => case.wrapping_mul(0x123456789).wrapping_add(i as u64 * 1777),
++                })
++            });
++            for swap in [G::ZERO, G::ONE] {
++                let expected = crate::hash::poseidon_trace_simd::trace(input, swap);
++                let mut state = input;
++                let mut out = Vec::new();
++                for i in 0..4 {
++                    out.push(swap * (state[i + 4] - state[i]));
++                }
++                if swap == G::ONE {
++                    for i in 0..4 {
++                        state.swap(i, i + 4);
++                    }
++                }
++                for round in 0..30 {
++                    <G as Poseidon>::constant_layer_field(&mut state, round);
++                    if (4..26).contains(&round) {
++                        out.push(state[0]);
++                        state[0] = <G as Poseidon>::sbox_monomial(state[0]);
++                    } else {
++                        if round != 0 {
++                            out.extend(state);
++                        }
++                        <G as Poseidon>::sbox_layer(&mut state);
++                    }
++                    state = <G as Poseidon>::mds_layer(&state);
++                }
++                out.extend(state);
++                assert_eq!(out.len(), 122);
++                for (i, (a, b)) in out.iter().zip(expected).enumerate() {
++                    assert_eq!(*a, b, "case={case} swap={swap:?} word={i}");
++                }
++            }
++        }
++    }
++}

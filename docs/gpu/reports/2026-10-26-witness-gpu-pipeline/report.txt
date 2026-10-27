@@ -1,0 +1,264 @@
+MainPod GPU witness pipeline experiments on fft-pipelined — 2026-10-26
+
+Completed: initial campaign, follow-ups, final confirmation, and local archive
+verification. Temporary pod iqqgjxfo4oivtn was deleted; the post-delete get returned
+404 and the account pod list was empty at 19:21:55 UTC.
+
+Result
+======
+Against the existing executor-enabled baseline, final same-binary confirmation
+measured these warm whole-proof medians (ms):
+
+  Mode                              Combined median   Process medians
+  Existing executor                     103.969       105.591 / 102.249
+  Prior checked GPU cut                  93.260        93.732 /  92.484
+  Cut + fixed parameters + dense trace   88.264        88.939 /  84.921
+  Above + broader uniform cache          88.847        90.331 /  86.193
+
+The selected candidate lowers latency by 15.11% versus the existing executor,
+and by another 5.36% versus the prior checked GPU cut. Each mode ran in two
+separate processes, forward then reverse order, with 31 proofs per process and
+three discarded: 56 warm proofs per mode. These descriptive medians are from
+correlated proofs, not independent samples or a claimed confidence interval.
+All modes ran faster in the second block; process medians are included to expose
+that drift. The combined median pools warm proofs; it is not the average of the
+two process medians. Percentages below belong to their own matched windows.
+
+The fixture is a real, verified, default-parameter ZK MainPod with an empty
+frontend builder and the full degree-16 padded recursive circuit.
+This baseline already uses the compiled witness executor, its direct mapped
+upload, 64 MiB of wiped execution-buffer reuse, and a 4 GiB GPU storage pool.
+The new percentages do not count enabling those existing facilities as new work.
+The fixed source baseline is fft-pipelined at 0bb3c575 (including packed quotient
+MDS and the pipelined NTT implementation). During the benchmark campaign, neither production defaults nor the
+user's fft-pipelined working checkout were changed.
+
+Exact timing boundary
+=====================
+The timer starts immediately before MainPodBuilder::prove(&Prover {}) and ends
+when that call returns. It includes frontend witness binding, CPU witness work,
+uploads, all GPU proving work, openings, proof assembly, and ordinary cleanup.
+Builder construction occurs before the timer. Each proof is CPU-verified after
+the timer. Three initial proofs per process are discarded, so circuit building,
+executor preparation, shader compilation and initial buffer fills are warmup.
+Cold-start latency and independent exported-proof verification were not measured.
+
+Architectures and isolation
+==========================
+All times in this section compare matched builds/windows on one EPYC/4090 host.
+
+Initial compact-state upload, 4 GiB storage pool:
+  Existing executor: 104.727 ms; compact state: 98.907 ms (5.56% lower).
+  With storage pooling off: 134.567 versus 134.779 ms (neutral).
+This is why the allocation policy must accompany a dataflow comparison.
+
+Same-binary architectural screen, 4 GiB pool:
+  Existing executor                         106.852 ms
+  Compact state                             101.130 ms (5.35% lower)
+  Compact state + GPU salts                   99.848 ms (6.56% lower)
+  Conservative GPU tail                     104.031 ms (2.64% lower)
+  Conservative tail + GPU witness randomness  99.334 ms (7.04% lower)
+  Conservative tail + GPU salts               99.347 ms (7.02% lower)
+  Conservative tail + both                   96.529 ms (9.66% lower)
+
+Moving more computation to the device initially failed to beat that simpler
+path. Rebuilding device dependencies reduced 232 dispatches to 175 and made the
+larger cut competitive. Final confirmation, two processes per mode, 27 proofs
+each with the first three discarded (48 warm proofs per mode):
+  Existing executor                         108.371 ms
+  Conservative tail + both                   97.818 ms (9.74% lower)
+  Checked GPU cut + device ranks + both       94.390 ms (12.90% lower)
+Candidate process medians 94.346 and 94.390 ms. The simpler candidate measured
+97.710 and 97.929 ms. Percentages from different windows must not be added.
+
+Follow-up experiments
+=====================
+Fixed witness dispatch parameters are immutable and reused across proofs, with
+separate cache entries for seeded/unseeded randomness and the existing retained
+memory budget. Fresh random keys remain per-proof. In the v8 screen, the prior
+cut measured 94.608 ms and parameter caching 92.496 ms (2.23% lower). Splitting
+equality into a separate kernel bucket did not improve either process block
+over parameter caching: 91.631/93.742 ms versus 89.777/92.813 ms. Pooled medians
+were noisy (92.087 versus 92.496 ms), so that split was not advanced.
+
+Per-kernel timestamps showed Poseidon accounted for 10.757 ms of deferred work,
+while equality took just 0.047 ms. This ruled out equality inversion as a useful
+next target. The follow-up instead reuses the tree hashing kernel's dense MDS,
+folded round constants, and scalar state for the full 122-value Poseidon witness
+trace. A CPU equivalence test checks every value across 512 varied/boundary/swap
+cases; native fresh-input proofs and root/alias checks pass with this layout.
+
+The v9 screen measured 94.075 ms with cached witness parameters and 89.059 ms
+with the dense trace (5.33% lower). Broader caching of fixed FFT/Merkle/control
+uniforms was nearly neutral without dense rounds, and slower in both final
+confirmation blocks with dense rounds. The selected mode therefore omits it.
+The final same-binary table above confirms all accepted changes together; the
+percentages from these screens must not be added.
+
+What changed
+============
+1. The CPU executor's compact slot state is uploaded instead of first expanding
+   the 67.5 MiB wire matrix. A cached cell-to-slot map is consumed directly by
+   the inverse FFT and permutation kernels. Dense coefficients and LDEs needed
+   by the proof still exist. Public inputs remain available on the CPU.
+2. A graph cut defers supported witness operations and their private results to
+   the GPU. CPU-provided roots remain expected values: GPU producers compare
+   their computed values against those roots, rather than overwriting them.
+   Alias comparisons move to a GPU validation kernel. A nonzero validation flag
+   rejects proving before the proof can return. CPU-only dependencies and
+   repeated non-root writes retain their original checks.
+3. ChaCha20 generates field padding and commitment salts on the device from fresh
+   OS-seeded, domain-separated keys, with rejection sampling into Goldilocks.
+   CPU seeds and explicit seed-word copies use Zeroizing. Random sources shared
+   across a CPU/GPU boundary retain one common value. Explicit deterministic
+   random values used for worklist comparisons keep their original meaning.
+4. The device schedule removes dependencies on values the CPU has already
+   produced, including seeded roots that only need a deferred consistency check.
+
+The benchmark's 18,456 Poseidons initially appeared almost immovable: the first
+cut deferred just two. A counterfactual graph analysis showed that adding every
+missing kernel without moving validation would still defer only two. Moving
+root/alias checking alone made 15,148 eligible; adding indexed selection made
+18,192 eligible. Thus the dominant restriction was the chosen validation boundary,
+not an inherent inability to execute these operations on the GPU.
+
+The final cut executes 1,387,604 of 1,587,515 operation descriptors on the GPU,
+including 18,192 Poseidons, 54,154 equalities, 7,392 indexed selections, arithmetic,
+copies, and all 741,181 random outputs. Sixteen operation kinds still execute on
+the CPU. The per-proof witness upload is 3,457,856 bytes (about 3.30 MiB), plus
+small seed/parameter data, instead of 70,778,880 bytes (67.5 MiB). Fixed metadata
+and mappings are cached and add cold traffic and memory. This is not a claim
+that all host/device proof transfers disappear.
+
+Remaining measured costs
+=========================
+Initial timestamp-enabled captures (12 warm proofs per mode; not mixed into
+ordinary latency comparisons) show:
+  Existing executor: CPU execute 18.141 ms, gather 7.464 ms;
+    GPU span 61.689 ms, recorded compute-pass union 44.124 ms.
+  Conservative GPU tail: CPU execute 18.148 ms, gather 2.910 ms;
+    GPU span 56.935 ms, compute-pass union 44.818 ms.
+  Checked GPU cut with device ranks: CPU execute 5.905 ms, gather 3.201 ms;
+    GPU span 68.393 ms, compute-pass union 55.567 ms.
+The executor report's sample field includes input binding and sampling; it is
+not an isolated randomness timer. Gathering includes enqueue/host work, while
+asynchronous GPU witness execution appears later in commitment waits.
+
+In the final GPU profile, quotient evaluation averaged 16.272 ms, deferred
+witness regions 11.330 ms, wire leaf hashing 11.259 ms, all Merkle levels 4.989 ms,
+and the large forward FFT 3.619 ms. Compute-pass intervals include barriers and
+are not SM occupancy measurements. Host and device clocks were not calibrated;
+do not subtract these numbers into a precise CPU/GPU/idle partition. Timestamp
+recording itself adds resolution/logging work, so use ordinary runs for latency.
+
+The v9 aggregate-pass profile reduced GPU witness work from 11.398 to 7.745 ms.
+Its GPU span was 64.811 ms with a 52.011 ms recorded compute-pass union; gaps
+were 12.602 ms. Quotient evaluation still averaged 16.234 ms, wire leaves
+11.284 ms, Merkle levels 4.998 ms, and the large forward FFT 3.607 ms. This
+profile includes the broader uniform cache, so it is not the selected latency
+candidate. A separate final per-dispatch capture of the selected candidate
+measured witness Poseidon 7.647 ms and other witness work 0.869 ms. Its CPU
+execute scope was 5.899 ms and sample/binding 2.419 ms. Detailed timestamps
+change pass boundaries and add host/logging overhead: that capture's whole
+proof median was 95.164 ms, not the ordinary-run 88.264 ms.
+
+The next largest measured GPU targets are quotient evaluation and commitment
+hashing. There is also remaining CPU input binding, about 6 ms of CPU executor
+work, and per-proof submission/bind-group creation. Reusing fixed dispatch
+parameters helped, suggesting further per-worker resource reuse may be worth
+investigating. Writing frontend inputs directly into prepared root slots could
+avoid PartialWitness hash-map insertion and rebinding. Those are unimplemented
+opportunities, not measured gains. Device gaps do not establish unused SM
+capacity or a precise idle-time budget; no Nsight/perf occupancy capture was
+available and the host/device clocks were not calibrated.
+
+Correctness and scope
+=====================
+1,820 measured MainPods verified in 81 processes, including warmups, screens, graph probes,
+confirmation and profile captures. All processes passed orderly GPU shutdown.
+Native Metal and Vulkan tests compared every uploaded wire with the worklist,
+checked fresh-input proofs, rejected conflicting roots and aliases, rejected
+invalid random values, checked recovery after errors, and checked random sources
+shared across the cut. GPU ChaCha20 output matches the existing CPU reference at
+multiple domains and nonaligned output ranges. The local release witness suite
+passed 42 active tests. Serial CPU compilation passed. Clippy completed with
+existing baseline warnings; no unrelated warning cleanups were included. Formatting
+checks pass for changed files; whole-workspace fmt still reports the unchanged
+baseline gpu/tests/benchmarks.rs. The exported patch applies cleanly to 0bb3c575.
+
+The new modes are opt-in development experiments behind witness-benchmarks.
+Ordinary application builds do not read the experiment variable. The GPU cut
+requires the parallel CPU executor and retains CPU fallback when ineligible.
+Sampled peak VRAM in final ordinary runs was 2,661 MiB for the baseline and
+2,919 MiB for the selected candidate. Sampling is at 50 ms intervals, not an
+exact allocation peak. Production integration, representative nonempty workloads,
+and concurrency of
+the new GPU witness path remain separate acceptance work. Earlier throughput
+numbers from the replay path cannot be assigned to this backend.
+
+Machine and method
+==================
+Runpod Secure Cloud EUR-IS-2, pod iqqgjxfo4oivtn; RTX 4090, AMD EPYC 7542,
+eight physical cores on the GPU's NUMA node, one proof worker, Vulkan backend.
+This CPU has no AVX-512. Both controls and candidates use target-cpu=native.
+These results cannot be extrapolated to the earlier Ryzen 7950X or to unified
+memory. GPU catalog rate read before creation was $0.89/hour.
+
+FFT control screen compared 0 and 8 tiles per workgroup in forward/reverse order:
+106.815 versus 108.364 ms, no repeatable pipelining advantage on this device.
+Architecture comparisons therefore use the branch's discrete default of zero.
+CPU execution buffers retain at most 64 MiB; GPU pool 4 GiB except the explicitly
+unpooled window. Default GPU retained budget is otherwise unchanged. Each proof
+uses fresh randomness and no installed-executor fallback is allowed.
+
+Artifacts and reproduction
+==========================
+Raw workspace: .benchmark-artifacts/witness-gpu-pipeline-2026-10-26/
+Isolated code: work/plonky2-integrated, branch codex/witness-gpu-pipeline.
+source-v9.tar.gz contains the exact 447 source/lock files checked remotely and
+locally. Earlier source snapshots and every measured binary are archived too.
+POD2 and plonky2-u32 use the previous captured 691a008/7eece0f fixture, mechanical
+witness metadata API renames, a strict one-time preparation hook, and a benchmark
+recursion-limit increase. POD2's obsolete profiling-test feature is avoided:
+profiling is enabled only on the Plonky2 dependency.
+
+Initial checkpoint archive SHA256:
+267b5e289c12a1280e4cc584b2744f81aec260c9c7f5fb76993406e0cb606950
+Archive bytes: 104,415,890. Local file: results-checkpoint-v7.tar.gz.
+The archive is verified locally and contains source snapshots, manifests, measured
+executables, raw proof logs, hardware receipts, GPU telemetry, and build scripts.
+summary-v7.json and phases-v7.json preserve the initial campaign. Current
+summary.json and phases.json include all follow-ups; gpu-trace.json contains
+per-proof relative GPU intervals suitable for a trace viewer.
+
+Final archive SHA256:
+bdb454d707d14155fda6820e2d514159fb22fc75df7c639ddf6976b8792e7d5c
+Archive bytes: 138,817,782. Local file: results-final.tar.gz.
+Local verification checked every raw timed/verified proof against runs.json,
+every measured binary hash, and all 447 final source/lock files against both
+the archived snapshot and the working source. final-local-verification.json and
+cleanup-receipt.json preserve the checks. All artifacts were secured before
+termination; there are no remaining pods on the account at the cleanup read.
+
+A portable witness-gpu-pipeline.patch against 0bb3c575 is alongside this report.
+The implementation was committed as 6644d126 on codex/witness-gpu-pipeline.
+On 2026-10-27, fft-pipelined and codex/witness-gpu-pipeline were merged into gpu
+as 4c97c7fe and 8b6c5f10 respectively. Experimental modes remain opt-in and
+production defaults are unchanged. Archived sources and receipts describe the
+original measured snapshots; the Git integration preserves their algorithm code.
+
+On a compatible temporary NVIDIA Linux pod, unpack source-v9.tar.gz under
+/tmp/witness-pipeline, run bootstrap.sh and build.sh, then measure.py with
+final-confirmation.json. Build uses --release --locked with gpu,time and dependency
+features plonky2/gpu-profiling,plonky2/witness-benchmarks. All runs explicitly set
+MAINPOD_WITNESS_MODE=prepared, PLONKY2_GPU_POOL_BYTES=4294967296, and
+PLONKY2_EXECUTOR_BUFFER_BYTES=67108864. The experiment variable is
+PLONKY2_GPU_WITNESS_EXPERIMENT, with modes baseline, compact, compact-salts,
+tail, tail-random, tail-salts, tail-random-salts, tail-checks-random-salts, and
+tail-checks-ranks-random-salts, and the selected final mode
+  tail-checks-ranks-random-salts-params-dense
+Additional rejected/screened variants append -uniforms or -split-eq. Fixed
+uniform caches allowlist shape/control labels and exclude fresh keys/challenges.
+The JSON case files preserve exact order/settings. Run the local scripts from
+the artifact workspace's scripts/ directory; they resolve its parent as the
+workspace. The archived scripts are preserved under results/provenance/.
