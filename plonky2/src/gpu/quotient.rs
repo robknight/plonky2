@@ -1784,7 +1784,6 @@ fn quotient(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
     // The gate constraints.
-    // BEGIN program
     var regs: array<Field, NREGS>;
     var gate_filter = Field(1u, 0u);
     var h: array<Field, NC>;
@@ -1799,7 +1798,6 @@ fn quotient(@builtin(global_invocation_id) id: vec3<u32>) {
             default: {}
         }
     }
-    // END program
     for (var c = 0u; c < NC; c++) {
         out[c * qp.n + row] = mul_field(acc[c], zh_inv);
     }
@@ -1932,26 +1930,6 @@ fn interpreter_cases(cases: &[u32]) -> String {
         writeln!(out, "            case {i}u: {{ {body} }}").unwrap();
     }
     out
-}
-
-/// The kernel with the interpreter loop replaced by `program` (WGSL
-/// statements over `regs`, `h`, `acc` and `gate_filter`), for experiments
-/// with straight-line gate code.
-#[cfg(all(test, feature = "gpu-profiling"))]
-pub(crate) fn kernel_source_with_program(
-    flavor: shader::Flavor,
-    registers: u32,
-    num_challenges: u32,
-    cases: &[u32],
-    program: Option<&str>,
-) -> String {
-    let kernel = kernel_source(flavor, registers, num_challenges, cases);
-    let Some(program) = program else {
-        return kernel;
-    };
-    let begin = kernel.find("    // BEGIN program\n").unwrap();
-    let end = kernel.find("    // END program\n").unwrap();
-    format!("{}{program}{}", &kernel[..begin], &kernel[end..])
 }
 
 impl GpuContext {

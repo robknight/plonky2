@@ -59,7 +59,7 @@
 //! | `PLONKY2_GPU_PASS_TIMELINE` | flag | Logs a device timeline of every named compute pass after each proof (`plonky2::gpu::timestamps`, info); see `tools/gpu/gpu-timeline`. |
 //! | `PLONKY2_DELAY_SCOPE`, `PLONKY2_DELAY_MS` | scope name, milliseconds | Sleeps at the start of every timing scope with that name, to probe the critical path. |
 //! | `PLONKY2_GPU_CAPTURE`, `PLONKY2_GPU_CAPTURE_QUOTIENT` | `.gputrace` path | Metal capture of the wires commitment or quotient evaluation; `PLONKY2_GPU_CAPTURE_INDEX` selects the zero-based invocation of each phase (default 1). Needs `METAL_CAPTURE_ENABLED=1`. |
-//! | `PLONKY2_GPU_PROGRAM_DUMP` | path | Writes the quotient program, for `bench_quotient_occupancy`. |
+//! | `PLONKY2_GPU_PROGRAM_DUMP` | path | Writes the quotient program, for `bench_quotient_program`. |
 //! | `PLONKY2_GPU_QMUL_DEBUG`, `PLONKY2_GPU_QMUL_DUMP` | flag, path prefix | Logs quintic fusion counts; dumps the gate DAG and its fused groups. |
 //! | `PLONKY2_GPU_QUOTIENT_NONCE` | integer | Renames the quotient entry point, forcing a driver shader cache miss. |
 //! | `PLONKY2_GPU_COEFFICIENT_AUDIT` | flag | Prints each coefficient transfer's direction, stage, size and time to stderr. |
