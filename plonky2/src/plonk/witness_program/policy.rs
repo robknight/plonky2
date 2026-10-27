@@ -82,6 +82,16 @@ pub(crate) enum WitnessGather {
     /// Request GPU gathering when GPU proving and a validated plan are available.
     #[cfg(any(feature = "gpu", test, feature = "witness-benchmarks"))]
     Gpu,
+    #[cfg(any(feature = "gpu", test))]
+    Compact,
+    #[cfg(any(feature = "gpu", test))]
+    Tail,
+    #[cfg(any(feature = "gpu", test))]
+    TailRandom,
+    #[cfg(any(feature = "gpu", test))]
+    TailChecks,
+    #[cfg(any(feature = "gpu", test))]
+    TailChecksRandom,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

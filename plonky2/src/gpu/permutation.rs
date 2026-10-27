@@ -128,10 +128,15 @@ pub(crate) fn try_partial_products_commitment<
     let wires = wires_commitment.batch().device_values.get()?;
     let ctx = context()?;
     wires_commitment.batch().device_values.take();
+    let slots = wires_commitment.batch().device_value_slots.take();
     let num_blocks = degree / PERMUTATION_BLOCK as usize;
     let num_columns = num_challenges * (1 + num_prods);
     let out = timed!(timing, "gpu: partial products and Z's", {
-        let rows = ctx.permutation_rows(num_chunks as u32, max_degree);
+        let rows = if slots.is_some() {
+            ctx.compact_permutation_rows(num_chunks as u32, max_degree)
+        } else {
+            ctx.permutation_rows(num_chunks as u32, max_degree)
+        };
         let sigmas = device_sigmas(&ctx, prover_data, config.num_routed_wires);
         let mut consts = Vec::new();
         for (&beta, &gamma) in betas.iter().zip(gammas) {
@@ -167,13 +172,25 @@ pub(crate) fn try_partial_products_commitment<
             (num_challenges * (degree * num_chunks + 2 * num_blocks) * 8) as u64,
         );
         let out = ctx.storage("partial products", (num_columns * degree * 8) as u64);
-        let bindings =
-            ctx.bind_permutation(&[&params, &wires, &sigmas, &consts, &twiddles, &scratch, &out]);
+        let bindings = if let Some(slots) = &slots {
+            ctx.bind(
+                &ctx.compact_permutation().layout,
+                &[
+                    &params, &wires, &sigmas, &consts, &twiddles, &scratch, &out, slots,
+                ],
+            )
+        } else {
+            ctx.bind_permutation(&[&params, &wires, &sigmas, &consts, &twiddles, &scratch, &out])
+        };
         let mut encoder = ctx.encoder("partial products");
         {
             let mut pass = ctx.begin_pass(&mut encoder, "partial products", None);
             pass.set_bind_group(0, &bindings, &[]);
-            let [blocks, prefix, fill] = &ctx.permutation;
+            let [blocks, prefix, fill] = if slots.is_some() {
+                &ctx.compact_permutation().rest
+            } else {
+                &ctx.permutation
+            };
             pass.set_pipeline(&rows);
             pass.dispatch_workgroups(
                 (degree as u32).div_ceil(HASH_WORKGROUP),

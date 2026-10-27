@@ -291,7 +291,7 @@ where
             ProverWires::Resident(resident) => timed!(
                 timing,
                 "compute resident wires commitment",
-                crate::gpu::lde::from_device_values::<F, C, D>(
+                crate::gpu::lde::from_device_values_with_slots::<F, C, D>(
                     &resident.ctx,
                     resident.wire_values.clone(),
                     config.num_wires,
@@ -302,11 +302,16 @@ where
                     timing,
                     gpu_plan.leaf_storage(),
                     retain_values,
+                    resident.wire_slots.as_ref(),
                 )
             ),
         }
     };
 
+    #[cfg(feature = "gpu")]
+    if let ProverWires::Resident(resident) = &wires {
+        resident.validate()?;
+    }
     // CPU quotient evaluation reads Merkle rows, not the column-major LDE.
     // Release that duplicate before constructing the permutation commitment.
     #[cfg(feature = "gpu")]
@@ -379,14 +384,10 @@ where
                     // Read through the original context even if GPU routing
                     // was disabled after the witness was uploaded.
                     let witness = MatrixWitness {
-                        wire_values: crate::gpu::lde::read_columns::<F>(
-                            &resident.ctx,
-                            &resident.wire_values,
-                            config.num_wires,
-                            degree,
-                        ),
+                        wire_values: resident.read_columns::<F>(config.num_wires, degree),
                     };
                     drop(wires_commitment.batch.device_values.take());
+                    drop(wires_commitment.batch.device_value_slots.take());
                     log::debug!("gpu: materialized wire values for CPU permutation fallback");
                     witness
                 }

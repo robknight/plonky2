@@ -233,6 +233,21 @@ impl RegionProgram {
         random_values: &'a [u64],
         reference: bool,
     ) -> Result<Executor<'a>> {
+        self.execute_state_inner_with_tail(
+            root_values,
+            random_values,
+            reference,
+            #[cfg(feature = "gpu")]
+            None,
+        )
+    }
+    fn execute_state_inner_with_tail<'a>(
+        &'a self,
+        root_values: &[u64],
+        random_values: &'a [u64],
+        reference: bool,
+        #[cfg(feature = "gpu")] gpu_tail: Option<&'a super::gpu_tail::Tail>,
+    ) -> Result<Executor<'a>> {
         ensure!(
             random_values.len() == self.random_count as usize,
             "expected {} random values, got {}",
@@ -271,6 +286,8 @@ impl RegionProgram {
             profile,
             program: self,
             random: random_values,
+            #[cfg(feature = "gpu")]
+            gpu_tail,
             compact_readiness,
             fast,
             state,
@@ -344,13 +361,19 @@ impl RegionProgram {
         }
         drop(layers);
         let aliases = executor.profile.stage(Stage::Aliases);
-        for i in 0..self.alias_count {
-            let canonical = self.targets[(self.alias_pair_offset + 2 * i) as usize];
-            let duplicate = self.targets[(self.alias_pair_offset + 2 * i + 1) as usize];
-            ensure!(
-                executor.load(canonical)? == executor.load(duplicate)?,
-                "alias slot {duplicate} disagrees with its canonical slot {canonical}"
-            );
+        #[cfg(feature = "gpu")]
+        let device_checks = executor.gpu_tail.is_some_and(|t| t.checks);
+        #[cfg(not(feature = "gpu"))]
+        let device_checks = false;
+        if !device_checks {
+            for i in 0..self.alias_count {
+                let canonical = self.targets[(self.alias_pair_offset + 2 * i) as usize];
+                let duplicate = self.targets[(self.alias_pair_offset + 2 * i + 1) as usize];
+                ensure!(
+                    executor.load(canonical)? == executor.load(duplicate)?,
+                    "alias slot {duplicate} disagrees with its canonical slot {canonical}"
+                );
+            }
         }
         drop(aliases);
         let readiness = executor.profile.stage(Stage::Ready);
@@ -373,7 +396,9 @@ impl RegionProgram {
 pub(super) struct Executor<'a> {
     pub(super) profile: profile::Execution,
     pub(super) program: &'a RegionProgram,
-    random: &'a [u64],
+    pub(super) random: &'a [u64],
+    #[cfg(feature = "gpu")]
+    pub(super) gpu_tail: Option<&'a super::gpu_tail::Tail>,
     pub(super) state: Vec<AtomicU64>,
     ready: Vec<AtomicBool>,
     compact_readiness: bool,
@@ -2193,12 +2218,110 @@ pub(crate) fn generate_wires_with<
         values
     };
     drop(root_binding);
+    #[cfg(feature = "gpu")]
+    let tail_requested = allow_device
+        && cfg!(feature = "parallel")
+        && (crate::gpu::resident_witness::experiment().starts_with("tail")
+            || program.runtime.config.policy.gather == super::super::policy::WitnessGather::Tail
+            || program.runtime.config.policy.gather
+                == super::super::policy::WitnessGather::TailRandom
+            || program.runtime.config.policy.gather
+                == super::super::policy::WitnessGather::TailChecks
+            || program.runtime.config.policy.gather
+                == super::super::policy::WitnessGather::TailChecksRandom)
+        && crate::gpu::permutation::supported_circuit(prover, common)
+        && program.runtime.config.policy.execution
+            != super::super::policy::WitnessExecution::Checked;
+    // Keep the selected context alive through execution and upload. Routing may
+    // change concurrently; deferred values must still be produced on this device.
+    #[cfg(feature = "gpu")]
+    let tail_ctx = if tail_requested {
+        crate::gpu::lde::applicable::<F, C, D>(
+            num_wires,
+            degree,
+            config.fri_config.rate_bits,
+            config.zero_knowledge,
+        )
+    } else {
+        None
+    };
+    #[cfg(feature = "gpu")]
+    let tail = if tail_ctx.is_some() {
+        let public_slots = prover
+            .public_inputs
+            .iter()
+            .map(|&t| rep(t).map(|r| program.rep_slots(map.len())[r]))
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            public_slots.iter().all(|&s| s != u32::MAX),
+            "missing public input in GPU witness plan"
+        );
+        let fast = program.fast.get().expect("prepared tail certificate");
+        let checks = crate::gpu::resident_witness::experiment().contains("checks")
+            || program.runtime.config.policy.gather
+                == super::super::policy::WitnessGather::TailChecks
+            || program.runtime.config.policy.gather
+                == super::super::policy::WitnessGather::TailChecksRandom;
+        let compress = checks && crate::gpu::resident_witness::experiment().contains("ranks");
+        let cache = if compress {
+            &fast.gpu_tail_ranks
+        } else if checks {
+            &fast.gpu_tail_checks
+        } else {
+            &fast.gpu_tail
+        };
+        let tail = cache
+            .get_or_init(|| {
+                std::sync::Arc::new(super::gpu_tail::Tail::compile_config(
+                    &program,
+                    &public_slots,
+                    checks,
+                    compress,
+                ))
+            })
+            .as_ref();
+        ensure!(
+            tail.matches_public_inputs(&public_slots),
+            "GPU witness plan public inputs changed"
+        );
+        Some(tail)
+    } else {
+        None
+    };
+    #[cfg(feature = "gpu")]
+    let device_seed = if tail.is_some()
+        && random_values.is_none()
+        && (crate::gpu::resident_witness::experiment().contains("random")
+            || program.runtime.config.policy.gather
+                == super::super::policy::WitnessGather::TailRandom
+            || program.runtime.config.policy.gather
+                == super::super::policy::WitnessGather::TailChecksRandom)
+    {
+        Some(crate::gpu::random::fresh_seed())
+    } else {
+        None
+    };
     let random_sampling = profile::Pipeline::new("random-sampling", prover.generators.len());
     let random = match random_values {
         Some(values) => zeroize::Zeroizing::new(values),
         None => program.runtime.run(|| {
             #[cfg(test)]
             program.runtime.assert_active_pool();
+            #[cfg(feature = "gpu")]
+            if device_seed.is_some() {
+                let mask = &tail.expect("device random tail").gpu_random;
+                let mut words = zeroize::Zeroizing::new(vec![0u64; program.random_count as usize]);
+                words
+                    .par_chunks_mut(SAMPLE_CHUNK)
+                    .enumerate()
+                    .for_each(|(block, chunk)| {
+                        let begin = block * SAMPLE_CHUNK;
+                        if !mask[begin..begin + chunk.len()].iter().all(|&x| x) {
+                            crate::util::blinding_rng::fill_field_words::<F>(chunk);
+                        }
+                    });
+                return words;
+            }
             sample_random_values::<F>(program.random_count as usize)
         }),
     };
@@ -2244,6 +2367,11 @@ pub(crate) fn generate_wires_with<
         }
     }
     let started = Instant::now();
+    #[cfg(feature = "gpu")]
+    let executor = program
+        .runtime
+        .run(|| program.execute_state_inner_with_tail(&root_values, &random, false, tail))?;
+    #[cfg(not(feature = "gpu"))]
     let executor = program.execute_state(&root_values, &random)?;
     report.execute = started.elapsed();
 
@@ -2270,7 +2398,9 @@ pub(crate) fn generate_wires_with<
         .collect::<Result<Vec<_>>>()?;
     // A device destination exists only with the `gpu` feature.
     #[cfg(feature = "gpu")]
-    let ctx = if allow_device && crate::gpu::permutation::supported_circuit(prover, common) {
+    let ctx = if tail.is_some() {
+        tail_ctx
+    } else if allow_device && crate::gpu::permutation::supported_circuit(prover, common) {
         crate::gpu::lde::applicable::<F, C, D>(
             num_wires,
             degree,
@@ -2292,7 +2422,22 @@ pub(crate) fn generate_wires_with<
             let gpu_gather = program.runtime.config.policy.gather
                 == super::super::policy::WitnessGather::Gpu
                 && executor.fast.is_some();
-            let wire_values = if gpu_gather {
+            let compact = tail.is_some()
+                || crate::gpu::resident_witness::experiment().starts_with("compact")
+                || program.runtime.config.policy.gather
+                    == super::super::policy::WitnessGather::Compact;
+            let mut wire_slots = None;
+            let mut error = None;
+            let wire_values = if compact {
+                report.gather_mode = "compact";
+                let (state, slots) = super::aot::compact_on_gpu(&executor, &ctx, cell_slots)?;
+                wire_slots = Some(slots);
+                if let Some(tail) = tail {
+                    error = Some(tail.submit(&executor, &ctx, &state, device_seed.as_deref())?);
+                    report.gather_mode = "tail";
+                }
+                state
+            } else if gpu_gather {
                 report.gather_mode = "gpu";
                 super::aot::gather_on_gpu(&executor, &ctx, cell_slots)?
             } else {
@@ -2338,7 +2483,12 @@ pub(crate) fn generate_wires_with<
                 wire_values
             };
             report.mode = "resident";
-            Wires::Resident(crate::gpu::resident_witness::ResidentWitness { ctx, wire_values })
+            Wires::Resident(crate::gpu::resident_witness::ResidentWitness {
+                ctx,
+                wire_values,
+                wire_slots,
+                error,
+            })
         }
         _ => {
             let cell_slots = program.cell_slots(map, num_wires, degree);
@@ -2848,6 +2998,13 @@ pub(crate) mod tests {
             let mut builder =
                 CircuitBuilder::<G, 2>::new(CircuitConfig::standard_recursion_zk_config());
             let input = builder.add_virtual_target();
+            // Private independent hash regions exercise device deferral while
+            // the public chain preserves a CPU boundary through the graph.
+            for i in 0..128 {
+                let c = builder.constant(G::from_canonical_u64(i));
+                let v = builder.add(input, c);
+                let _ = builder.hash_n_to_hash_no_pad::<PoseidonHash>(vec![v; 4]);
+            }
             let mut state = vec![input; 4];
             for _ in 0..hashes {
                 state = builder
@@ -2890,7 +3047,15 @@ pub(crate) mod tests {
                 (WitnessGather::Auto, 16, 256),
                 (WitnessGather::Auto, 7, 123),
                 (WitnessGather::Gpu, 16, 256),
+                (WitnessGather::Compact, 16, 256),
+                (WitnessGather::Tail, 16, 256),
+                (WitnessGather::TailChecks, 16, 256),
             ] {
+                if !cfg!(feature = "parallel")
+                    && matches!(gather, WitnessGather::Tail | WitnessGather::TailChecks)
+                {
+                    continue;
+                }
                 let mut config = program.config().clone();
                 config.policy.gather = gather;
                 config.policy.gather_tiles = (columns, rows);
@@ -2910,7 +3075,11 @@ pub(crate) mod tests {
                 .unwrap();
                 assert_eq!(
                     report.gather_mode,
-                    if gather == WitnessGather::Gpu {
+                    if gather == WitnessGather::Tail || gather == WitnessGather::TailChecks {
+                        "tail"
+                    } else if gather == WitnessGather::Compact {
+                        "compact"
+                    } else if gather == WitnessGather::Gpu {
                         "gpu"
                     } else {
                         "reused"
@@ -2919,7 +3088,13 @@ pub(crate) mod tests {
                 let Wires::Resident(resident) = &wires else {
                     panic!("native resident wires required")
                 };
-                let actual = resident.ctx.read_u64(&resident.wire_values, expected.len());
+                resident.validate().unwrap();
+                let actual = resident
+                    .read_columns::<G>(data.common.config.num_wires, data.common.degree())
+                    .into_iter()
+                    .flatten()
+                    .map(|x| x.to_canonical_u64())
+                    .collect::<Vec<_>>();
                 assert_eq!(actual.len(), expected.len());
                 for (i, (&a, &b)) in actual.iter().zip(&expected).enumerate() {
                     assert_eq!(a, b, "hashes={hashes} tile={columns}x{rows} cell={i}");
@@ -2933,6 +3108,234 @@ pub(crate) mod tests {
                 )
                 .unwrap();
                 data.verify(proof).unwrap();
+                if gather == WitnessGather::Tail || gather == WitnessGather::TailChecks {
+                    let mut invalid = random.clone();
+                    invalid[0] = G::ORDER;
+                    match generate_wires_with(
+                        &pw,
+                        &data.prover_only,
+                        &data.common,
+                        true,
+                        Some(invalid),
+                    ) {
+                        Err(_) => {}
+                        Ok(Some((_, Wires::Resident(bad), _))) => assert!(bad.validate().is_err()),
+                        _ => panic!("invalid random values must be rejected"),
+                    }
+                    let (_, valid, _) = generate_wires_with(
+                        &pw,
+                        &data.prover_only,
+                        &data.common,
+                        true,
+                        Some(random.clone()),
+                    )
+                    .unwrap()
+                    .unwrap();
+                    let Wires::Resident(valid) = valid else {
+                        panic!("resident tail")
+                    };
+                    valid.validate().unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "gpu", feature = "parallel"))]
+    #[ignore = "requires a native GPU; run alone"]
+    fn gpu_tail_random_proves_fresh_inputs() {
+        use crate::hash::poseidon::PoseidonHash;
+        use crate::plonk::witness_program::policy::WitnessGather;
+        use crate::plonk::witness_program::{WitnessConfig, WitnessFallback};
+        let mut builder =
+            CircuitBuilder::<G, 2>::new(CircuitConfig::standard_recursion_zk_config());
+        let input = builder.add_virtual_target();
+        for i in 0..128 {
+            let c = builder.constant(G::from_canonical_u64(i));
+            let v = builder.add(input, c);
+            let mut state = vec![v; 4];
+            for _ in 0..4 {
+                state = builder
+                    .hash_n_to_hash_no_pad::<PoseidonHash>(state)
+                    .elements
+                    .to_vec();
+            }
+        }
+        builder.register_public_input(input);
+        let data = builder.build::<C>();
+        let mut config = WitnessConfig::default();
+        config.policy.gather = WitnessGather::TailRandom;
+        config.fallback = WitnessFallback::Error;
+        data.prepare_witness_program_with_config(&[input], config)
+            .unwrap();
+        let mut previous = None;
+        for value in [13, 13, G::ORDER - 1] {
+            let mut pw = PartialWitness::new();
+            pw.set_target(input, G::from_canonical_u64(value)).unwrap();
+            let (public, wires, report) =
+                generate_wires(&pw, &data.prover_only, &data.common, true)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(report.gather_mode, "tail");
+            assert_eq!(public, vec![G::from_canonical_u64(value)]);
+            let Wires::Resident(resident) = &wires else {
+                panic!("resident tail")
+            };
+            resident.validate().unwrap();
+            let actual =
+                resident.read_columns::<G>(data.common.config.num_wires, data.common.degree());
+            if let Some(prior) = previous {
+                assert_ne!(prior, actual, "fresh witness randomness");
+            }
+            previous = Some(actual);
+            let proof = crate::plonk::prover::prove_from_wires(
+                &data.prover_only,
+                &data.common,
+                public,
+                wires,
+                &mut TimingTree::default(),
+            )
+            .unwrap();
+            data.verify(proof).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "gpu", feature = "parallel"))]
+    #[ignore = "requires a native GPU; run alone"]
+    fn gpu_tail_preserves_shared_random_sources() {
+        let mut builder =
+            CircuitBuilder::<G, 2>::new(CircuitConfig::standard_recursion_zk_config());
+        let input = builder.add_virtual_target();
+        builder.register_public_input(input);
+        let data = builder.build::<C>();
+        let installed = data.compile_witness_program(&[input]).unwrap();
+        let mut p = (*installed.program).clone();
+        let g = p
+            .groups
+            .iter()
+            .flatten()
+            .find(|g| g.kind == Kind::RandomValue && g.count > 1)
+            .unwrap()
+            .clone();
+        let co = g.coefficients_offset().unwrap() as usize;
+        let source = p.coefficients[co] as usize;
+        std::sync::Arc::make_mut(&mut p.coefficients)[co + 1] = source as u64;
+        p.fast = Default::default();
+        p.prepare(
+            &data.prover_only.representative_map,
+            data.common.config.num_wires,
+            data.common.degree(),
+        )
+        .unwrap();
+        let first = p.targets[g.targets_offset as usize];
+        let second = p.targets[g.targets_offset as usize + 1];
+        let tail = super::super::gpu_tail::Tail::compile(&p, &[first]);
+        assert!(!tail.gpu_random[source]);
+        let roots = vec![13; p.roots.len()];
+        let random = vec![17; p.random_count as usize];
+        let executor = p
+            .runtime
+            .run(|| p.execute_state_inner_with_tail(&roots, &random, false, Some(&tail)))
+            .unwrap();
+        let ctx = crate::gpu::context().expect("native GPU");
+        let state = tail.upload_state(&executor, &ctx);
+        let error = tail
+            .submit(&executor, &ctx, &state, Some(&[42; 32]))
+            .unwrap();
+        assert!(ctx.read_u64(&error, 2).iter().all(|&x| x == 0));
+        let actual = ctx.read_u64(&state, p.state_slots as usize);
+        assert_eq!(actual[first as usize], 17);
+        assert_eq!(actual[second as usize], 17);
+    }
+
+    #[test]
+    #[cfg(all(feature = "gpu", feature = "parallel"))]
+    #[ignore = "requires native GPU; run alone"]
+    fn gpu_tail_checks_seeded_roots_and_aliases() {
+        use crate::hash::poseidon::PoseidonHash;
+        use crate::plonk::config::Hasher;
+        use crate::plonk::witness_program::policy::WitnessGather;
+        use crate::plonk::witness_program::{WitnessConfig, WitnessFallback};
+        let mut builder =
+            CircuitBuilder::<G, 2>::new(CircuitConfig::standard_recursion_zk_config());
+        let a = builder.add_virtual_target();
+        let b = builder.add_virtual_target();
+        let claim = builder.add_virtual_target();
+        let ha = builder.hash_n_to_hash_no_pad::<PoseidonHash>(vec![a; 4]);
+        let hb = builder.hash_n_to_hash_no_pad::<PoseidonHash>(vec![b; 4]);
+        builder.connect(ha.elements[0], claim);
+        builder.connect(hb.elements[0], claim);
+        builder.register_public_input(claim);
+        let data = builder.build::<C>();
+        let input = G::from_canonical_u64(13);
+        let expected = PoseidonHash::hash_no_pad(&[input; 4]).elements[0];
+        let mut pw = PartialWitness::new();
+        pw.set_target(a, input).unwrap();
+        pw.set_target(b, input).unwrap();
+        pw.set_target(claim, expected).unwrap();
+        let worklist = crate::iop::generator::generate_partial_witness(
+            pw.clone(),
+            &data.prover_only,
+            &data.common,
+        )
+        .unwrap();
+        let mut config = WitnessConfig::default();
+        config.policy.gather = WitnessGather::TailChecks;
+        config.fallback = WitnessFallback::Error;
+        let program = data
+            .compile_witness_program_with_config(&[a, b, claim], config)
+            .unwrap();
+        let random = program
+            .program
+            .random_representatives()
+            .iter()
+            .map(|r| worklist.values[r.unwrap()].unwrap().to_canonical_u64())
+            .collect::<Vec<_>>();
+        let expected_wires = worklist.full_witness().wire_values;
+        data.install_witness_program(program).unwrap();
+        for (right, claimed, valid) in [
+            (13, expected, true),
+            (14, expected, false),
+            (13, G::ZERO, false),
+            (13, expected, true),
+        ] {
+            let mut pw = pw.clone();
+            pw.target_values.insert(b, G::from_canonical_u64(right));
+            pw.target_values.insert(claim, claimed);
+            let (public, wires, report) = generate_wires_with(
+                &pw,
+                &data.prover_only,
+                &data.common,
+                true,
+                Some(random.clone()),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(report.gather_mode, "tail");
+            let Wires::Resident(resident) = &wires else {
+                panic!("resident checked regions")
+            };
+            if valid {
+                resident.validate().unwrap();
+                assert_eq!(
+                    resident.read_columns::<G>(data.common.config.num_wires, data.common.degree()),
+                    expected_wires
+                );
+                let proof = crate::plonk::prover::prove_from_wires(
+                    &data.prover_only,
+                    &data.common,
+                    public,
+                    wires,
+                    &mut TimingTree::default(),
+                )
+                .unwrap();
+                data.verify(proof).unwrap();
+            } else {
+                assert!(
+                    resident.validate().is_err(),
+                    "conflicting root/alias must be rejected"
+                );
             }
         }
     }

@@ -24,6 +24,12 @@ pub(super) struct FastLayout {
     pub random_spans: OnceLock<HashMap<u32, (u32, u32)>>,
     #[cfg(feature = "gpu")]
     pub gpu_gather: OnceLock<Arc<GpuGather>>,
+    #[cfg(feature = "gpu")]
+    pub gpu_tail: OnceLock<Arc<super::gpu_tail::Tail>>,
+    #[cfg(feature = "gpu")]
+    pub gpu_tail_checks: OnceLock<Arc<super::gpu_tail::Tail>>,
+    #[cfg(feature = "gpu")]
+    pub gpu_tail_ranks: OnceLock<Arc<super::gpu_tail::Tail>>,
 }
 
 #[cfg(feature = "witness-benchmarks")]
@@ -55,6 +61,13 @@ pub(super) fn execute(executor: &Executor<'_>) -> Result<bool> {
 }
 
 pub(super) fn run_fixed<const K: u8>(executor: &Executor<'_>, group: &Group) -> Result<()> {
+    #[cfg(all(feature = "gpu", feature = "parallel"))]
+    if let Some(tail) = executor.gpu_tail {
+        return tail.cpu_ranges(group, 0, group.count, |a, b| {
+            run_range_inner(executor, group, a, b)
+        });
+    }
+
     let kind = Kind::from_code(K as usize)?;
     let use_simd = K == 0 && poseidon_mode(executor) != 0 && group.count >= poseidon_min_group();
     let chunk = if use_simd {
@@ -491,6 +504,12 @@ pub(super) fn certify(p: &RegionProgram) -> Result<FastLayout> {
         random_spans: Default::default(),
         #[cfg(feature = "gpu")]
         gpu_gather: Default::default(),
+        #[cfg(feature = "gpu")]
+        gpu_tail: Default::default(),
+        #[cfg(feature = "gpu")]
+        gpu_tail_checks: Default::default(),
+        #[cfg(feature = "gpu")]
+        gpu_tail_ranks: Default::default(),
     })
 }
 
@@ -709,11 +728,11 @@ pub(super) struct GpuGather {
 /// Upload compact contiguous state; resolve the fixed wire permutation on GPU.
 /// Synchronous submission makes this experiment's gather timer include GPU work.
 #[cfg(feature = "gpu")]
-pub(super) fn gather_on_gpu(
+pub(super) fn compact_on_gpu(
     e: &Executor<'_>,
     ctx: &crate::gpu::GpuContext,
     slots: &[u32],
-) -> Result<crate::gpu::DeviceBuffer> {
+) -> Result<(crate::gpu::DeviceBuffer, crate::gpu::DeviceBuffer)> {
     let cache = e.program.fast.get().expect("validated GPU gather plan").gpu_gather.get_or_init(|| {
         let layout = crate::gpu::storage_layout(&ctx.device, "witness gather", &[(false,true),(false,true),(false,false)]);
         let module = crate::gpu::module(&ctx.device, "witness gather", r#"
@@ -742,6 +761,9 @@ fn gather(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups)
         cache.slots.set_if_within_limit(ctx, indices.clone());
         indices
     });
+    if let Some(tail) = e.gpu_tail {
+        return Ok((tail.upload_state(e, ctx), indices));
+    }
     let state_bytes = e.state.len() * 8;
     let staging = ctx.upload_staging(state_bytes as u64);
     e.program.runtime.run(|| {
@@ -769,6 +791,24 @@ fn gather(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups)
     });
     let state = ctx.storage("compact witness state", state_bytes as u64);
     ctx.finish_upload(staging, &state, state_bytes as u64);
+    Ok((state, indices))
+}
+
+#[cfg(feature = "gpu")]
+pub(super) fn gather_on_gpu(
+    e: &Executor<'_>,
+    ctx: &crate::gpu::GpuContext,
+    slots: &[u32],
+) -> Result<crate::gpu::DeviceBuffer> {
+    let (state, indices) = compact_on_gpu(e, ctx, slots)?;
+    let cache = e
+        .program
+        .fast
+        .get()
+        .expect("validated GPU gather plan")
+        .gpu_gather
+        .get()
+        .expect("prepared gather");
     let out = ctx.storage("GPU gathered proving wires", (slots.len() * 8) as u64);
     let bind = ctx.bind(&cache.layout, &[&state, &indices, &out]);
     let mut encoder = ctx.encoder("witness wire gather");
@@ -810,6 +850,14 @@ fn poseidon_chunk() -> u32 {
 
 #[cfg(feature = "parallel")]
 pub(super) fn run_range(e: &Executor<'_>, g: &Group, start: u32, end: u32) -> Result<()> {
+    #[cfg(feature = "gpu")]
+    if let Some(tail) = e.gpu_tail {
+        return tail.cpu_ranges(g, start, end, |a, b| run_range_inner(e, g, a, b));
+    }
+    run_range_inner(e, g, start, end)
+}
+#[cfg(feature = "parallel")]
+fn run_range_inner(e: &Executor<'_>, g: &Group, start: u32, end: u32) -> Result<()> {
     match g.kind {
         Kind::Arithmetic => return arithmetic_simplified(e, g, start, end),
         Kind::Equality => return equality_batch(e, g, start, end),
