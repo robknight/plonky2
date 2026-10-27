@@ -428,11 +428,46 @@ fn upload_columns_with_timing<F: PrimeField64>(
     if !columns.is_empty() {
         let column_bytes = columns[0].len() * 8;
         if column_bytes > 0 {
+            let bytes = (column_bytes * columns.len()) as u64;
+            let pack = |buffer: &wgpu::Buffer| {
+                columns.par_iter().enumerate().for_each(|(i, column)| {
+                    assert_eq!(column.len() * 8, column_bytes);
+                    let start = (i * column_bytes) as u64;
+                    let mut view = buffer
+                        .slice(start..start + column_bytes as u64)
+                        .get_mapped_range_mut()
+                        .expect("mapped upload");
+                    let (words, _) = view.slice(..).into_chunks::<8>();
+                    for (word, value) in words.into_iter().zip(*column) {
+                        word.write(value.to_noncanonical_u64().to_le_bytes());
+                    }
+                })
+            };
+            if !ctx.mappable {
+                // A reused mapped staging buffer, copied into a pooled device
+                // buffer: a fresh mapped buffer per upload costs a driver
+                // allocation, which is slow while the pool holds memory.
+                let staging = super::timed_optional(
+                    timing.as_deref_mut(),
+                    "gpu: take upload staging",
+                    || ctx.upload_staging(bytes),
+                );
+                super::timed_optional(
+                    timing.as_deref_mut(),
+                    "gpu: pack and copy upload columns",
+                    || pack(&staging.buffer),
+                );
+                let buffer = ctx.storage(label, bytes);
+                super::timed_optional(timing, "gpu: submit upload copy", || {
+                    ctx.finish_upload(staging, &buffer, bytes)
+                });
+                return buffer;
+            }
             let buffer =
                 super::timed_optional(timing.as_deref_mut(), "gpu: allocate mapped upload", || {
                     ctx.device.create_buffer(&wgpu::BufferDescriptor {
                         label: Some(label),
-                        size: (column_bytes * columns.len()).max(16).next_multiple_of(16) as u64,
+                        size: bytes.max(16).next_multiple_of(16),
                         usage: ctx.storage_usage(),
                         mapped_at_creation: true,
                     })
@@ -440,20 +475,7 @@ fn upload_columns_with_timing<F: PrimeField64>(
             super::timed_optional(
                 timing.as_deref_mut(),
                 "gpu: pack and copy upload columns",
-                || {
-                    columns.par_iter().enumerate().for_each(|(i, column)| {
-                        assert_eq!(column.len() * 8, column_bytes);
-                        let start = (i * column_bytes) as u64;
-                        let mut view = buffer
-                            .slice(start..start + column_bytes as u64)
-                            .get_mapped_range_mut()
-                            .expect("mapped upload");
-                        let (words, _) = view.slice(..).into_chunks::<8>();
-                        for (word, value) in words.into_iter().zip(*column) {
-                            word.write(value.to_noncanonical_u64().to_le_bytes());
-                        }
-                    })
-                },
+                || pack(&buffer),
             );
             super::timed_optional(timing, "gpu: unmap upload", || buffer.unmap());
             return DeviceBuffer::unpooled(buffer);
