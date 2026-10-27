@@ -757,6 +757,8 @@ pub trait Read {
             device_coeffs: Default::default(),
             #[cfg(feature = "gpu")]
             device_values: Default::default(),
+            #[cfg(feature = "gpu")]
+            device_value_slots: Default::default(),
         })
     }
 

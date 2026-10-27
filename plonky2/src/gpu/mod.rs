@@ -104,6 +104,7 @@ pub use policy::ExecutionMode;
 pub(crate) mod pow;
 #[doc(hidden)]
 pub mod quotient;
+pub(crate) mod random;
 pub(crate) mod resident_witness;
 mod retained;
 #[doc(hidden)]
@@ -366,9 +367,12 @@ pub fn field_supported<F: PrimeField64>() -> bool {
     F::ORDER == GOLDILOCKS_ORDER
 }
 
+type FixedUniformCache = Mutex<std::collections::HashMap<(String, Vec<u32>), DeviceCache>>;
+
 /// A device, its queue, the compiled pipelines and cached constant tables.
 #[doc(hidden)]
 pub struct GpuContext {
+    fixed_uniforms: FixedUniformCache,
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
     pub info: wgpu::AdapterInfo,
@@ -389,6 +393,9 @@ pub struct GpuContext {
     pub(crate) hash_nodes: wgpu::ComputePipeline,
     #[cfg(test)]
     pub(crate) permute: wgpu::ComputePipeline,
+    pub(crate) random: OnceLock<random::Kernels>,
+    pub(crate) witness_tail: OnceLock<crate::plonk::witness_program::region::gpu_tail::Kernels>,
+    pub(crate) compact_fft: OnceLock<resident_witness::CompactFft>,
     fft_layout: wgpu::BindGroupLayout,
     pub(crate) fft: wgpu::ComputePipeline,
     #[cfg(test)]
@@ -412,6 +419,7 @@ pub struct GpuContext {
     /// `batch_powers`, `reduce_batch`, `divide_blocks`, `scan_blocks` and
     /// `combine_quotients`, dispatched in this order.
     pub(crate) combine: [wgpu::ComputePipeline; 5],
+    pub(crate) compact_permutation: OnceLock<resident_witness::CompactPermutation>,
     permutation_layout: wgpu::BindGroupLayout,
     /// `block_products`, `block_prefix` and `fill_columns`, following row products.
     pub(crate) permutation: [wgpu::ComputePipeline; 3],
@@ -570,9 +578,11 @@ impl GpuOptions {
             mode: config.mode,
             proving_workers: config.proving_workers,
             retained_bytes: config.retained_bytes_limit(),
-            fft_tiles_per_workgroup: config
-                .fft_tiles_per_workgroup
-                .unwrap_or(if mappable { 8 } else { 0 }),
+            fft_tiles_per_workgroup: config.fft_tiles_per_workgroup.unwrap_or(if mappable {
+                8
+            } else {
+                0
+            }),
         }
     }
 
@@ -930,6 +940,10 @@ impl GpuContext {
             hash_nodes,
             #[cfg(test)]
             permute,
+            random: OnceLock::new(),
+            witness_tail: OnceLock::new(),
+            fixed_uniforms: Mutex::new(Default::default()),
+            compact_fft: OnceLock::new(),
             fft_layout,
             fft,
             #[cfg(test)]
@@ -947,6 +961,7 @@ impl GpuContext {
             eval_openings,
             combine_layout,
             combine,
+            compact_permutation: OnceLock::new(),
             permutation_layout,
             permutation,
             permutation_rows: cache::GpuCache::new(retained.clone()),
@@ -1028,6 +1043,41 @@ impl GpuContext {
 
     /// A uniform buffer holding `words`.
     pub(crate) fn uniform(&self, label: &str, words: &[u32]) -> wgpu::Buffer {
+        // Only shape/control metadata is eligible. Fresh RNG keys and proof
+        // challenges are deliberately outside this allowlist.
+        if cfg!(feature = "witness-benchmarks")
+            && resident_witness::experiment().contains("uniforms")
+            && matches!(
+                label,
+                "fft params"
+                    | "hash params"
+                    | "permutation params"
+                    | "fold params"
+                    | "leaf gather params"
+                    | "scatter range"
+                    | "alias range"
+            )
+        {
+            let cache = {
+                let mut fixed = self.fixed_uniforms.lock().unwrap();
+                let key = (label.to_owned(), words.to_vec());
+                if !fixed.contains_key(&key) && fixed.len() >= 1024 {
+                    if let Some(old) = fixed.keys().next().cloned() {
+                        fixed.remove(&old);
+                    }
+                }
+                fixed.entry(key).or_default().clone()
+            };
+            if let Some(buffer) = cache.get() {
+                return std::ops::Deref::deref(&buffer).clone();
+            }
+            let buffer = self.uniform_uncached(label, words);
+            cache.set_if_within_limit(self, DeviceBuffer::unpooled(buffer.clone()));
+            return buffer;
+        }
+        self.uniform_uncached(label, words)
+    }
+    fn uniform_uncached(&self, label: &str, words: &[u32]) -> wgpu::Buffer {
         let mut bytes = words
             .iter()
             .flat_map(|w| w.to_le_bytes())

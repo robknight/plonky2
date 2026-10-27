@@ -23,6 +23,8 @@ use crate::iop::witness::{PartialWitness, PartitionWitness};
 pub(crate) mod aot;
 pub(super) mod buffers;
 pub mod cpu;
+#[cfg(feature = "gpu")]
+pub(crate) mod gpu_tail;
 pub(crate) mod plan_bytes;
 mod profile;
 #[cfg(feature = "parallel")]

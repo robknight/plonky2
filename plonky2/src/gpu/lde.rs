@@ -223,6 +223,51 @@ fn record_fft(
     tiles_per_workgroup: u32,
     #[cfg(test)] only: Option<usize>,
 ) {
+    record_fft_input(
+        ctx,
+        encoder,
+        job,
+        plan,
+        kernel,
+        tiles_per_workgroup,
+        #[cfg(test)]
+        only,
+        None,
+    );
+}
+
+pub(crate) fn fft_compact(
+    ctx: &GpuContext,
+    encoder: &mut wgpu::CommandEncoder,
+    job: FftJob<'_>,
+    slots: &wgpu::Buffer,
+) {
+    let tiles = ctx.options.fft_tiles_per_workgroup;
+    let plan = fft_plan(job.log_n);
+    record_fft_input(
+        ctx,
+        encoder,
+        job,
+        plan,
+        ctx.fft_kernel_for(tiles),
+        tiles,
+        #[cfg(test)]
+        None,
+        Some(slots),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_fft_input(
+    ctx: &GpuContext,
+    encoder: &mut wgpu::CommandEncoder,
+    job: FftJob<'_>,
+    plan: Vec<(u32, u32, u32)>,
+    kernel: &wgpu::ComputePipeline,
+    tiles_per_workgroup: u32,
+    #[cfg(test)] only: Option<usize>,
+    slots: Option<&wgpu::Buffer>,
+) {
     assert!(
         job.shift_in.is_none() || job.shift_out.is_none(),
         "a coset shift on both load and store"
@@ -290,7 +335,22 @@ fn record_fft(
                 .checked_div(tiles_per_workgroup)
                 .map_or(tiles, |w| w.max(1));
             (
-                ctx.bind_fft(&params, job.input, job.data, output, &twiddles, &shift_pows),
+                if let Some(slots) = slots {
+                    ctx.bind(
+                        &ctx.compact_fft().layout,
+                        &[
+                            &params,
+                            job.input,
+                            job.data,
+                            output,
+                            &twiddles,
+                            &shift_pows,
+                            slots,
+                        ],
+                    )
+                } else {
+                    ctx.bind_fft(&params, job.input, job.data, output, &twiddles, &shift_pows)
+                },
                 workgroups,
             )
         })
@@ -303,6 +363,16 @@ fn record_fft(
         if job.inverse { " inverse" } else { "" }
     );
     let mut pass = ctx.begin_pass(encoder, &label, None);
+    let kernel = if slots.is_some() {
+        let compact = ctx.compact_fft();
+        if tiles_per_workgroup == 0 {
+            &compact.ordinary
+        } else {
+            &compact.pipelined
+        }
+    } else {
+        kernel
+    };
     pass.set_pipeline(kernel);
     for (bindings, workgroups) in &bindings {
         pass.set_bind_group(0, bindings, &[]);
@@ -570,6 +640,39 @@ pub(crate) fn from_device_values<
     leaf_storage: LeafStorage,
     retain_values: bool,
 ) -> ProverPolynomialBatch<F, C, D> {
+    from_device_values_with_slots::<F, C, D>(
+        ctx,
+        vals,
+        num_polys,
+        degree,
+        rate_bits,
+        blinding,
+        cap_height,
+        timing,
+        leaf_storage,
+        retain_values,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn from_device_values_with_slots<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    ctx: &std::sync::Arc<GpuContext>,
+    vals: DeviceBuffer,
+    num_polys: usize,
+    degree: usize,
+    rate_bits: usize,
+    blinding: bool,
+    cap_height: usize,
+    timing: &mut TimingTree,
+    leaf_storage: LeafStorage,
+    retain_values: bool,
+    slots: Option<&DeviceBuffer>,
+) -> ProverPolynomialBatch<F, C, D> {
     let log_d = log2_strict(degree) as u32;
     let (coeffs, work) = timed!(timing, "gpu: allocate IFFT buffers", {
         let coeffs = ctx.storage("coeffs", (num_polys * degree * 8) as u64);
@@ -582,22 +685,23 @@ pub(crate) fn from_device_values<
     });
     let encoder = timed!(timing, "gpu: encode IFFT", {
         let mut encoder = ctx.encoder("ifft");
-        fft(
-            ctx,
-            &mut encoder,
-            FftJob {
-                log_n: log_d,
-                columns: num_polys as u32,
-                input: &vals,
-                in_len: degree as u32,
-                in_stride: degree as u32,
-                data: &work,
-                output: Some(&coeffs),
-                shift_in: None,
-                inverse: true,
-                shift_out: None,
-            },
-        );
+        let job = FftJob {
+            log_n: log_d,
+            columns: num_polys as u32,
+            input: &vals,
+            in_len: degree as u32,
+            in_stride: degree as u32,
+            data: &work,
+            output: Some(&coeffs),
+            shift_in: None,
+            inverse: true,
+            shift_out: None,
+        };
+        if let Some(slots) = slots {
+            fft_compact(ctx, &mut encoder, job, slots);
+        } else {
+            fft(ctx, &mut encoder, job);
+        }
         encoder
     });
     let device_values = crate::gpu::DeviceCache::default();
@@ -610,7 +714,7 @@ pub(crate) fn from_device_values<
     } else {
         drop(vals);
     }
-    commit(
+    let batch = commit(
         ctx,
         HostCoefficients::Device {
             columns: num_polys,
@@ -623,7 +727,13 @@ pub(crate) fn from_device_values<
         cap_height,
         timing,
         leaf_storage,
-    )
+    );
+    if retain_values {
+        if let Some(slots) = slots {
+            batch.batch.device_value_slots.set(slots.clone());
+        }
+    }
+    batch
 }
 
 /// Commits column-major device coefficients without a host copy. CPU opening
@@ -780,6 +890,7 @@ fn commit<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usi
     // written while the device runs it (into columns it does not touch), and
     // the leaf hashing below queues behind it, so the device goes from one to
     // the other without waiting for the host.
+    let device_random = crate::gpu::resident_witness::experiment().contains("salts");
     let salts = timed!(timing, "gpu: FFT and salt", {
         timed!(
             timing,
@@ -790,14 +901,23 @@ fn commit<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usi
                 ctx.submit_async(encoder)
             )
         );
-        salt_words::<F>(salt_size, n)
+        if device_random {
+            Vec::new()
+        } else {
+            salt_words::<F>(salt_size, n)
+        }
     });
     // The opening phase evaluates the polynomials from these coefficients.
     let device_coeffs = crate::gpu::DeviceCache::default();
     device_coeffs.set(coeffs.clone());
     timed!(timing, "gpu: pack and enqueue salt writes", {
         // The salt columns follow the polynomials' columns in the LDE buffer.
-        ctx.write(&lde, (num_polys * n) as u64, &salts);
+        if device_random && salt_size > 0 {
+            let seed = crate::gpu::random::fresh_seed();
+            ctx.fill_random(&lde, num_polys * n, salt_size * n, &seed, 0x53414c54);
+        } else {
+            ctx.write(&lde, (num_polys * n) as u64, &salts);
+        }
     });
     let rows = (leaf_storage != LeafStorage::Columns).then(|| {
         timed!(
@@ -896,6 +1016,7 @@ fn commit<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usi
         device,
         device_coeffs,
         device_values,
+        device_value_slots: Default::default(),
     };
     match host_coeffs {
         HostCoefficients::Ready(polynomials) => ProverPolynomialBatch::from(PolynomialBatch {

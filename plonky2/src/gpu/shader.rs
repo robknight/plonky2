@@ -1708,3 +1708,64 @@ fn permutation_module_source(flavor: Flavor, chunks: u32, rows: &str) -> String 
     );
     out
 }
+
+/// The same 122 witness values as the sparse CPU trace. The dense partial
+/// rounds preserve the S-box input in word zero; the other words are needed
+/// only after the partial-round basis transformation has been undone.
+/// Reuse the tree kernel's small-coefficient MDS and folded round constants.
+pub(crate) fn witness_dense_trace() -> String {
+    let mut out = String::from("\nfn trace_poseidon(g:Op) {\n");
+    for i in 0..12 {
+        writeln!(out, "var s{i}=inp(g,{i}u);").unwrap();
+    }
+    out.push_str("let swap=canonical(inp(g,12u));if(swap.y!=0u || swap.x>1u){fail();return;}\n");
+    for i in 0..4 {
+        writeln!(
+            out,
+            "emit(g,{i}u,mul_field(swap,sub_field(s{},s{i})));",
+            i + 4
+        )
+        .unwrap();
+    }
+    out.push_str("if(swap.x==1u){\n");
+    for i in 0..4 {
+        writeln!(out, "let t{i}=s{i};s{i}=s{};s{}=t{i};", i + 4, i + 4).unwrap();
+    }
+    out.push_str("}\n");
+    for i in 1..12 {
+        writeln!(out, "var t0_{i}:u32;var t1_{i}:u32;var t2_{i}:u32;").unwrap();
+    }
+    for (i, c) in round_constants(0).iter().enumerate() {
+        writeln!(out, "s{i}=add_const(s{i},{});", literal(*c)).unwrap();
+    }
+    let mut output = 4;
+    let partial = 4..26;
+    for round in 0..30 {
+        let full = !partial.contains(&round);
+        writeln!(out, "{{ // witness round {round}").unwrap();
+        if full {
+            if round != 0 {
+                for i in 0..12 {
+                    writeln!(out, "emit(g,{output}u,s{i});").unwrap();
+                    output += 1;
+                }
+            }
+        } else {
+            writeln!(out, "emit(g,{output}u,s0);").unwrap();
+            output += 1;
+        }
+        for i in 0..if full { 12 } else { 1 } {
+            writeln!(out, "s{i}=sbox(s{i});").unwrap();
+        }
+        let next = (round + 1 < 30).then(|| round_constants(round + 1));
+        mds_layer(&mut out, next, !full, partial.contains(&(round + 1)));
+        out.push_str("}\n");
+    }
+    for i in 0..12 {
+        writeln!(out, "emit(g,{output}u,s{i});").unwrap();
+        output += 1;
+    }
+    assert_eq!(output, 122);
+    out.push_str("}\n");
+    out
+}

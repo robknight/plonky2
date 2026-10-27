@@ -72,6 +72,10 @@ pub struct PolynomialBatch<F: RichField + Extendable<D>, C: GenericConfig<D, F =
     #[cfg(feature = "gpu")]
     #[serde(skip)]
     pub(crate) device_values: crate::gpu::DeviceCache,
+    /// Optional compact witness slot map for the subgroup values.
+    #[cfg(feature = "gpu")]
+    #[serde(skip)]
+    pub(crate) device_value_slots: crate::gpu::DeviceCache,
 }
 
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> Default
@@ -90,6 +94,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> D
             device_coeffs: Default::default(),
             #[cfg(feature = "gpu")]
             device_values: Default::default(),
+            #[cfg(feature = "gpu")]
+            device_value_slots: Default::default(),
         }
     }
 }
@@ -303,6 +309,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             device_coeffs: Default::default(),
             #[cfg(feature = "gpu")]
             device_values: Default::default(),
+            #[cfg(feature = "gpu")]
+            device_value_slots: Default::default(),
         }
     }
 
