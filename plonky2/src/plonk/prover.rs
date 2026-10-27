@@ -221,6 +221,10 @@ where
     C::InnerHasher: Hasher<F>,
 {
     #[cfg(feature = "gpu")]
+    if let Some(ctx) = crate::gpu::context() {
+        ctx.storage_pool.begin_proof(common_data.degree_bits());
+    }
+    #[cfg(feature = "gpu")]
     let gpu_plan = timed!(
         timing,
         "plan GPU execution",

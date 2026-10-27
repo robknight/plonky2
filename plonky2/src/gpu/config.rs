@@ -60,6 +60,14 @@ pub struct GpuConfig {
     /// Idle storage buffers kept for reuse. `None` is 4 GiB on unified-memory
     /// adapters and 0 (no pooling) on discrete ones.
     pub pool_bytes: Option<u64>,
+    /// Idle storage buffers are released once they have stayed unused while
+    /// this many later proofs started. `None` keeps them until `pool_bytes`
+    /// evicts them.
+    pub pool_max_idle_proofs: Option<u64>,
+    /// Proofs of circuits with fewer than `2^pool_min_degree_bits` rows
+    /// neither take buffers from the pool nor return them. The most recently
+    /// started proof decides for all proofs running at that time. `None` is 0.
+    pub pool_min_degree_bits: Option<u32>,
     /// The share of quotient rows the CPU evaluates in a hybrid proof's first
     /// plan, from 0 (GPU only) to 1. With one proving worker each proof then
     /// moves it to its measured balance.
@@ -87,6 +95,8 @@ impl Default for GpuConfig {
             proving_workers: 1,
             retained_bytes: None,
             pool_bytes: None,
+            pool_max_idle_proofs: None,
+            pool_min_degree_bits: None,
             quotient_cpu_share: 0.10,
             shutdown_at_exit: true,
             fft_tiles_per_workgroup: None,
@@ -165,6 +175,18 @@ impl GpuConfig {
             env.optional_number("PLONKY2_GPU_POOL_BYTES", "PLONKY2_GPU_POOL_BYTES")?
         {
             c.pool_bytes = value;
+        }
+        if let Some(value) = env.optional_number(
+            "PLONKY2_GPU_POOL_MAX_IDLE_PROOFS",
+            "PLONKY2_GPU_POOL_MAX_IDLE_PROOFS",
+        )? {
+            c.pool_max_idle_proofs = value;
+        }
+        if let Some(value) = env.optional_number(
+            "PLONKY2_GPU_POOL_MIN_DEGREE_BITS",
+            "PLONKY2_GPU_POOL_MIN_DEGREE_BITS",
+        )? {
+            c.pool_min_degree_bits = value;
         }
         if let Some(v) = env.number(
             "PLONKY2_GPU_QUOTIENT_CPU_SHARE",
@@ -297,6 +319,8 @@ mod tests {
             proving_workers: 7,
             retained_bytes: Some(1024),
             pool_bytes: Some(2048),
+            pool_max_idle_proofs: Some(3),
+            pool_min_degree_bits: Some(12),
             quotient_cpu_share: 0.3,
             shutdown_at_exit: false,
             fft_tiles_per_workgroup: Some(5),
@@ -312,6 +336,8 @@ mod tests {
                 ("PLONKY2_GPU_PROVING_WORKERS", "2"),
                 ("PLONKY2_GPU_RETAINED_BYTES", "auto"),
                 ("PLONKY2_GPU_POOL_BYTES", "0"),
+                ("PLONKY2_GPU_POOL_MAX_IDLE_PROOFS", "1"),
+                ("PLONKY2_GPU_POOL_MIN_DEGREE_BITS", "auto"),
             ],
         )
         .unwrap();
@@ -321,6 +347,8 @@ mod tests {
         assert_eq!(c.proving_workers, 2);
         assert_eq!(c.retained_bytes, None);
         assert_eq!(c.pool_bytes, Some(0));
+        assert_eq!(c.pool_max_idle_proofs, Some(1));
+        assert_eq!(c.pool_min_degree_bits, None);
         assert_eq!(c.retained_bytes_limit(), 4 << 30);
         assert_eq!(c.mode, defaults.mode);
         assert_eq!(c.quotient_cpu_share, defaults.quotient_cpu_share);

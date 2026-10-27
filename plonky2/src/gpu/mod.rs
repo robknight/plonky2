@@ -71,7 +71,7 @@
 //! 2^19 field elements). Batches that exceed the adapter's limits fall back
 //! to the CPU.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -494,34 +494,77 @@ impl DeviceBuffer {
 }
 
 /// Free storage buffers by exact size, at most `limit` bytes in all (the
-/// oldest leave first), [`GpuConfig::pool_bytes`].
+/// oldest leave first), [`GpuConfig::pool_bytes`]. Each is tagged with the
+/// number of proofs started when it was returned, so that buffers no proof
+/// has reused for a while can be released
+/// ([`GpuConfig::pool_max_idle_proofs`]).
 #[derive(Debug)]
 pub(crate) struct StoragePool {
-    free: Mutex<Vec<wgpu::Buffer>>,
+    free: Mutex<Vec<(wgpu::Buffer, u64)>>,
     limit: u64,
+    max_idle_proofs: Option<u64>,
+    min_degree_bits: u32,
+    proofs: AtomicU64,
+    /// Whether the most recently started proof uses the pool.
+    active: AtomicBool,
 }
 
 impl StoragePool {
+    pub(crate) fn new(limit: u64, max_idle_proofs: Option<u64>, min_degree_bits: u32) -> Self {
+        Self {
+            free: Mutex::new(Vec::new()),
+            limit,
+            max_idle_proofs,
+            min_degree_bits,
+            proofs: AtomicU64::new(0),
+            active: AtomicBool::new(true),
+        }
+    }
+
     fn take(&self, size: u64) -> Option<wgpu::Buffer> {
+        if !self.active.load(Ordering::Relaxed) {
+            return None;
+        }
         let mut free = self.free.lock().unwrap();
-        let i = free.iter().rposition(|b| b.size() == size)?;
-        Some(free.swap_remove(i))
+        let i = free.iter().rposition(|(b, _)| b.size() == size)?;
+        Some(free.swap_remove(i).0)
     }
 
     fn put(&self, buffer: wgpu::Buffer) {
-        if buffer.size() > self.limit {
+        if buffer.size() > self.limit || !self.active.load(Ordering::Relaxed) {
             return;
         }
         let mut free = self.free.lock().unwrap();
-        free.push(buffer);
-        while free.iter().map(|b| b.size()).sum::<u64>() > self.limit {
+        free.push((buffer, self.proofs.load(Ordering::Relaxed)));
+        while free.iter().map(|(b, _)| b.size()).sum::<u64>() > self.limit {
             free.remove(0);
+        }
+    }
+
+    /// Called as each proof starts: decides whether proofs of this size use
+    /// the pool and releases buffers that have stayed idle too long.
+    pub(crate) fn begin_proof(&self, degree_bits: usize) {
+        self.active.store(
+            degree_bits >= self.min_degree_bits as usize,
+            Ordering::Relaxed,
+        );
+        let proofs = self.proofs.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(max) = self.max_idle_proofs {
+            self.free
+                .lock()
+                .unwrap()
+                .retain(|(_, returned)| returned + max >= proofs);
         }
     }
 
     /// Bytes of free buffers held.
     pub(crate) fn bytes(&self) -> u64 {
-        self.free.lock().unwrap().iter().map(|b| b.size()).sum()
+        self.free
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(b, _)| b.size())
+            .sum()
     }
 }
 
@@ -560,6 +603,8 @@ pub(crate) const MIN_LOG_LEAVES: u32 = 10;
 /// Immutable per-context policy, resolved from a [`GpuConfig`].
 pub(crate) struct GpuOptions {
     pub pool_bytes: u64,
+    pub pool_max_idle_proofs: Option<u64>,
+    pub pool_min_degree_bits: u32,
     pub mode: ExecutionMode,
     pub proving_workers: usize,
     pub retained_bytes: u64,
@@ -574,6 +619,8 @@ impl GpuOptions {
             pool_bytes: config
                 .pool_bytes
                 .unwrap_or_else(|| Self::default_pool_bytes(mappable)),
+            pool_max_idle_proofs: config.pool_max_idle_proofs,
+            pool_min_degree_bits: config.pool_min_degree_bits.unwrap_or(0),
             mode: config.mode,
             proving_workers: config.proving_workers,
             retained_bytes: config.retained_bytes_limit(),
@@ -929,10 +976,11 @@ impl GpuContext {
             mappable,
             readback_pool: Mutex::new(Vec::new()),
             upload_pool: Mutex::new(Vec::new()),
-            storage_pool: Arc::new(StoragePool {
-                free: Mutex::new(Vec::new()),
-                limit: options.pool_bytes,
-            }),
+            storage_pool: Arc::new(StoragePool::new(
+                options.pool_bytes,
+                options.pool_max_idle_proofs,
+                options.pool_min_degree_bits,
+            )),
             retained: retained.clone(),
             options,
             hash_layout,
