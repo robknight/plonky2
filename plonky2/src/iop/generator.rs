@@ -276,7 +276,7 @@ fn run_round<F: RichField + Extendable<D>, const D: usize>(
     let run = || indices.par_chunks(chunk).map(task).collect();
     #[cfg(all(feature = "parallel", feature = "std"))]
     {
-        generator_pool().install(run)
+        on_generator_pool(run)
     }
     #[cfg(not(all(feature = "parallel", feature = "std")))]
     {
@@ -363,12 +363,16 @@ fn merge_replay<F: RichField>(
         let chunk_size = witness
             .values
             .len()
-            .div_ceil(generator_pool().current_num_threads())
+            .div_ceil(
+                generator_pool().map_or_else(rayon::current_num_threads, |pool| {
+                    pool.current_num_threads()
+                }),
+            )
             .max(1);
         let parts = witness.values.len().div_ceil(chunk_size);
         // Assign each update to its owner once. Per-task buckets keep this
         // scatter parallel; merging buckets never scans unrelated updates.
-        let buckets = generator_pool().install(|| {
+        let buckets = on_generator_pool(|| {
             results
                 .into_par_iter()
                 .fold(
@@ -391,7 +395,7 @@ fn merge_replay<F: RichField>(
                     },
                 )
         });
-        return generator_pool().install(|| {
+        return on_generator_pool(|| {
             let merge = |(part, (chunk, updates)): (usize, (&mut [Option<F>], Vec<(usize, F)>))| -> Result<u32> {
                 let base = part * chunk_size;
                 let mut count = 0;
@@ -410,7 +414,12 @@ fn merge_replay<F: RichField>(
                 }
                 Ok(count)
             };
-            witness.values.par_chunks_mut(chunk_size).zip(buckets.into_par_iter()).enumerate().map(merge)
+            witness
+                .values
+                .par_chunks_mut(chunk_size)
+                .zip(buckets.into_par_iter())
+                .enumerate()
+                .map(merge)
                 .try_reduce(|| 0, |a, b| Ok(a + b))
         });
     }
@@ -483,25 +492,57 @@ const GENERATOR_CHUNK_MIN: usize = 128;
 /// The finished generators and the values produced by one task of a round.
 type RoundResults<F> = (Vec<u32>, Vec<(Target, F)>);
 
-/// The thread pool the rounds run on. Generator runs are bound by memory
-/// latency (random reads of the witness and the representative map), and on
-/// Apple silicon adding the efficiency cores to the four performance cores
-/// made a round 2.5x slower, so the pool has one thread per performance core
-/// there and one per available core elsewhere (`available_parallelism`, which
-/// follows Linux CPU quotas). On Linux, 4 to 32 threads measured within 12% of
-/// each other.
+/// The thread pool the rounds run on, or `None` to run on the caller's pool.
+/// Generator runs are bound by memory latency (random reads of the witness and
+/// the representative map), and on Apple silicon adding the efficiency cores
+/// to the four performance cores made a round 2.5x slower, so by default the
+/// pool has one thread per performance core there. On Linux, 4 to 32 threads
+/// measured within 12% of each other. Sized once, on first use, by
+/// [`generator_threads`]; an invalid setting panics there.
 #[cfg(all(feature = "parallel", feature = "std"))]
-fn generator_pool() -> &'static rayon::ThreadPool {
-    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+fn generator_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
-        let threads = performance_cores()
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .thread_name(|i| format!("plonky2-generators-{i}"))
-            .build()
-            .expect("building the generator thread pool")
+        let threads = generator_threads(&crate::util::environment::Environment::process())
+            .unwrap_or_else(|e| panic!("{e}"))?;
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|i| format!("plonky2-generators-{i}"))
+                .build()
+                .expect("building the generator thread pool"),
+        )
     })
+    .as_ref()
+}
+
+#[cfg(all(feature = "parallel", feature = "std"))]
+fn on_generator_pool<R: Send>(op: impl FnOnce() -> R + Send) -> R {
+    match generator_pool() {
+        Some(pool) => pool.install(op),
+        None => op(),
+    }
+}
+
+/// The generator pool size. `PLONKY2_GENERATOR_THREADS` sets it; zero runs on
+/// the caller's pool. Unset, it is the performance-core count where the system
+/// distinguishes them, capped by the current Rayon pool size, which follows
+/// `RAYON_NUM_THREADS`, `build_global`, CPU affinity and Linux CPU quotas.
+#[cfg(all(feature = "parallel", feature = "std"))]
+fn generator_threads<F: Fn(&str) -> Option<std::ffi::OsString>>(
+    env: &crate::util::environment::Environment<F>,
+) -> Result<Option<usize>, crate::util::environment::EnvironmentError> {
+    Ok(
+        match env.number("PLONKY2_GENERATOR_THREADS", "PLONKY2_GENERATOR_THREADS")? {
+            Some(0) => None,
+            Some(threads) => Some(threads),
+            None => Some(
+                performance_cores()
+                    .unwrap_or(usize::MAX)
+                    .min(rayon::current_num_threads()),
+            ),
+        },
+    )
 }
 
 /// The number of performance cores, where the system distinguishes them.
@@ -1280,5 +1321,32 @@ mod tests {
             &rerecorded,
             &data.prover_only.generator_schedule.get().unwrap()
         ));
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn generator_threads_follow_the_environment() {
+        use crate::util::environment::Environment;
+        let threads = |value: Option<&str>| {
+            generator_threads(&Environment::with_lookup(|key: &str| {
+                assert_eq!(key, "PLONKY2_GENERATOR_THREADS");
+                value.map(Into::into)
+            }))
+        };
+        assert_eq!(threads(Some("3")).unwrap(), Some(3));
+        assert_eq!(threads(Some("0")).unwrap(), None);
+        let default = threads(None).unwrap().unwrap();
+        assert!((1..=rayon::current_num_threads()).contains(&default));
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        assert_eq!(pool.install(|| threads(None)).unwrap(), Some(1));
+        for bad in ["", "-1", "two"] {
+            assert_eq!(
+                threads(Some(bad)).unwrap_err().variable,
+                "PLONKY2_GENERATOR_THREADS"
+            );
+        }
     }
 }

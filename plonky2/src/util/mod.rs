@@ -13,7 +13,9 @@ use crate::field::types::Field;
 #[cfg(all(feature = "std", feature = "rand_chacha"))]
 pub(crate) mod blinding_rng;
 pub(crate) mod context_tree;
-#[cfg(all(feature = "std", feature = "rand_chacha"))]
+// Which readers have callers depends on the enabled features.
+#[cfg(feature = "std")]
+#[cfg_attr(not(feature = "rand_chacha"), allow(dead_code))]
 pub mod environment;
 pub(crate) mod partial_products;
 pub mod reducing;

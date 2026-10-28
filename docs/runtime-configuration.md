@@ -17,6 +17,7 @@
 | `CircuitConfig`, `FriConfig`, `StarkConfig`, `GenericConfig` / hash choice, POD2 `Params` and container/Merkle limits | Keep explicit | Circuit shape, security targets, commitments and verifier/proof parameters must remain reproducible and visible to circuit construction. |
 | `TimingTree`, witness inputs, circuit input targets, serializers, shutdown | Keep explicit | These are execution data, observation or lifecycle operations rather than deployment defaults. |
 | Profiling/export/benchmark controls | Keep their separate diagnostic parsers and feature gates | Loose diagnostic flags are not the contract for production configuration. This audit does not expose experimental controls in normal builds. |
+| Worklist generator pool size | Add `PLONKY2_GENERATOR_THREADS` | The worklist runs generators on a dedicated pool that `RAYON_NUM_THREADS` does not size. Unset, it is capped by the current Rayon pool, so a Rayon thread cap also caps it; zero runs generators on the caller's pool, sharing that cap. |
 | Cargo features and Rayon global pool | Keep existing mechanisms | Environment variables cannot enable code omitted at compilation. Rayon owns `RAYON_NUM_THREADS`; no duplicate global CPU-thread setting is introduced. |
 
 ## GPU environment contract
@@ -70,6 +71,8 @@ plonky2::gpu::configure(settings)?;
 ```
 
 `enabled=false` avoids device creation and is fixed with the startup configuration. `set_enabled(false)` is a separate temporary routing gate; setting it back to true does not undo startup disablement or permanent shutdown.
+
+`PLONKY2_GENERATOR_THREADS` sizes the worklist generator pool once, when the first worklist round runs, and applies process-wide. It accepts a non-negative integer. A positive value creates a pool of exactly that size; zero runs generators on the caller's Rayon pool. Unset, the pool has one thread per performance core on Apple silicon and one per available core elsewhere, capped by the size of the Rayon pool current at first use. An invalid value panics at first use, naming the variable.
 
 Witness settings are captured during preparation and remain in the installed program. The four operational `PLONKY2_EXECUTOR_*` settings override library defaults when using `from_env_with_defaults`. Legacy `P2_*` configuration aliases and retired tuning variables are ignored. Standalone applications can deliberately bypass environment settings with the explicit `_with_config` APIs. `WitnessCache::Environment` is an explicit exception in otherwise passed-in configuration: it still resolves the cache-directory hint during preparation; choose `Disabled` or `Directory` for an explicit cache policy. POD2 captures its defaults through `WitnessConfig::from_env_with_defaults` on first preparation/proving because circuit objects are shared. It exposes no scalar plonky2 policy wrapper. Applications may call `set_witness_thread_pool(Arc<rayon::ThreadPool>)` before that point to inject a resource; this explicit application handle takes precedence over an environment thread-count hint while other environment policies remain effective. The pool is retained with process-wide circuit caches; this is not an independently disposable per-proof runtime.
 
