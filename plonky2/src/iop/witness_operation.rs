@@ -150,6 +150,33 @@ pub enum WitnessOperation {
         num_chunks: usize,
         chunk_bits: usize,
     },
+    /// Field mul-add followed by canonical u64 decomposition. Outputs are
+    /// low u32, high u32, inverse of `u32::MAX - high` (zero at equality),
+    /// then the canonical result's 32 little-endian two-bit limbs.
+    U32Arithmetic {
+        inputs: [Target; 3],
+        outputs: [Target; 35],
+    },
+    /// Field sum of at most 16 addends and a carry (the final input).
+    /// Outputs are result u32, carry, 16 two-bit result limbs, two carry limbs.
+    U32AddMany {
+        inputs: Vec<Target>,
+        outputs: [Target; 20],
+    },
+    /// Field subtraction `x - y - borrow`. The output borrow is one when
+    /// its canonical value exceeds 2^32. Outputs are the corrected result,
+    /// borrow, then the low 32 bits as 16 little-endian two-bit limbs.
+    U32Subtraction {
+        inputs: [Target; 3],
+        outputs: [Target; 18],
+    },
+    /// Each input's low 32 canonical bits as 16 two-bit limbs, input-major.
+    /// This reproduces the generator's truncation; circuit constraints, not
+    /// witness generation, enforce that the inputs are in the u32 range.
+    U32RangeCheck {
+        inputs: Vec<Target>,
+        outputs: Vec<Target>,
+    },
 }
 
 impl WitnessOperation {
@@ -193,6 +220,10 @@ impl WitnessOperation {
             Self::EcScalarMul { .. } => "ec_scalar_mul",
             Self::CosetInterpolation { .. } => "coset_interpolation",
             Self::Comparison { .. } => "comparison",
+            Self::U32Arithmetic { .. } => "u32_arithmetic",
+            Self::U32AddMany { .. } => "u32_add_many",
+            Self::U32Subtraction { .. } => "u32_subtraction",
+            Self::U32RangeCheck { .. } => "u32_range_check",
         }
     }
 
@@ -248,6 +279,10 @@ impl WitnessOperation {
             Self::EcScalarMul { inputs, .. } => inputs.to_vec(),
             Self::CosetInterpolation { inputs, .. } => inputs.clone(),
             Self::Comparison { inputs, .. } => inputs.to_vec(),
+            Self::U32Arithmetic { inputs, .. } | Self::U32Subtraction { inputs, .. } => {
+                inputs.to_vec()
+            }
+            Self::U32AddMany { inputs, .. } | Self::U32RangeCheck { inputs, .. } => inputs.clone(),
         }
     }
 
@@ -319,6 +354,10 @@ impl WitnessOperation {
             Self::EcScalarMul { outputs, .. } => outputs.to_vec(),
             Self::CosetInterpolation { outputs, .. } => outputs.clone(),
             Self::Comparison { outputs, .. } => outputs.clone(),
+            Self::U32Arithmetic { outputs, .. } => outputs.to_vec(),
+            Self::U32AddMany { outputs, .. } => outputs.to_vec(),
+            Self::U32Subtraction { outputs, .. } => outputs.to_vec(),
+            Self::U32RangeCheck { outputs, .. } => outputs.clone(),
         }
     }
 }

@@ -664,11 +664,74 @@ impl Executor<'_> {
         Ok(())
     }
 
+    /// Preserve the gadget generators' field arithmetic, canonicalization and
+    /// truncation even for out-of-range inputs; their gates enforce validity.
+    fn step_u32(&self, group: &super::Group, k: u32) -> Result<()> {
+        let count = group.count;
+        let offset = group.targets_offset;
+        let input = |i| self.input(offset, i, count, k);
+        let output = |i, value| self.output(offset, group.inputs + i, count, k, value);
+        let limbs = |start, word: u64, n| -> Result<()> {
+            for i in 0..n {
+                output(start + i, G::from_canonical_u64((word >> (2 * i)) & 3))?;
+            }
+            Ok(())
+        };
+        match group.kind {
+            Kind::U32Arithmetic => {
+                let word = (input(0)? * input(1)? + input(2)?).to_canonical_u64();
+                let high = word >> 32;
+                let diff = G::from_canonical_u64(u32::MAX as u64 - high);
+                output(0, G::from_canonical_u32(word as u32))?;
+                output(1, G::from_canonical_u64(high))?;
+                output(
+                    2,
+                    if diff == G::ZERO {
+                        G::ZERO
+                    } else {
+                        inverse(diff)?
+                    },
+                )?;
+                limbs(3, word, 32)
+            }
+            Kind::U32AddMany => {
+                ensure!((1..=17).contains(&group.inputs), "invalid u32 addend count");
+                let mut sum = G::ZERO;
+                for i in 0..group.inputs {
+                    sum += input(i)?;
+                }
+                let word = sum.to_canonical_u64();
+                output(0, G::from_canonical_u32(word as u32))?;
+                output(1, G::from_canonical_u64(word >> 32))?;
+                limbs(2, word, 16)?;
+                limbs(18, word >> 32, 2)
+            }
+            Kind::U32Subtraction => {
+                let difference = input(0)? - input(1)? - input(2)?;
+                let borrow = G::from_bool(difference.to_canonical_u64() > 1u64 << 32);
+                let result = difference + G::from_canonical_u64(1u64 << 32) * borrow;
+                output(0, result)?;
+                output(1, borrow)?;
+                limbs(2, result.to_canonical_u64(), 16)
+            }
+            Kind::U32RangeCheck => {
+                for i in 0..group.inputs {
+                    limbs(16 * i, input(i)?.to_canonical_u64() as u32 as u64, 16)?;
+                }
+                Ok(())
+            }
+            _ => anyhow::bail!("not a u32 operation"),
+        }
+    }
+
     fn step(&self, group: &super::Group, k: u32) -> Result<()> {
         let kind = group.kind;
         let count = group.count;
         let offset = group.targets_offset;
         match kind {
+            Kind::U32Arithmetic | Kind::U32AddMany | Kind::U32Subtraction | Kind::U32RangeCheck => {
+                self.step_u32(group, k)
+            }
             Kind::Poseidon => self.step_poseidon(k, count, offset),
             Kind::Arithmetic => {
                 let co = group.coefficients_offset()?;
@@ -1168,6 +1231,9 @@ impl Executor<'_> {
         let count = group.count;
         let offset = group.targets_offset;
         match kind {
+            Kind::U32Arithmetic | Kind::U32AddMany | Kind::U32Subtraction | Kind::U32RangeCheck => {
+                self.step_u32(group, k)
+            }
             Kind::Poseidon => self.step_poseidon(k, count, offset),
             Kind::Arithmetic => {
                 let co = group.coefficients_offset()?;

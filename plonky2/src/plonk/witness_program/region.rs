@@ -83,6 +83,10 @@ operation_kinds! {
     Comparison = 25,
     ArithmeticChain = 26,
     BitSum = 27,
+    U32Arithmetic = 28,
+    U32AddMany = 29,
+    U32Subtraction = 30,
+    U32RangeCheck = 31,
 }
 use OperationKind as Kind;
 
@@ -473,6 +477,10 @@ impl Lane {
             Op::EcScalarMul { .. } => Kind::EcScalarMul,
             Op::CosetInterpolation { .. } => Kind::CosetInterpolation,
             Op::Comparison { .. } => Kind::Comparison,
+            Op::U32Arithmetic { .. } => Kind::U32Arithmetic,
+            Op::U32AddMany { .. } => Kind::U32AddMany,
+            Op::U32Subtraction { .. } => Kind::U32Subtraction,
+            Op::U32RangeCheck { .. } => Kind::U32RangeCheck,
         };
         let parameter = match op {
             Op::BaseSplit { limb_bits, .. } => *limb_bits,

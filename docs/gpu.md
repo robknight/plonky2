@@ -75,6 +75,8 @@ Compilation time and stored program size depend on the circuit. Loading checks t
 
 A circuit can be compiled only over the Goldilocks field, if every generator describes its computation through `WitnessGenerator::witness_operation` and it has no lookup tables. Most of plonky2's own generators do (not those of lookups, the dummy-proof generator or nonbinary `BaseSumGenerator`s); `witness_program_support` checks a circuit without compiling and names the first generator that does not. Libraries with custom generators implement `witness_operation` and can test their implementations on real circuits with `witness_program::check_against_worklist`, which fails on any value that differs from the worklist.
 
+The executor also supports u32 mul-add, addition with carry, subtraction with borrow and range decomposition through typed `WitnessOperation::U32*` descriptions. These operations run on the CPU, including when the rest of the proof uses the GPU. Gadget libraries must provide the descriptions; enabling `gpu` alone does not add them. The operations preserve the generators' canonical field arithmetic and limb truncation, and the existing circuit constraints continue to enforce input ranges.
+
 ## Diagnostics and tools
 
 - Debug logs need no switch: `RUST_LOG=plonky2::util::timing=debug` prints the prover's timing tree, `plonky2::witness_program::compile=debug` a program's compile phases, `plonky2::witness_program::executor=debug` the executor's report per proof.

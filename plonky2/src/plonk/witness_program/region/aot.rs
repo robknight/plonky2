@@ -317,6 +317,13 @@ fn validate_shape(p: &RegionProgram, g: &Group) -> Result<()> {
         Kind::EcAddHomogOffset => (20, 20),
         Kind::EcScalarMul => (10, 10),
         Kind::LowHigh => (1, 2),
+        Kind::U32Arithmetic => (3, 35),
+        Kind::U32Subtraction => (3, 18),
+        Kind::U32AddMany => {
+            ensure!((1..=17).contains(&g.inputs), "invalid u32 addend count");
+            (g.inputs as u64, 20)
+        }
+        Kind::U32RangeCheck => (g.inputs as u64, 16 * g.inputs as u64),
         Kind::BitSum => {
             ensure!(g.inputs <= 63, "invalid bit sum width");
             (g.inputs as u64, 1)
@@ -564,6 +571,10 @@ fn run_dynamic(e: &Executor<'_>, g: &Group) -> Result<()> {
         Kind::Comparison => run_fixed::<25>(e, g),
         Kind::ArithmeticChain => run_fixed::<26>(e, g),
         Kind::BitSum => run_fixed::<27>(e, g),
+        Kind::U32Arithmetic => run_fixed::<28>(e, g),
+        Kind::U32AddMany => run_fixed::<29>(e, g),
+        Kind::U32Subtraction => run_fixed::<30>(e, g),
+        Kind::U32RangeCheck => run_fixed::<31>(e, g),
     }
 }
 
@@ -804,7 +815,7 @@ fn run_range_inner(e: &Executor<'_>, g: &Group, start: u32, end: u32) -> Result<
     macro_rules! run {($($k:literal),*)=>{match g.kind.code(){$($k=>{for k in start..end{e.step_fixed::<$k>(g,k)?;}},)*_=>unreachable!()}}}
     run!(
         0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-        25, 26, 27
+        25, 26, 27, 28, 29, 30, 31
     );
     Ok(())
 }
@@ -866,6 +877,39 @@ mod tests {
         let mut p = plan(vec![vec![copy(0, 1)]], vec![0, 1], 2);
         p.groups[0][0].inputs = 0;
         assert!(certify(&p).unwrap_err().to_string().contains("arity"));
+    }
+    #[test]
+    fn certificate_checks_u32_operand_shapes() {
+        let p = plan(vec![], vec![], 0);
+        for (kind, inputs, outputs) in [
+            (Kind::U32Arithmetic, 3, 35),
+            (Kind::U32AddMany, 17, 20),
+            (Kind::U32Subtraction, 3, 18),
+            (Kind::U32RangeCheck, 7, 112),
+        ] {
+            let mut g = Group {
+                kind,
+                inputs,
+                outputs,
+                count: 1,
+                targets_offset: 0,
+                argument: kind.argument(0),
+            };
+            validate_shape(&p, &g).unwrap();
+            g.outputs -= 1;
+            assert!(validate_shape(&p, &g).is_err());
+        }
+        for inputs in [0, 18, u32::MAX] {
+            let g = Group {
+                kind: Kind::U32AddMany,
+                inputs,
+                outputs: 20,
+                count: 1,
+                targets_offset: 0,
+                argument: Kind::U32AddMany.argument(0),
+            };
+            assert!(validate_shape(&p, &g).is_err());
+        }
     }
     #[test]
     fn certificate_preserves_checks_for_roots_and_repeated_lane_outputs() {
