@@ -432,8 +432,11 @@ fn reallocate_registers(ops: &mut [[u32; 4]], registers: u32) -> Option<u32> {
     if peak > registers {
         return None;
     }
-    // Rewrite the operands.
-    for (i, op) in ops.iter_mut().enumerate() {
+    // A packed index can reject this allocation after earlier instructions
+    // have been rewritten. Commit only a complete successful rewrite so the
+    // caller can retain the original allocation on every `None` path.
+    let mut rewritten = ops.to_vec();
+    for (i, op) in rewritten.iter_mut().enumerate() {
         let base = op[0] & BASE_MASK;
         let read = |slot: usize| physical[reads[i][slot].unwrap()];
         match base {
@@ -471,6 +474,7 @@ fn reallocate_registers(ops: &mut [[u32; 4]], registers: u32) -> Option<u32> {
             }
         }
     }
+    ops.copy_from_slice(&rewritten);
     Some(peak.max(1))
 }
 
@@ -2646,6 +2650,97 @@ pub(crate) fn try_compute_quotient_polys<
         plan,
     )
     .map(DeviceQuotient::read)
+}
+
+#[cfg(test)]
+mod register_allocation_tests {
+    use super::*;
+    use crate::gpu::trace::{Dag, NodeId};
+
+    #[test]
+    fn failed_packed_register_allocation_preserves_the_original_program() {
+        let mut ops = vec![op(OP_LITERAL, 300, 7, 0, 0)];
+        for register in 5..260 {
+            ops.push(op(OP_LITERAL, register, register, 0, 0));
+        }
+        // All 256 literals remain live until after this packed product, so
+        // its five-output block cannot be encoded with an eight-bit base.
+        ops.push(op(
+            OP_QMUL | (0x3ff << 16),
+            0,
+            0x03020100,
+            0x07060504,
+            0x0908,
+        ));
+        for (term, register) in core::iter::once(300).chain(5..260).enumerate() {
+            ops.push(op(OP_WEIGHTED, 0, register, term as u32, 0));
+        }
+        ops.push(op(OP_END, 0, 0, 0, 0));
+        ops.push([11, 22, 33, 44]); // Non-executable table data is unchanged too.
+        let original = ops.clone();
+        assert_eq!(reallocate_registers(&mut ops, 301), None);
+        for (index, (actual, expected)) in ops.iter().zip(&original).enumerate() {
+            assert_eq!(actual, expected, "instruction {index} changed on failure");
+        }
+    }
+
+    #[test]
+    fn compiled_quintic_with_late_literals_survives_allocator_fallback() {
+        type F = GoldilocksField;
+        let mut dag = Dag::<F>::new();
+        let x: [NodeId; 5] = core::array::from_fn(|i| dag.push(Node::Wire(i as u32)));
+        let y: [NodeId; 5] = core::array::from_fn(|i| dag.push(Node::Wire(5 + i as u32)));
+        let three = dag.constant(F::from_canonical_u64(3));
+        // Write the quintic product as ordinary polynomial arithmetic so this
+        // exercises the actual compiler's recognition and packed-op lowering.
+        let mut constraints = Vec::new();
+        for k in 0..5 {
+            let mut coefficient = dag.mul(x[0], y[k]);
+            for i in 1..=k {
+                let term = dag.mul(x[i], y[k - i]);
+                coefficient = dag.add(coefficient, term);
+            }
+            let mut wrapped = None;
+            for i in k + 1..5 {
+                let product = dag.mul(x[i], y[5 + k - i]);
+                let term = dag.mul(product, three);
+                wrapped = Some(match wrapped {
+                    None => term,
+                    Some(sum) => dag.add(sum, term),
+                });
+            }
+            if let Some(wrapped) = wrapped {
+                coefficient = dag.add(coefficient, wrapped);
+            }
+            constraints.push(coefficient);
+        }
+        for literal in 2..=256 {
+            constraints.push(dag.constant(F::from_canonical_u64(literal)));
+        }
+        let gate = TracedGate {
+            name: "quintic with late literals".into(),
+            trace: GateTrace { dag, constraints },
+            selector_index: 0,
+            filter_factors: vec![],
+        };
+        let program = compile_program(&[gate], 0, 1).unwrap();
+        assert!(
+            program.uses_qmul,
+            "regression must reach packed quintic lowering"
+        );
+        let wires = (2..14).map(F::from_canonical_u64).collect::<Vec<_>>();
+        let actual = run_program_host(
+            &program.ops,
+            program.registers as usize,
+            &wires,
+            &[F::ZERO],
+            &[],
+            &[F::ONE],
+        );
+        // Product coefficients modulo X^5 - 3 are 512, 481, 415, 312, 170.
+        // Alpha=1 adds these to sum(2..=256)=32895.
+        assert_eq!(actual, vec![F::from_canonical_u64(34785)]);
+    }
 }
 
 #[cfg(test)]
