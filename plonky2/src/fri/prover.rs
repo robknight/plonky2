@@ -295,16 +295,23 @@ pub(crate) fn fri_prover_query_rounds<
                 crate::util::log2_strict(tree.cap.len()),
             );
         };
-        for tree in initial_merkle_trees {
-            prepare(tree, &indices);
-        }
+        // These sparse readbacks are independent. Submit them from the prover's
+        // existing worker pool so one tree's device wait can overlap another's
+        // gather and host preparation. A single-worker pool stays sequential.
+        let mut queries = initial_merkle_trees
+            .iter()
+            .map(|&tree| (tree, indices.clone()))
+            .collect::<Vec<_>>();
         let mut layer_indices = indices.clone();
         for (tree, &arity) in trees.iter().zip(&fri_params.reduction_arity_bits) {
             for index in &mut layer_indices {
                 *index >>= arity;
             }
-            prepare(tree, &layer_indices);
+            queries.push((tree, layer_indices.clone()));
         }
+        queries.into_par_iter().for_each(|(tree, indices)| {
+            prepare(tree, &indices);
+        });
     }
     indices
         .into_par_iter()

@@ -7,6 +7,8 @@ mod column_leaves;
 mod fft_tiles;
 mod inversion;
 mod permutation_products;
+#[cfg(feature = "parallel")]
+mod query_readbacks;
 #[cfg(feature = "poseidon_bn128")]
 mod poseidon_bn128;
 mod residency_matrix;
