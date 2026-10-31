@@ -1,20 +1,21 @@
 //! WGSL kernel generation.
 //!
-//! All kernels are generated from Rust so that the Poseidon constants are
-//! immediates and every loop over the sponge state is unrolled. The permutation
-//! matches this crate's CPU implementation. Goldilocks elements are
+//! Kernels are generated from Rust using the CPU's Poseidon constants. Full
+//! rounds and state-word operations are unrolled; native Apple Metal loops
+//! the partial rounds with a constant table. The permutation matches the CPU. Goldilocks elements are
 //! pairs of `u32` words with explicit carries, noncanonical in `[0, 2^64)`
 //! during arithmetic, as in the CPU code. Both flavors implement the same field
 //! operations; the native flavor uses `u64` products and the portable flavor
 //! assembles wide products from 16-bit pieces.
 //!
-//! Seven modules are generated, each with its own bind group 0:
+//! Generated kernel families, each with its own bind group 0:
 //!
 //! - [`hash_module`]: `hash_leaves` (which can also write the gathered leaves
 //!   out row by row, replacing a separate transpose), `hash_nodes` and
 //!   `poseidon_permute`.
 //! - [`fft_module`]: `fft_group`, one group of radix-2 stages of a batched
-//!   Goldilocks NTT through workgroup memory.
+//!   Goldilocks NTT through workgroup memory. Native Apple Metal's pipelined
+//!   forward variant keeps pairs of stages in four-value register packets.
 //! - [`fold_module`]: `fri_fold`, the arity-`2^k` coefficient fold of FRI over
 //!   the quadratic extension.
 //! - [`open_module`]: `eval_openings`, the committed polynomials at the
@@ -951,7 +952,7 @@ const INVERSE: u32 = 4u;
 const SHIFT_OUT: u32 = 8u;
 const TO_OUTPUT: u32 = 16u;
 // Tile slots per thread of the pipelined kernel.
-const SLOTS: u32 = FFT_TILE_SIZE / 256u;
+const SLOTS: u32 = FFT_TILE_SIZE / FFT_THREADS_PLACEHOLDERu;
 
 @group(0) @binding(0) var<uniform> fp: FftParams;
 @group(0) @binding(1) var<storage, read> input: array<Field>;
@@ -987,7 +988,7 @@ fn slot_index(base: u32, l: u32) -> u32 {
     return base | ((l >> bl) << fp.s0) | (l & ((1u << bl) - 1u));
 }
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(FFT_THREADS_PLACEHOLDER)
 fn fft_group(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
     let tid = lid.x;
     let w = wid.x;
@@ -1006,14 +1007,14 @@ fn fft_group(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id
         // are zero and their twiddles irrelevant). Load and shift each source
         // once and replicate it, then start the butterflies at stage `skip`.
         let rep = 1u << fp.skip;
-        for (var g = tid; g < (tile_size >> fp.skip); g += 256u) {
+        for (var g = tid; g < (tile_size >> fp.skip); g += FFT_THREADS_PLACEHOLDERu) {
             let l = g << fp.skip;
             let i = base | ((l >> bl) << s0) | (l & low_mask);
             let v = load_input(col, i);
             for (var k = 0u; k < rep; k++) { tile[l | k] = v; }
         }
     } else {
-        for (var l = tid; l < tile_size; l += 256u) {
+        for (var l = tid; l < tile_size; l += FFT_THREADS_PLACEHOLDERu) {
             let i = base | ((l >> bl) << s0) | (l & low_mask);
             var v = Field(0u, 0u);
             if ((fp.flags & LOAD_BITREV) != 0u) {
@@ -1026,25 +1027,8 @@ fn fft_group(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id
     }
     workgroupBarrier();
     let half = tile_size >> 1u;
-    for (var st = fp.skip; st < fp.stages; st++) {
-        let s = s0 + st;
-        for (var b = tid; b < half; b += 256u) {
-            let low = b & low_mask;
-            let jp = b >> bl;
-            let j0 = ((jp >> st) << (st + 1u)) | (jp & ((1u << st) - 1u));
-            let j1 = j0 | (1u << st);
-            let l0 = (j0 << bl) | low;
-            let l1 = (j1 << bl) | low;
-            let i0 = base | (j0 << s0) | low;
-            let omega = twiddles[(i0 & ((1u << s) - 1u)) << (fp.log_n - s - 1u)];
-            let u = tile[l0];
-            let t = mul_field(omega, tile[l1]);
-            tile[l0] = add_field(u, t);
-            tile[l1] = sub_field(u, t);
-        }
-        workgroupBarrier();
-    }
-    for (var l = tid; l < tile_size; l += 256u) {
+    // FFT_STAGES_0
+    for (var l = tid; l < tile_size; l += FFT_THREADS_PLACEHOLDERu) {
         let i = base | ((l >> bl) << s0) | (l & low_mask);
         var v = tile[l];
         var o = i;
@@ -1074,7 +1058,7 @@ fn load_slot(col: u32, col_off: u32, base: u32, l: u32) -> Field {
 // loading the next tile into registers while the current one's butterflies
 // run, so that memory traffic overlaps arithmetic. Each thread owns `slots`
 // contiguous slots of the tile.
-@compute @workgroup_size(256)
+@compute @workgroup_size(FFT_THREADS_PLACEHOLDER)
 fn fft_group_pipelined(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let tid = lid.x;
     let col = wid.y;
@@ -1086,7 +1070,7 @@ fn fft_group_pipelined(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(wo
     let col_off = col * n;
     let tiles = n >> (fp.stages + bl);
     let stride = nwg.x;
-    let slots = max(tile_size >> 8u, 1u);
+    let slots = max(tile_size >> FFT_THREAD_BITS_PLACEHOLDERu, 1u);
     let rep_mask = (1u << fp.skip) - 1u;
     var next: array<Field, SLOTS>;
     var t = wid.x;
@@ -1124,24 +1108,7 @@ fn fft_group_pipelined(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(wo
             }
         }
         let half = tile_size >> 1u;
-        for (var st = fp.skip; st < fp.stages; st++) {
-            let s = s0 + st;
-            for (var b = tid; b < half; b += 256u) {
-                let low = b & low_mask;
-                let jp = b >> bl;
-                let j0 = ((jp >> st) << (st + 1u)) | (jp & ((1u << st) - 1u));
-                let j1 = j0 | (1u << st);
-                let l0 = (j0 << bl) | low;
-                let l1 = (j1 << bl) | low;
-                let i0 = base | (j0 << s0) | low;
-                let omega = twiddles[(i0 & ((1u << s) - 1u)) << (fp.log_n - s - 1u)];
-                let u = tile[l0];
-                let m = mul_field(omega, tile[l1]);
-                tile[l0] = add_field(u, m);
-                tile[l1] = sub_field(u, m);
-            }
-            workgroupBarrier();
-        }
+        // FFT_STAGES_1
         for (var j = 0u; j < SLOTS; j++) {
             let l = tid * slots + j;
             if (j < slots && l < tile_size) {
@@ -1187,13 +1154,147 @@ fn check_tail(@builtin(global_invocation_id) id: vec3<u32>) {
     out
 }
 
+// Stage templates shared by the ordinary and pipelined entry points.
+const FFT_RADIX2_STAGES: &str = r#"for (var st = fp.skip; st < fp.stages; st++) {
+    let s = s0 + st;
+    for (var b = tid; b < half; b += FFT_THREADS_PLACEHOLDERu) {
+        let low = b & low_mask;
+        let jp = b >> bl;
+        let j0 = ((jp >> st) << (st + 1u)) | (jp & ((1u << st) - 1u));
+        let j1 = j0 | (1u << st);
+        let l0 = (j0 << bl) | low;
+        let l1 = (j1 << bl) | low;
+        let i0 = base | (j0 << s0) | low;
+        let omega = twiddles[(i0 & ((1u << s) - 1u)) << (fp.log_n - s - 1u)];
+        let u = tile[l0];
+        let FFT_PRODUCT_PLACEHOLDER = mul_field(omega, tile[l1]);
+        tile[l0] = add_field(u, FFT_PRODUCT_PLACEHOLDER);
+        tile[l1] = sub_field(u, FFT_PRODUCT_PLACEHOLDER);
+    }
+    workgroupBarrier();
+}"#;
+
+const FFT_RADIX4_STAGES: &str = r#"var st = fp.skip;
+loop {
+    if (st >= fp.stages) { break; }
+    if (st + 1u < fp.stages) {
+        fft_radix4_stage(base, low_mask, s0, bl, tile_size, st, tid);
+        st += 2u;
+    } else {
+        let s = s0 + st;
+        for (var b = tid; b < half; b += FFT_THREADS_PLACEHOLDERu) {
+            let low = b & low_mask;
+            let jp = b >> bl;
+            let j0 = ((jp >> st) << (st + 1u)) | (jp & ((1u << st) - 1u));
+            let j1 = j0 | (1u << st);
+            let l0 = (j0 << bl) | low;
+            let l1 = (j1 << bl) | low;
+            let i0 = base | (j0 << s0) | low;
+            let omega = twiddles[(i0 & ((1u << s) - 1u)) << (fp.log_n - s - 1u)];
+            let u = tile[l0];
+            let FFT_PRODUCT_PLACEHOLDER = mul_field(omega, tile[l1]);
+            tile[l0] = add_field(u, FFT_PRODUCT_PLACEHOLDER);
+            tile[l1] = sub_field(u, FFT_PRODUCT_PLACEHOLDER);
+        }
+
+        st++;
+    }
+    workgroupBarrier();
+}"#;
+
+const FFT_RADIX4_STEP: &str = r#"
+fn fft_radix4_stage(base: u32, low_mask: u32, s0: u32, bl: u32,
+                    tile_size: u32, st: u32, tid: u32) {
+    let s = s0 + st;
+    for (var b = tid; b < (tile_size >> 2u); b += 128u) {
+        let low = b & low_mask;
+        let jp = b >> bl;
+        let j0 = ((jp >> st) << (st + 2u)) | (jp & ((1u << st) - 1u));
+        let j1 = j0 | (1u << st);
+        let j2 = j0 | (2u << st);
+        let j3 = j0 | (3u << st);
+        let l0 = (j0 << bl) | low;
+        let l1 = (j1 << bl) | low;
+        let l2 = (j2 << bl) | low;
+        let l3 = (j3 << bl) | low;
+        let i0 = base | (j0 << s0) | low;
+        let wa = twiddles[(i0 & ((1u << s) - 1u)) << (fp.log_n - s - 1u)];
+        let wb_index = (i0 & ((1u << (s + 1u)) - 1u)) << (fp.log_n - s - 2u);
+        let wb0 = twiddles[wb_index];
+        let wb1 = twiddles[wb_index + (1u << (fp.log_n - 2u))];
+        let x0 = tile[l0];
+        let x1 = tile[l1];
+        let x2 = tile[l2];
+        let x3 = tile[l3];
+        let a1 = mul_field(wa, x1);
+        let a3 = mul_field(wa, x3);
+        let p0 = add_field(x0, a1);
+        let p1 = sub_field(x0, a1);
+        let p2 = add_field(x2, a3);
+        let p3 = sub_field(x2, a3);
+        let q2 = mul_field(wb0, p2);
+        let q3 = mul_field(wb1, p3);
+        tile[l0] = add_field(p0, q2);
+        tile[l1] = add_field(p1, q3);
+        tile[l2] = sub_field(p0, q2);
+        tile[l3] = sub_field(p1, q3);
+    }
+}
+"#;
+
 /// The NTT module.
 pub fn fft_module(flavor: Flavor) -> String {
     let mut out = prelude(flavor);
     let tile = 1u32 << FFT_TILE_BITS;
     writeln!(out, "const FFT_TILE_SIZE: u32 = {tile}u;").unwrap();
-    out.push_str(FFT_KERNEL);
+    out.push_str(&fft_source(false));
     out
+}
+
+/// Register-blocked forward NTT for native Apple Metal. Four field values
+/// remain in registers across two stages, halving shared-memory exchanges.
+/// The inverse and nonpipelined kernels retain their existing configuration.
+pub(crate) fn fft_forward_module(flavor: Flavor) -> String {
+    let mut out = prelude(flavor);
+    writeln!(
+        out,
+        "const FFT_TILE_SIZE: u32 = {}u;",
+        1u32 << FFT_TILE_BITS
+    )
+    .unwrap();
+    out.push_str(&fft_source(true));
+    out
+}
+
+fn fft_source(blocked: bool) -> String {
+    let stages = if blocked {
+        FFT_RADIX4_STAGES
+    } else {
+        FFT_RADIX2_STAGES
+    };
+    let indent = |spaces: usize, product: &str| {
+        stages
+            .lines()
+            .map(|line| format!("{}{line}", " ".repeat(spaces)))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .replace("FFT_PRODUCT_PLACEHOLDER", product)
+    };
+    let mut source = FFT_KERNEL
+        .replace("    // FFT_STAGES_0", &indent(4, "t"))
+        .replace("        // FFT_STAGES_1", &indent(8, "m"))
+        .replace(
+            "FFT_THREADS_PLACEHOLDER",
+            if blocked { "128" } else { "256" },
+        )
+        .replace(
+            "FFT_THREAD_BITS_PLACEHOLDER",
+            if blocked { "7" } else { "8" },
+        );
+    if blocked {
+        source.push_str(FFT_RADIX4_STEP);
+    }
+    source
 }
 
 #[cfg(test)]

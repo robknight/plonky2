@@ -401,6 +401,9 @@ pub struct GpuContext {
     /// The NTT kernel whose workgroups each loop over several tiles,
     /// prefetching the next (`GpuOptions::fft_tiles_per_workgroup`).
     pub(crate) fft_pipelined: wgpu::ComputePipeline,
+    /// Native Apple Metal uses register blocking for pipelined forward NTTs.
+    pub(crate) blocked_forward_fft: bool,
+    pub(crate) fft_forward128: OnceLock<wgpu::ComputePipeline>,
     fold_layout: wgpu::BindGroupLayout,
     pub(crate) fold: wgpu::ComputePipeline,
     /// The proof-of-work search, compiled on first use.
@@ -792,11 +795,12 @@ impl GpuContext {
         } else {
             Flavor::Portable
         };
-        // Native Apple Metal benefits from the smaller partial-round loop.
-        // Other hardware/compiler paths keep their existing kernel.
-        let rolled_poseidon = info.backend == wgpu::Backend::Metal
+        // These kernel configurations are measured on native Apple Metal.
+        // Other hardware/compiler paths keep their existing kernels.
+        let native_apple_metal = info.backend == wgpu::Backend::Metal
             && info.name.starts_with("Apple ")
             && flavor == Flavor::Native;
+        let rolled_poseidon = native_apple_metal;
         let mut features = wgpu::Features::empty();
         if mappable {
             features |= wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;
@@ -986,6 +990,8 @@ impl GpuContext {
             #[cfg(test)]
             fft_large: OnceLock::new(),
             fft_pipelined,
+            blocked_forward_fft: native_apple_metal,
+            fft_forward128: OnceLock::new(),
             fold_layout,
             fold,
             pow_kernel: OnceLock::new(),

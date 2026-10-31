@@ -7,10 +7,10 @@ mod column_leaves;
 mod fft_tiles;
 mod inversion;
 mod permutation_products;
-#[cfg(feature = "parallel")]
-mod query_readbacks;
 #[cfg(feature = "poseidon_bn128")]
 mod poseidon_bn128;
+#[cfg(feature = "parallel")]
+mod query_readbacks;
 mod residency_matrix;
 
 use rand::{RngCore, SeedableRng};
@@ -200,6 +200,10 @@ fn shaders_validate() {
             ("pow", shader::pow_module(flavor)),
             ("pow rolled", shader::pow_module_rolled(flavor)),
             ("fft", shader::fft_module(flavor)),
+            (
+                "register-blocked forward fft",
+                shader::fft_forward_module(flavor),
+            ),
             ("large fft", shader::fft_module_with_tile(flavor, 11)),
             ("leaf gather", shader::leaf_gather_module().to_owned()),
             ("sibling gather", shader::sibling_gather_module().to_owned()),
@@ -541,6 +545,73 @@ fn fft_kernels_match_cpu() {
                 actual, expected,
                 "log_n={log_n} rate_bits={rate_bits} inverse={inverse} tiles_per_workgroup={tiles_per_workgroup}"
             );
+        }
+    }
+}
+
+/// The register packets are exact Goldilocks butterflies in both arithmetic
+/// flavors, including zero-padding skips, odd stage counts and small tiles.
+#[test]
+fn register_blocked_forward_fft_matches_cpu_both_flavors() {
+    use crate::gpu::lde::{fft_with_test_kernel, FftJob};
+    let Some(ctx) = ctx() else { return };
+    let mut rng = StdRng::seed_from_u64(0x524144495834);
+    for flavor in [Flavor::Native, Flavor::Portable] {
+        if flavor == Flavor::Native && ctx.flavor != Flavor::Native {
+            continue;
+        }
+        let source = shader::fft_forward_module(flavor);
+        let module = super::module(&ctx.device, "register-blocked test", &source);
+        let kernel = super::pipeline(&ctx.device, &ctx.fft_layout, &module, "fft_group_pipelined");
+        for (log_n, rate_bits, coset) in [
+            (4u32, 0usize, false),
+            (6, 3, true),
+            (10, 0, true),
+            (13, 3, false),
+            (17, 3, true),
+            (19, 3, true),
+        ] {
+            let n = 1usize << log_n;
+            let len = n >> rate_bits;
+            let input = random_columns(&mut rng, 3, len);
+            let shift = if coset { F::coset_shift() } else { F::ONE };
+            let expected: Vec<_> = input
+                .iter()
+                .map(|c| {
+                    PolynomialCoeffs::new(c.clone())
+                        .lde(rate_bits)
+                        .coset_fft_with_options(shift, Some(rate_bits), None)
+                        .values
+                })
+                .collect();
+            let columns = input.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            let values = lde::upload_columns(&ctx, "register-blocked test input", &columns);
+            let data = ctx.storage("register-blocked test data", (3 * n * 8) as u64);
+            for tiles in [1u32, 3, 1000] {
+                let mut encoder = ctx.encoder("register-blocked test");
+                fft_with_test_kernel(
+                    &ctx,
+                    &mut encoder,
+                    FftJob {
+                        log_n,
+                        columns: 3,
+                        input: &values,
+                        in_len: len as u32,
+                        in_stride: len as u32,
+                        data: &data,
+                        output: None,
+                        shift_in: coset.then_some(shift),
+                        inverse: false,
+                        shift_out: None,
+                    },
+                    &kernel,
+                    tiles,
+                );
+                ctx.submit(encoder);
+                let actual = lde::read_columns::<F>(&ctx, &data, 3, n);
+                assert_eq!(actual, expected,
+                    "flavor={flavor:?} log_n={log_n} rate_bits={rate_bits} coset={coset} tiles={tiles}");
+            }
         }
     }
 }
@@ -1534,7 +1605,10 @@ fn quotient_shader_variants_and_cache() {
     let with_quintic = ctx.quotient_kernel(64, 2, &every);
     let without = ctx.quotient_kernel(64, 2, &plain);
     assert!(!Arc::ptr_eq(&with_quintic, &without));
-    assert!(Arc::ptr_eq(&with_quintic, &ctx.quotient_kernel(64, 2, &every)));
+    assert!(Arc::ptr_eq(
+        &with_quintic,
+        &ctx.quotient_kernel(64, 2, &every)
+    ));
     assert!(Arc::ptr_eq(&without, &ctx.quotient_kernel(64, 2, &plain)));
 }
 
@@ -1573,7 +1647,9 @@ fn program_opcodes_are_numbered_by_frequency() {
     // The arithmetic gate's constraints are computed by the op before their
     // weighting: one fused op each, no separate weighted ops.
     assert!(count(8) == 0, "{} weighted ops", count(8));
-    assert!(cases.iter().any(|&key| (22..=27).contains(&(key & quotient::BASE_MASK))));
+    assert!(cases
+        .iter()
+        .any(|&key| (22..=27).contains(&(key & quotient::BASE_MASK))));
     let words = quotient::program_words(&ops, &cases);
     for (i, op) in ops.iter().enumerate() {
         let word = words[4 * i];

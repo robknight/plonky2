@@ -117,6 +117,27 @@ pub(crate) struct FftJob<'a> {
 }
 
 impl GpuContext {
+    fn fft_kernel_for_job(
+        &self,
+        tiles_per_workgroup: u32,
+        inverse: bool,
+    ) -> &wgpu::ComputePipeline {
+        if self.blocked_forward_fft && !inverse && tiles_per_workgroup != 0 {
+            self.fft_forward128.get_or_init(|| {
+                let source = super::shader::fft_forward_module(self.flavor);
+                let module = super::module(&self.device, "register-blocked forward fft", &source);
+                super::pipeline(
+                    &self.device,
+                    &self.fft_layout,
+                    &module,
+                    "fft_group_pipelined",
+                )
+            })
+        } else {
+            self.fft_kernel_for(tiles_per_workgroup)
+        }
+    }
+
     /// The NTT kernel for `tiles_per_workgroup` (zero: one tile per workgroup).
     pub(crate) fn fft_kernel_for(&self, tiles_per_workgroup: u32) -> &wgpu::ComputePipeline {
         if tiles_per_workgroup == 0 {
@@ -164,12 +185,13 @@ pub(crate) fn fft_groups(
 ) {
     let plan = fft_plan(job.log_n);
     let tiles_per_workgroup = ctx.options.fft_tiles_per_workgroup;
+    let kernel = ctx.fft_kernel_for_job(tiles_per_workgroup, job.inverse);
     record_fft(
         ctx,
         encoder,
         job,
         plan,
-        ctx.fft_kernel_for(tiles_per_workgroup),
+        kernel,
         tiles_per_workgroup,
         #[cfg(test)]
         only,
@@ -188,15 +210,21 @@ pub(crate) fn fft_with_plan(
     only: Option<usize>,
     tiles_per_workgroup: u32,
 ) {
-    record_fft(
-        ctx,
-        encoder,
-        job,
-        plan,
-        ctx.fft_kernel_for(tiles_per_workgroup),
-        tiles_per_workgroup,
-        only,
-    );
+    let kernel = ctx.fft_kernel_for_job(tiles_per_workgroup, job.inverse);
+    record_fft(ctx, encoder, job, plan, kernel, tiles_per_workgroup, only);
+}
+
+/// Exercise an explicitly generated kernel against CPU reference transforms.
+#[cfg(test)]
+pub(crate) fn fft_with_test_kernel(
+    ctx: &GpuContext,
+    encoder: &mut wgpu::CommandEncoder,
+    job: FftJob<'_>,
+    kernel: &wgpu::ComputePipeline,
+    tiles_per_workgroup: u32,
+) {
+    let plan = fft_plan(job.log_n);
+    record_fft(ctx, encoder, job, plan, kernel, tiles_per_workgroup, None);
 }
 
 /// Profiling/test entry point; production retains the measured 1024-element plan.
