@@ -243,7 +243,9 @@ pub(crate) fn committed_trees<
             );
             vals = new_vals;
         }
-        ctx.submit(encoder);
+        // The next cap read (or the final coefficient read) waits for this
+        // work on the same queue. Encode the next tree while the fold runs.
+        ctx.submit_async(encoder);
         coeffs_buffer = folded;
     }
 
@@ -330,7 +332,7 @@ pub(crate) fn try_opening_fft_from<F: RichField + Extendable<D>, const D: usize>
             shift_out: None,
         },
     );
-    ctx.submit(encoder);
+    ctx.submit_async(encoder);
     Some(PolynomialValues::new(read_extension::<F, D>(ctx, &data, n)))
 }
 

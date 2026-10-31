@@ -101,7 +101,7 @@ fn evaluate<F: RichField + Extendable<D>, const D: usize>(
         pass.set_pipeline(&ctx.eval_openings);
         pass.dispatch_workgroups(count as u32, 1, 1);
     }
-    ctx.submit(encoder);
+    ctx.submit_async(encoder);
     read_extension::<F, D>(ctx, &evals, count)
 }
 

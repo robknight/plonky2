@@ -1180,6 +1180,7 @@ impl GpuContext {
     }
 
     /// Submits `encoder` and blocks until the device has executed it.
+    #[cfg(test)]
     pub(crate) fn submit(&self, encoder: wgpu::CommandEncoder) {
         let index = self.submit_async(encoder);
         self.wait(&index);
