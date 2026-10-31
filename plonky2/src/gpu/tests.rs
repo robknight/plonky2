@@ -196,7 +196,9 @@ fn shaders_validate() {
         };
         for (name, source) in [
             ("hash", shader::hash_module(flavor)),
+            ("hash rolled", shader::hash_module_rolled(flavor)),
             ("pow", shader::pow_module(flavor)),
+            ("pow rolled", shader::pow_module_rolled(flavor)),
             ("fft", shader::fft_module(flavor)),
             ("large fft", shader::fft_module_with_tile(flavor, 11)),
             ("leaf gather", shader::leaf_gather_module().to_owned()),

@@ -162,6 +162,8 @@ fn bench_merkle_query_readback() {
 fn dump_hash_msl() {
     let source = match std::env::var("PLONKY2_GPU_MSL_MODULE").as_deref() {
         Ok("quotient") => quotient::kernel_source(Flavor::Native, 64, 2, &quotient::every_case()),
+        Ok("hash-rolled") => shader::hash_module_rolled(Flavor::Native),
+        Ok("pow-rolled") => shader::pow_module_rolled(Flavor::Native),
         _ => shader::hash_module(Flavor::Native),
     };
     let module = naga::front::wgsl::parse_str(&source)

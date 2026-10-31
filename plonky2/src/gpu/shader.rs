@@ -439,6 +439,21 @@ fn round_constants(round: usize) -> [u64; 12] {
 /// previous layer instead of being split from `s_i`; with `limbs_out` they
 /// leave that way, normalized by `mds_norm` instead of recombined.
 fn mds_layer(out: &mut String, next: Option<[u64; 12]>, limbs_in: bool, limbs_out: bool) {
+    mds_layer_with_constants(out, next.map(MdsConstants::Immediate), limbs_in, limbs_out);
+}
+
+#[derive(Clone, Copy)]
+enum MdsConstants {
+    Immediate([u64; 12]),
+    PartialRound,
+}
+
+fn mds_layer_with_constants(
+    out: &mut String,
+    next: Option<MdsConstants>,
+    limbs_in: bool,
+    limbs_out: bool,
+) {
     for i in 0..12 {
         if limbs_in && i > 0 {
             continue;
@@ -469,7 +484,12 @@ fn mds_layer(out: &mut String, next: Option<[u64; 12]>, limbs_in: bool, limbs_ou
         let limbs = (0..3)
             .map(|limb| {
                 let addend = match next {
-                    Some(c) => format!(" + {}u", (c[row] >> (22 * limb)) & 0x3fffff),
+                    Some(MdsConstants::Immediate(c)) => {
+                        format!(" + {}u", (c[row] >> (22 * limb)) & 0x3fffff)
+                    }
+                    Some(MdsConstants::PartialRound) => {
+                        format!(" + PARTIAL_RC[round][{row}][{limb}]")
+                    }
                     None => String::new(),
                 };
                 if row == 0 {
@@ -492,14 +512,46 @@ fn mds_layer(out: &mut String, next: Option<[u64; 12]>, limbs_in: bool, limbs_ou
     }
 }
 
-/// The unrolled `permute(State) -> State` function: round 0's constants are
-/// added to the input, every later round's constants ride on the previous
-/// round's MDS recombination. The 22 partial rounds (4..26) are in their plain
-/// form (S-box on word 0, then the dense layer): on the GPU the dense layer
-/// (22-bit limbs, small constant multiplies) is cheaper than Plonky2's sparse
-/// "fast" variant, whose dot products with 64-bit coefficients need a full
-/// 64x64 product and a 160-bit carry chain per term.
-fn permutation(out: &mut String) {
+// Round 4's constants were fused into the preceding full MDS layer. The
+// loop absorbs the following constants, rounds 5 through 26 inclusive.
+fn partial_round_table(out: &mut String) {
+    out.push_str("const PARTIAL_RC: array<array<vec3<u32>, 12>, 22> = array(\n");
+    for round in 5..27 {
+        out.push_str("    array<vec3<u32>, 12>(");
+        for c in round_constants(round) {
+            write!(
+                out,
+                "vec3<u32>({}u, {}u, {}u),",
+                c & 0x3fffff,
+                (c >> 22) & 0x3fffff,
+                c >> 44
+            )
+            .unwrap();
+        }
+        out.push_str("),\n");
+    }
+    out.push_str(");\n");
+}
+
+fn rolled_partial_rounds(out: &mut String) {
+    out.push_str("    for (var round = 0u; round < 22u; round++) {\n    s0 = sbox(s0);\n");
+    mds_layer_with_constants(out, Some(MdsConstants::PartialRound), true, true);
+    out.push_str("    }\n");
+    // The final partial layer normally recombines words 1..11. Here its
+    // normalized limbs are recombined once after leaving the loop.
+    for i in 1..12 {
+        writeln!(out, "    s{i} = mds_combine(t0_{i}, t1_{i}, t2_{i});").unwrap();
+    }
+}
+
+/// Generate the permutation with eight unrolled full rounds and either
+/// unrolled or looped partial rounds. The loop uses the same constants from
+/// a small read-only table, reducing the native Metal kernel's code size.
+/// Dense 22-bit MDS layers remain cheaper here than the CPU's sparse variant.
+fn permutation(out: &mut String, rolled: bool) {
+    if rolled {
+        partial_round_table(out);
+    }
     out.push_str("\nfn permute(input: State) -> State {\n");
     for i in 0..12 {
         writeln!(out, "    var s{i} = input.s{i};").unwrap();
@@ -517,6 +569,12 @@ fn permutation(out: &mut String) {
     }
     let partial = 4..26;
     for round in 0..30 {
+        if rolled && partial.contains(&round) {
+            if round == 4 {
+                rolled_partial_rounds(out);
+            }
+            continue;
+        }
         let full = !partial.contains(&round);
         writeln!(out, "    {{ // round {round}").unwrap();
         let words = if full { 12 } else { 1 };
@@ -742,9 +800,17 @@ fn qmul(x: array<Field, 5>, y: array<Field, 5>) -> array<Field, 5> {
 
 /// The hashing module: sponge over leaves and two-to-one nodes.
 pub fn hash_module(flavor: Flavor) -> String {
+    hash_module_with_rounds(flavor, false)
+}
+
+pub(crate) fn hash_module_rolled(flavor: Flavor) -> String {
+    hash_module_with_rounds(flavor, true)
+}
+
+fn hash_module_with_rounds(flavor: Flavor, rolled: bool) -> String {
     let mut out = prelude(flavor);
     out.push_str(MDS);
-    permutation(&mut out);
+    permutation(&mut out, rolled);
     out.push_str(HASH_BINDINGS);
     out.push_str(HASH_KERNELS);
     #[cfg(test)]
@@ -840,9 +906,17 @@ fn pow_search(@builtin(global_invocation_id) id: vec3<u32>) {
 
 /// The proof-of-work search kernel.
 pub fn pow_module(flavor: Flavor) -> String {
+    pow_module_with_rounds(flavor, false)
+}
+
+pub(crate) fn pow_module_rolled(flavor: Flavor) -> String {
+    pow_module_with_rounds(flavor, true)
+}
+
+fn pow_module_with_rounds(flavor: Flavor, rolled: bool) -> String {
     let mut out = prelude(flavor);
     out.push_str(MDS);
-    permutation(&mut out);
+    permutation(&mut out, rolled);
     out.push_str(POW_KERNEL);
     out
 }

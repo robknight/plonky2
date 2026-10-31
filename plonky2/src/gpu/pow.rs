@@ -80,7 +80,11 @@ fn poseidon_kernel(ctx: &GpuContext) -> Option<&PowKernel> {
     ctx.pow_kernel
         .get_or_init(|| {
             let validation = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
-            let source = shader::pow_module(ctx.flavor);
+            let source = if ctx.rolled_poseidon {
+                shader::pow_module_rolled(ctx.flavor)
+            } else {
+                shader::pow_module(ctx.flavor)
+            };
             let module = module(&ctx.device, "proof of work", &source);
             let layout = storage_layout(
                 &ctx.device,

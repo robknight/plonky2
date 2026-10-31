@@ -374,6 +374,7 @@ pub struct GpuContext {
     pub(crate) queue: wgpu::Queue,
     pub info: wgpu::AdapterInfo,
     pub flavor: Flavor,
+    pub(crate) rolled_poseidon: bool,
     /// Storage buffers can be mapped directly (unified memory).
     pub mappable: bool,
     readback_pool: Mutex<Vec<wgpu::Buffer>>,
@@ -791,6 +792,11 @@ impl GpuContext {
         } else {
             Flavor::Portable
         };
+        // Native Apple Metal benefits from the smaller partial-round loop.
+        // Other hardware/compiler paths keep their existing kernel.
+        let rolled_poseidon = info.backend == wgpu::Backend::Metal
+            && info.name.starts_with("Apple ")
+            && flavor == Flavor::Native;
         let mut features = wgpu::Features::empty();
         if mappable {
             features |= wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;
@@ -833,7 +839,12 @@ impl GpuContext {
                 (false, false),
             ],
         );
-        let hash_module = module(&device, "plonky2 hash", &shader::hash_module(flavor));
+        let hash_source = if rolled_poseidon {
+            shader::hash_module_rolled(flavor)
+        } else {
+            shader::hash_module(flavor)
+        };
+        let hash_module = module(&device, "plonky2 hash", &hash_source);
         let hash_leaves = pipeline(&device, &hash_layout, &hash_module, "hash_leaves");
         let hash_nodes = pipeline(&device, &hash_layout, &hash_module, "hash_nodes");
         #[cfg(test)]
@@ -952,6 +963,7 @@ impl GpuContext {
             queue,
             info,
             flavor,
+            rolled_poseidon,
             mappable,
             readback_pool: Mutex::new(Vec::new()),
             upload_pool: Mutex::new(Vec::new()),
