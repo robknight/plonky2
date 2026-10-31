@@ -371,40 +371,18 @@ struct Complex3 {
     z0r: u32, z0i: u32, z1r: u32, z1i: u32, z2r: u32, z2i: u32,
 }
 
-// MDS_FREQ_BLOCK_TWO = [(2, -1), (-4, 1), (16, 1)].
-const Y0R: u32 = 2u;
-const Y0I: u32 = 0xffffffffu; // -1
-const Y1R: u32 = 0xfffffffcu; // -4
-const Y1I: u32 = 1u;
-const Y2R: u32 = 16u;
-const Y2I: u32 = 1u;
-
-fn block2(x0r: u32, x0i: u32, x1r: u32, x1i: u32, x2r: u32, x2i: u32) -> Complex3 {
-    let x0s = x0r + x0i;
-    let x1s = x1r + x1i;
-    let x2s = x2r + x2i;
-    let y0s = 1u; // Y0R + Y0I
-    let y1s = 0xfffffffdu; // Y1R + Y1I = -3
-    let y2s = 17u; // Y2R + Y2I
-    // x0 y0 - i x1 y2 - i x2 y1
-    var m0r = x0r * Y0R; var m0i = x0i * Y0I;
-    var m1r = x1r * Y2R; var m1i = x1i * Y2I;
-    var m2r = x2r * Y1R; var m2i = x2i * Y1I;
-    let z0r = (m0r - m0i) + (x1s * y2s - m1r - m1i) + (x2s * y1s - m2r - m2i);
-    let z0i = (x0s * y0s - m0r - m0i) + (m1i - m1r) + (m2i - m2r);
-    // x0 y1 + x1 y0 - i x2 y2
-    m0r = x0r * Y1R; m0i = x0i * Y1I;
-    m1r = x1r * Y0R; m1i = x1i * Y0I;
-    m2r = x2r * Y2R; m2i = x2i * Y2I;
-    let z1r = (m0r - m0i) + (m1r - m1i) + (x2s * y2s - m2r - m2i);
-    let z1i = (x0s * y1s - m0r - m0i) + (x1s * y0s - m1r - m1i) + (m2i - m2r);
-    // x0 y2 + x1 y1 + x2 y0
-    m0r = x0r * Y2R; m0i = x0i * Y2I;
-    m1r = x1r * Y1R; m1i = x1i * Y1I;
-    m2r = x2r * Y0R; m2i = x2i * Y0I;
-    let z2r = (m0r - m0i) + (m1r - m1i) + (m2r - m2i);
-    let z2i = (x0s * y2s - m0r - m0i) + (x1s * y1s - m1r - m1i) + (x2s * y0s - m2r - m2i);
-    return Complex3(z0r, z0i, z1r, z1i, z2r, z2i);
+// MDS_FREQ_BLOCK_TWO = [(2, -1), (-4, 1), (16, 1)]. Expand the
+// complex products with these constants before code generation. The general
+// three-multiply formula introduces sums that cancel for these small constants.
+// All expressions are equivalent in the wrapping u32 ring.
+fn block2(a: u32, b: u32, c: u32, d: u32, e: u32, f: u32) -> Complex3 {
+    return Complex3(
+        2u * a + b + c + 16u * d + e - 4u * f,
+        2u * b - a - 16u * c + d + 4u * e + f,
+        2u * c - 4u * a - b + d + e + 16u * f,
+        a - 4u * b - c + 2u * d - 16u * e + f,
+        16u * a - b - 4u * c - d + 2u * e + f,
+        a + 16u * b + c - 4u * d - e + 2u * f);
 }
 
 fn mds_freq(s0: u32, s1: u32, s2: u32, s3: u32, s4: u32, s5: u32,
