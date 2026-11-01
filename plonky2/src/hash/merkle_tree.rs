@@ -42,6 +42,31 @@ impl<F: RichField, H: Hasher<F>> MerkleCap<F, H> {
     }
 }
 
+/// A submitted row gather whose host decoding can overlap later device work.
+#[cfg(feature = "gpu")]
+pub(crate) struct PendingLeafRows<'a> {
+    ready: Option<(
+        std::sync::Arc<crate::gpu::GpuContext>,
+        wgpu::SubmissionIndex,
+    )>,
+    finish: Box<dyn FnOnce() + Send + 'a>,
+}
+
+#[cfg(feature = "gpu")]
+impl PendingLeafRows<'_> {
+    /// Complete this gather before launching device work that might starve it.
+    /// Host decoding remains deferred until `finish`.
+    pub(crate) fn wait_for_device(&self) {
+        if let Some((ctx, done)) = &self.ready {
+            ctx.wait(done);
+        }
+    }
+
+    pub(crate) fn finish(self) {
+        (self.finish)();
+    }
+}
+
 /// Internal storage: host access is explicit through `MerkleLeaves` methods.
 #[derive(Clone, Debug)]
 struct LeafValues<F: Copy> {
@@ -378,17 +403,19 @@ impl<F: Copy> MerkleLeaves<F> {
     where
         F: Send + Sync,
     {
-        if let Some(finish) = self.queue_rows(indices) {
-            finish();
+        if let Some(rows) = self.queue_rows(indices) {
+            rows.finish();
         }
     }
 
     /// The device work of `prepare_rows`, submitted now; the returned step
     /// waits for it and stores the rows. Column leaves are gathered by a
     /// device dispatch, so a caller about to queue other device work queues
-    /// this first and finishes it while that work runs. Row leaves are read
-    /// from the mapped buffer here, under the lock a full download also takes.
-    pub(crate) fn queue_rows(&self, indices: &[usize]) -> Option<Box<dyn FnOnce() + Send + '_>>
+    /// this first. `wait_for_device` ensures the gather completes before a
+    /// competing dispatch, while `finish` can decode rows during that work.
+    /// Row leaves are read from the mapped buffer here, under the lock a
+    /// full download also takes.
+    pub(crate) fn queue_rows(&self, indices: &[usize]) -> Option<PendingLeafRows<'_>>
     where
         F: Send + Sync,
     {
@@ -477,7 +504,11 @@ impl<F: Copy> MerkleLeaves<F> {
             ))
         };
         drop(resident);
-        Some(Box::new(move || {
+        let ready = gathered
+            .as_ref()
+            .ok()
+            .map(|(_, done)| (ctx.clone(), done.clone()));
+        let finish = Box::new(move || {
             let data = match gathered {
                 Ok((compact, done)) => ctx.read_after(
                     &compact,
@@ -499,7 +530,8 @@ impl<F: Copy> MerkleLeaves<F> {
                 started.elapsed()
             );
             let _ = d.rows.set(PreparedRows { index, data });
-        }))
+        });
+        Some(PendingLeafRows { ready, finish })
     }
 
     /// True while a device copy is retained. Does not download any data.

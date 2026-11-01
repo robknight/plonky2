@@ -353,8 +353,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     /// these indices, from the device buffer where the host maps it directly.
     #[cfg(all(feature = "gpu", test))]
     pub(crate) fn prepare_lde_values(&self, indices: impl IntoIterator<Item = usize>, step: usize) {
-        if let Some(finish) = self.queue_lde_values(indices, step) {
-            finish();
+        if let Some(rows) = self.queue_lde_values(indices, step) {
+            rows.finish();
         }
     }
 
@@ -365,7 +365,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         &self,
         indices: impl IntoIterator<Item = usize>,
         step: usize,
-    ) -> Option<Box<dyn FnOnce() + Send + '_>> {
+    ) -> Option<crate::hash::merkle_tree::PendingLeafRows<'_>> {
         let bits = self.degree_log + self.rate_bits;
         let rows = indices
             .into_iter()

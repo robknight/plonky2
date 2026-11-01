@@ -2479,10 +2479,9 @@ pub(crate) fn try_compute_quotient<
     // The CPU evaluates the last points while the kernel runs, the share
     // following the rates measured on the previous proof.
     let start = std::time::Instant::now();
-    // The CPU share's rows are gathered by the device before the GPU share is
-    // queued, so the CPU waits only for the gathers. The Z polynomials also
-    // need the row `next_step` points ahead, which for the last points wraps
-    // into the first `next_step` rows.
+    // Submit both CPU row gathers before waiting for either. The Z
+    // polynomials also need the row `next_step` points ahead, which for the
+    // last points wraps into the first `next_step` rows.
     let (wires_rows, zs_rows) = if gpu_rows < n {
         (
             wires_commitment
@@ -2495,6 +2494,14 @@ pub(crate) fn try_compute_quotient<
     } else {
         (None, None)
     };
+    let pending_rows = [wires_rows, zs_rows];
+    // Metal can run independent submissions concurrently: the large
+    // quotient dispatch can starve these small gathers and delay the CPU
+    // share until the GPU share ends. Complete only their device work here;
+    // host decoding still overlaps the quotient in the CPU branch below.
+    for rows in pending_rows.iter().flatten() {
+        rows.wait_for_device();
+    }
     #[cfg(feature = "gpu-profiling")]
     let _capture = super::capture::Capture::quotient();
     let (gpu_time, cpu_time) = plonky2_maybe_rayon::join(
@@ -2538,8 +2545,8 @@ pub(crate) fn try_compute_quotient<
                 return None;
             }
             let start = std::time::Instant::now();
-            for finish in [wires_rows, zs_rows].into_iter().flatten() {
-                finish();
+            for rows in pending_rows.into_iter().flatten() {
+                rows.finish();
             }
             let values = crate::plonk::prover::quotient_values_cpu::<F, C, D>(
                 common_data,
