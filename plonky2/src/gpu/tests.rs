@@ -3245,3 +3245,31 @@ fn proof_of_work_kernel_follows_the_sponge_permutation() {
         None
     );
 }
+
+#[test]
+fn bounded_merkle_batches_match_cpu() {
+    let Some(ctx) = ctx() else { return };
+    let mut rng = StdRng::seed_from_u64(0x4241544348);
+    for batch_log in [0u32, 5, 9] {
+        let log_n = if batch_log == 0 { 4 } else { 10 };
+        for leaf_len in [0usize, 1, 4, 9, 139] {
+            let n = 1usize << log_n;
+            let mut values = random_fields(&mut rng, n * leaf_len);
+            for (x, w) in values.iter_mut().zip(boundary_words()) {
+                *x = F::from_noncanonical_u64(w);
+            }
+            let leaves = MerkleLeaves::new(values, leaf_len, n);
+            for cap_height in [0u32, 2, log_n - 1, log_n] {
+                let cpu = MerkleTree::<F, H>::new_cpu(leaves.clone(), cap_height as usize);
+                let (digests, cap) =
+                    merkle::build_batched::<F, H>(&ctx, &leaves, log_n, cap_height, batch_log);
+                assert_eq!(
+                    digests.as_slice(),
+                    &*cpu.digests,
+                    "leaf_len={leaf_len} cap={cap_height} batch={batch_log}"
+                );
+                assert_eq!(cap, cpu.cap.0);
+            }
+        }
+    }
+}

@@ -468,11 +468,37 @@ pub(crate) fn try_new<F: RichField, H: Hasher<F>>(
     }
     let ctx = context()?;
     let ctx = &*ctx;
-    if !supported_on::<F, H>(ctx)
-        || !ctx.fits(leaves.num_values() as u64 * 8)
-        || (leaves.len() as u32).div_ceil(HASH_WORKGROUP) > ctx.max_workgroups
-    {
+    if !supported_on::<F, H>(ctx) {
         return None;
+    }
+    let cap_len = 1usize << cap_height;
+    if !ctx.fits(leaves.num_values() as u64 * 8)
+        || !ctx.fits(2 * (leaves.len() - cap_len) as u64 * 32)
+        || !ctx.fits(cap_len as u64 * 32)
+        || (leaves.len() as u64).div_ceil(u64::from(HASH_WORKGROUP)) > u64::from(ctx.max_workgroups)
+    {
+        let batch_log = batch_log(
+            leaves.leaf_len,
+            log_leaves,
+            ctx.max_binding,
+            ctx.max_workgroups,
+        )?;
+        // Keep the CPU fallback when a useful GPU batch cannot fit, or when
+        // the cap is just a copy of short Poseidon leaves (no hashing work).
+        if batch_log < crate::gpu::MIN_LOG_LEAVES
+            || (cap_height == log_leaves as usize
+                && leaves.leaf_len <= 4
+                && H::GPU_HASH == GpuHash::Poseidon)
+        {
+            return None;
+        }
+        return Some(build_batched::<F, H>(
+            ctx,
+            leaves,
+            log_leaves,
+            cap_height as u32,
+            batch_log,
+        ));
     }
     Some(build_from_rows::<F, H>(
         ctx,
@@ -503,4 +529,142 @@ pub(crate) fn build_from_rows<F: RichField, H: Hasher<F>>(
         None,
     );
     tree.read::<F, H>(ctx)
+}
+
+/// A power-of-two batch fitting the input, both tree outputs and dispatch limit.
+/// A single leaf that cannot fit still uses the caller's CPU fallback.
+fn batch_log(
+    leaf_len: usize,
+    log_leaves: u32,
+    max_binding: u64,
+    max_workgroups: u32,
+) -> Option<u32> {
+    let bytes_per_leaf = u64::try_from(leaf_len).ok()?.checked_mul(8)?.max(64);
+    // Input conversion and its mapped upload coexist on unified-memory GPUs.
+    // Bound their footprint even when the adapter accepts multi-GiB bindings.
+    const MAX_BATCH_BYTES: u64 = 128 << 20;
+    let rows = (max_binding.min(MAX_BATCH_BYTES) / bytes_per_leaf)
+        .min(u64::from(max_workgroups) * u64::from(HASH_WORKGROUP))
+        .min(1u64.checked_shl(log_leaves)?);
+    (rows > 0).then(|| rows.ilog2())
+}
+
+/// Only the oversized-buffer/dispatch path uses batches. The ordinary tree
+/// kernels and full-buffer path are unchanged. Batches finish before their
+/// upload buffer is released, bounding transient device memory too.
+#[cold]
+pub(crate) fn build_batched<F: RichField, H: Hasher<F>>(
+    ctx: &GpuContext,
+    leaves: &MerkleLeaves<F>,
+    log_leaves: u32,
+    cap_height: u32,
+    batch_log: u32,
+) -> DigestsAndCap<H::Hash> {
+    let depth = log_leaves - cap_height;
+    let fields = leaves.as_flat_slice();
+    let leaf_len = leaves.leaf_len;
+    let mut digests = Vec::with_capacity(2 * (leaves.len() - (1 << cap_height)));
+    let mut cap = Vec::with_capacity(1 << cap_height);
+    if batch_log >= depth {
+        // Each batch contains whole cap subtrees. Their flattened digest
+        // blocks and cap entries can be concatenated without rehashing.
+        let batch_leaves = 1usize << batch_log;
+        for start in (0..leaves.len()).step_by(batch_leaves) {
+            let src = ctx.upload(
+                "batched leaves",
+                &field_words(&fields[start * leaf_len..(start + batch_leaves) * leaf_len]),
+            );
+            let tree = build_tree(
+                ctx,
+                H::GPU_HASH,
+                &src,
+                LeafSource::Rows {
+                    leaf_len: leaf_len as u32,
+                },
+                batch_log,
+                batch_log - depth,
+                None,
+            );
+            let (batch_digests, batch_cap) = tree.read::<F, H>(ctx);
+            digests.extend(batch_digests);
+            cap.extend(batch_cap);
+        }
+    } else {
+        // A cap subtree itself exceeds the limit. Hash its smaller subtrees
+        // on the GPU and combine only their roots on the CPU, preserving
+        // Plonky2's left-subtree / child-pair / right-subtree digest layout.
+        digests.resize(
+            2 * (leaves.len() - (1 << cap_height)),
+            H::Hash::from_bytes(&[0; 32]),
+        );
+        let subtree_leaves = 1usize << depth;
+        let subtree_digests = 2 * (subtree_leaves - 1);
+        for i in 0..1usize << cap_height {
+            cap.push(build_bounded_subtree::<F, H>(
+                ctx,
+                &fields[i * subtree_leaves * leaf_len..(i + 1) * subtree_leaves * leaf_len],
+                leaf_len,
+                depth,
+                batch_log,
+                &mut digests[i * subtree_digests..(i + 1) * subtree_digests],
+            ));
+        }
+    }
+    (digests, cap)
+}
+
+fn build_bounded_subtree<F: RichField, H: Hasher<F>>(
+    ctx: &GpuContext,
+    fields: &[F],
+    leaf_len: usize,
+    log_leaves: u32,
+    batch_log: u32,
+    digests: &mut [H::Hash],
+) -> H::Hash {
+    if log_leaves <= batch_log {
+        let src = ctx.upload("batched leaves", &field_words(fields));
+        let tree = build_tree(
+            ctx,
+            H::GPU_HASH,
+            &src,
+            LeafSource::Rows {
+                leaf_len: leaf_len as u32,
+            },
+            log_leaves,
+            0,
+            None,
+        );
+        let (batch_digests, cap) = tree.read::<F, H>(ctx);
+        digests.copy_from_slice(&batch_digests);
+        return cap[0];
+    }
+    let mid = digests.len() / 2;
+    let (left, right) = digests.split_at_mut(mid);
+    let (left_root, left) = left.split_last_mut().unwrap();
+    let (right_root, right) = right.split_first_mut().unwrap();
+    let (left_fields, right_fields) = fields.split_at((1usize << (log_leaves - 1)) * leaf_len);
+    *left_root =
+        build_bounded_subtree::<F, H>(ctx, left_fields, leaf_len, log_leaves - 1, batch_log, left);
+    *right_root = build_bounded_subtree::<F, H>(
+        ctx,
+        right_fields,
+        leaf_len,
+        log_leaves - 1,
+        batch_log,
+        right,
+    );
+    H::two_to_one(*left_root, *right_root)
+}
+
+#[cfg(test)]
+mod batching_tests {
+    use super::batch_log;
+    #[test]
+    fn batch_bounds_include_outputs_and_dispatch() {
+        assert_eq!(batch_log(139, 19, 512 << 20, 65535), Some(16));
+        assert_eq!(batch_log(1, 20, 4096, 65535), Some(6));
+        assert_eq!(batch_log(0, 20, 4096, 1), Some(6));
+        assert_eq!(batch_log(139, 20, 1000, 65535), None);
+        assert_eq!(batch_log(1, 20, 4096, 0), None);
+    }
 }

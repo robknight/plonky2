@@ -68,8 +68,9 @@
 //!
 //! Buffers are bound whole, so the adapter must allow storage bindings of the
 //! size of an extended polynomial batch (about 583 MB for 139 columns of
-//! 2^19 field elements). Batches that exceed the adapter's limits fall back
-//! to the CPU.
+//! 2^19 field elements). Polynomial batches that exceed the adapter's limits
+//! fall back to the CPU. Host-row Merkle trees use bounded GPU batches when
+//! their complete input or tree outputs exceed those limits.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::borrow::Cow;

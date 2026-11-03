@@ -368,3 +368,24 @@ fn bn128_wrap_proofs_verify_on_cpu() {
     corrupted.proof.wires_cap.0[0] = corrupted.proof.plonk_zs_partial_products_cap.0[0];
     assert!(cpu_data.verify(corrupted).is_err());
 }
+
+#[test]
+fn bounded_bn128_merkle_batches_match_cpu() {
+    let Some(ctx) = ctx() else { return };
+    if !merkle::supported_on::<F, Hb>(&ctx) {
+        return;
+    }
+    let mut rng = StdRng::seed_from_u64(0x4241544348424e);
+    for leaf_len in [0usize, 3, 9] {
+        let leaves = MerkleLeaves::new(random_fields(&mut rng, 64 * leaf_len), leaf_len, 64);
+        for cap_height in [0u32, 3, 6] {
+            let cpu = MerkleTree::<F, Hb>::new_cpu(leaves.clone(), cap_height as usize);
+            for batch_log in [2u32, 5] {
+                let (digests, cap) =
+                    merkle::build_batched::<F, Hb>(&ctx, &leaves, 6, cap_height, batch_log);
+                assert_eq!(digests.as_slice(), &*cpu.digests);
+                assert_eq!(cap, cpu.cap.0);
+            }
+        }
+    }
+}
